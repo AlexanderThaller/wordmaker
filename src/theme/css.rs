@@ -1,10 +1,10 @@
-//! Compile a WordPress `theme.json` into the stylesheet WordPress itself would
-//! generate for it: preset custom properties, `@font-face` rules, layout rules,
-//! and the theme's element, block and block-style-variation styles.
+//! Compile a `WordPress` `theme.json` into the stylesheet `WordPress` itself
+//! would generate for it: preset custom properties, `@font-face` rules, layout
+//! rules, and the theme's element, block and block-style-variation styles.
 //!
 //! Only the declarative part of a block theme is understood. Templates and PHP
-//! patterns are not; the page frame is WordMaker's own, using WordPress's class
-//! names so these rules apply to it.
+//! patterns are not; the page frame is `WordMaker`'s own, using `WordPress`'s
+//! class names so these rules apply to it.
 
 use std::fmt::Write;
 
@@ -208,9 +208,8 @@ fn root_variables(css: &mut String, settings: &Value, styles: &Value, ctx: &Ctx<
             value.unwrap_or_else(|| "0px".into()),
         ));
     }
-    let gap = lookup(styles, &["spacing", "blockGap"])
-        .map(|v| resolve(v, ctx))
-        .unwrap_or_else(|| "24px".into());
+    let gap =
+        lookup(styles, &["spacing", "blockGap"]).map_or_else(|| "24px".into(), |v| resolve(v, ctx));
     vars.push(("--wp--style--block-gap".into(), gap));
 
     css.push_str(":root {\n");
@@ -319,16 +318,15 @@ impl FluidSettings {
             return size.to_owned();
         };
         let max = explicit("max").unwrap_or(preferred);
-        let min = match explicit("min") {
-            Some(min) => min,
-            None => {
-                if preferred <= self.min_font_size_rem {
-                    return size.to_owned();
-                }
-                let px = preferred * 16.0;
-                let factor = (1.0 - 0.075 * px.log2()).clamp(0.25, 0.75);
-                (preferred * factor).max(self.min_font_size_rem)
+        let min = if let Some(min) = explicit("min") {
+            min
+        } else {
+            if preferred <= self.min_font_size_rem {
+                return size.to_owned();
             }
+            let px = preferred * 16.0;
+            let factor = (1.0 - 0.075 * px.log2()).clamp(0.25, 0.75);
+            (preferred * factor).max(self.min_font_size_rem)
         };
         if min >= max {
             return size.to_owned();
@@ -416,7 +414,7 @@ fn font_faces(css: &mut String, settings: &Value, asset_base: &str) {
 }
 
 fn font_format(src: &str) -> Option<&'static str> {
-    let extension = src.rsplit('.').next()?.to_ascii_lowercase();
+    let extension = src.rsplit('.').next()?.to_lowercase();
     Some(match extension.as_str() {
         "woff2" => "woff2",
         "woff" => "woff",
@@ -462,7 +460,7 @@ fn element_selectors(element: &str) -> Option<&'static [&'static str]> {
     })
 }
 
-/// The selector a block's styles apply to, plus the AsciiDoc markup that
+/// The selector a block's styles apply to, plus the `AsciiDoc` markup that
 /// plays the same part.
 fn block_selectors(block: &str) -> Vec<String> {
     let aliases: &[&str] = match block {
@@ -847,8 +845,8 @@ pub fn literal_color<'a>(theme: &'a Value, css: &'a str) -> Option<&'a str> {
         .and_then(|preset| str_field(preset, "color"))
 }
 
-/// The layout rules WordPress emits with every block theme's global styles.
-const LAYOUT_CSS: &str = r#"
+/// The layout rules `WordPress` emits with every block theme's global styles.
+const LAYOUT_CSS: &str = r"
 :where(body) { margin: 0; }
 .wp-site-blocks { padding-top: var(--wp--style--root--padding-top); padding-bottom: var(--wp--style--root--padding-bottom); }
 .has-global-padding { padding-right: var(--wp--style--root--padding-right); padding-left: var(--wp--style--root--padding-left); }
@@ -875,7 +873,7 @@ body .is-layout-grid { display: grid; }
 .has-text-align-center { text-align: center; }
 .has-text-align-left { text-align: left; }
 .has-text-align-right { text-align: right; }
-"#;
+";
 
 #[cfg(test)]
 mod tests {
@@ -883,9 +881,9 @@ mod tests {
 
     use super::*;
 
-    fn compile_json(theme: Value) -> String {
+    fn compile_json(theme: &Value) -> String {
         compile(&Input {
-            theme: &theme,
+            theme,
             block_styles: &[],
             asset_base: "/_wm/theme/t",
             style_css: None,
@@ -894,7 +892,7 @@ mod tests {
 
     #[test]
     fn presets_become_custom_properties() {
-        let css = compile_json(json!({
+        let css = compile_json(&json!({
             "settings": {
                 "color": { "defaultPalette": false, "palette": [{ "slug": "base", "color": "#fff" }] },
                 "layout": { "contentSize": "645px", "wideSize": "1340px" },
@@ -913,7 +911,7 @@ mod tests {
 
     #[test]
     fn fluid_font_sizes_follow_wordpress() {
-        let css = compile_json(json!({
+        let css = compile_json(&json!({
             "settings": {
                 "layout": { "wideSize": "1340px" },
                 "typography": {
@@ -942,7 +940,7 @@ mod tests {
 
     #[test]
     fn font_faces_point_at_theme_assets() {
-        let css = compile_json(json!({
+        let css = compile_json(&json!({
             "settings": { "typography": { "fontFamilies": [{
                 "slug": "fira-code", "fontFamily": "\"Fira Code\", monospace",
                 "fontFace": [{ "fontFamily": "Fira Code", "fontWeight": "300 700",
@@ -961,7 +959,7 @@ mod tests {
 
     #[test]
     fn styles_resolve_presets_and_nest() {
-        let css = compile_json(json!({
+        let css = compile_json(&json!({
             "styles": {
                 "color": { "background": "var:preset|color|base" },
                 "spacing": { "padding": { "left": "var:preset|spacing|50" }, "blockGap": "1.2rem" },

@@ -346,8 +346,8 @@ mod tests {
             ),
             (
                 "mytheme/styles/sections/section-1.json",
-                r##"{"slug":"section-1","blockTypes":["core/group"],
-                     "styles":{"color":{"background":"var:preset|color|contrast"}}}"##,
+                r#"{"slug":"section-1","blockTypes":["core/group"],
+                     "styles":{"color":{"background":"var:preset|color|contrast"}}}"#,
             ),
             ("mytheme/assets/fonts/body.woff2", "font-bytes"),
             ("mytheme/functions.php", "<?php echo 'never extracted';"),

@@ -28,7 +28,7 @@ use crate::{
     mcp::WordMakerMcp,
 };
 
-/// A small AsciiDoc CMS with a REST API and an MCP server.
+/// A small `AsciiDoc` CMS with a REST API and an MCP server.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {

@@ -25,7 +25,7 @@ pub struct Media {
 }
 
 impl Media {
-    /// Site-relative path, suitable for `image::` macros in AsciiDoc.
+    /// Site-relative path, suitable for `image::` macros in `AsciiDoc`.
     pub fn path(&self) -> String {
         format!("/media/{}", self.filename)
     }
@@ -55,12 +55,14 @@ pub async fn store(
     let filename = format!("{}-{}", &id[..8], sanitize_filename(original_name));
     let content_type = content_type
         .filter(|ct| !ct.is_empty() && *ct != "application/octet-stream")
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            mime_guess::from_path(&filename)
-                .first_or_octet_stream()
-                .to_string()
-        });
+        .map_or_else(
+            || {
+                mime_guess::from_path(&filename)
+                    .first_or_octet_stream()
+                    .to_string()
+            },
+            str::to_owned,
+        );
 
     tokio::fs::create_dir_all(media_dir).await?;
     let path = media_dir.join(&filename);
@@ -74,7 +76,7 @@ pub async fn store(
     .bind(&filename)
     .bind(original_name)
     .bind(&content_type)
-    .bind(bytes.len() as i64)
+    .bind(i64::try_from(bytes.len()).unwrap_or(i64::MAX))
     .bind(Utc::now())
     .fetch_one(pool)
     .await;
@@ -139,7 +141,7 @@ fn sanitize_filename(name: &str) -> String {
 pub struct MediaView {
     #[serde(flatten)]
     pub media: Media,
-    /// Site-relative path to use in AsciiDoc, e.g. `image::/media/x.png[]`.
+    /// Site-relative path to use in `AsciiDoc`, e.g. `image::/media/x.png[]`.
     pub path: String,
     pub url: String,
 }

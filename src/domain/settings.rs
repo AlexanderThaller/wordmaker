@@ -24,7 +24,7 @@ pub struct Settings {
     pub site_language: String,
     /// Short line shown under the site title in the footer.
     pub site_tagline: Option<String>,
-    /// AsciiDoc shown in the footer.
+    /// `AsciiDoc` shown in the footer.
     pub footer_text: Option<String>,
     /// Slug of the page shown at `/`. Without one, `/` lists all published
     /// pages.
@@ -46,7 +46,7 @@ pub struct SettingsUpdate {
     /// New tagline; an empty string removes it.
     #[serde(default)]
     pub site_tagline: Option<String>,
-    /// New footer text in AsciiDoc; an empty string removes it.
+    /// New footer text in `AsciiDoc`; an empty string removes it.
     #[serde(default)]
     pub footer_text: Option<String>,
     /// Slug of the page to show at `/`; an empty string clears it.

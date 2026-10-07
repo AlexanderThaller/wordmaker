@@ -13,7 +13,7 @@ pub struct Rendered {
     pub toc: Option<String>,
 }
 
-/// Render AsciiDoc source to an HTML fragment.
+/// Render `AsciiDoc` source to an HTML fragment.
 pub fn render(source: &str) -> Rendered {
     let mut parser = asciidoc_parser::Parser::default();
     let document = parser.parse(source);

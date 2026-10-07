@@ -1,4 +1,4 @@
-//! WordPress block themes: installing them, listing their style variations,
+//! `WordPress` block themes: installing them, listing their style variations,
 //! and turning the active one into the site's stylesheet.
 
 pub mod css;
@@ -19,6 +19,7 @@ use std::{
     sync::{
         Arc,
         Mutex,
+        PoisonError,
     },
     time::SystemTime,
 };
@@ -320,15 +321,14 @@ fn extract(themes_dir: &Path, bytes: &[u8], slug: Option<String>) -> AppResult<S
         bad("no theme.json found; only block themes (like Twenty Twenty-Five) are supported".into())
     })?;
 
-    let slug = match slug {
-        Some(slug) => slug,
-        None => {
-            let name = root
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| bad("theme zip has no top-level folder; pass a slug".into()))?;
-            validate_slug(&name.to_ascii_lowercase())?
-        }
+    let slug = if let Some(slug) = slug {
+        slug
+    } else {
+        let name = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| bad("theme zip has no top-level folder; pass a slug".into()))?;
+        validate_slug(&name.to_lowercase())?
     };
 
     std::fs::create_dir_all(themes_dir)?;
@@ -446,7 +446,11 @@ impl ThemeCache {
             theme,
             modified,
         };
-        if let Some((cached_key, sheet)) = self.last.lock().unwrap().as_ref()
+        if let Some((cached_key, sheet)) = self
+            .last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
             && *cached_key == key
         {
             return sheet.clone();
@@ -466,7 +470,7 @@ impl ThemeCache {
             css,
             version: format!("{:016x}", hasher.finish()),
         });
-        *self.last.lock().unwrap() = Some((key, sheet.clone()));
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some((key, sheet.clone()));
         sheet
     }
 }
@@ -495,7 +499,7 @@ fn build(themes_dir: &Path, theme: Option<&str>, variations: &[String]) -> AppRe
                     .as_object_mut()
                     .ok_or_else(|| AppError::BadRequest("theme.json is not an object".into()))?
                     .entry(key)
-                    .or_insert_with(|| Value::Object(Default::default()));
+                    .or_insert_with(|| Value::Object(serde_json::Map::default()));
                 css::merge(target, part);
             }
         }

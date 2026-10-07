@@ -33,7 +33,7 @@ pub struct Page {
     pub id: i64,
     pub slug: String,
     pub title: String,
-    /// AsciiDoc source.
+    /// `AsciiDoc` source.
     pub body: String,
     pub status: Status,
     /// Whether the page is linked from the site navigation.
@@ -58,6 +58,10 @@ pub struct PageSummary {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, sqlx::FromRow)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "`revision` is the column and the API field clients know"
+)]
 pub struct Revision {
     pub revision: i64,
     pub title: String,
@@ -80,7 +84,7 @@ pub struct NewPage {
     /// when omitted.
     #[serde(default)]
     pub slug: Option<String>,
-    /// Page content in AsciiDoc. Do not repeat the title as a `= Title` line.
+    /// Page content in `AsciiDoc`. Do not repeat the title as a `= Title` line.
     #[serde(default)]
     pub body: String,
     /// Publish immediately instead of creating a draft.
@@ -102,7 +106,7 @@ pub struct PageUpdate {
     /// New slug; the page moves to the new URL.
     #[serde(default)]
     pub slug: Option<String>,
-    /// New AsciiDoc body, replacing the old one entirely.
+    /// New `AsciiDoc` body, replacing the old one entirely.
     #[serde(default)]
     pub body: Option<String>,
     /// Whether the page is linked from the site navigation.

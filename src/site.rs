@@ -141,7 +141,7 @@ async fn render_page(
 }
 
 /// The page, laid out like Twenty Twenty-Five's `page` template so a
-/// WordPress theme's styles apply to it.
+/// `WordPress` theme's styles apply to it.
 fn layout(
     frame: &Frame,
     title: &str,
@@ -149,9 +149,7 @@ fn layout(
     current: Option<&str>,
     content: &str,
 ) -> Html<String> {
-    let site_title = escape(&frame.settings.site_title);
     let language = &frame.settings.site_language;
-    let labels = Labels::for_language(language);
     let mut html = String::with_capacity(content.len() + 4096);
     let _ = write!(
         html,
@@ -174,7 +172,39 @@ fn layout(
         frame.stylesheet_version
     );
 
-    // Header: site title on the left, navigation on the right.
+    write_header(&mut html, frame, current);
+
+    // Main: title and content, constrained to the theme's content width.
+    html.push_str(
+        "<main class=\"wp-block-group has-global-padding is-layout-constrained\" \
+         style=\"margin-top:var(--wp--preset--spacing--60, 2.5rem)\">\n<div \
+         class=\"wp-block-group alignfull has-global-padding is-layout-constrained\" \
+         style=\"padding-top:var(--wp--preset--spacing--60, \
+         2.5rem);padding-bottom:var(--wp--preset--spacing--60, 2.5rem)\">\n",
+    );
+    if let Some(heading) = heading {
+        let _ = writeln!(
+            html,
+            "<h1 class=\"wp-block-post-title\">{}</h1>",
+            escape(heading)
+        );
+    }
+    html.push_str(
+        "<div class=\"entry-content alignfull wp-block-post-content has-global-padding \
+         is-layout-constrained wm-adoc\">\n",
+    );
+    html.push_str(content);
+    html.push_str("\n</div>\n</div>\n</main>\n");
+
+    write_footer(&mut html, frame);
+    html.push_str("</div>\n</body>\n</html>\n");
+    Html(html)
+}
+
+/// Header: site title on the left, navigation on the right.
+fn write_header(html: &mut String, frame: &Frame, current: Option<&str>) {
+    let site_title = escape(&frame.settings.site_title);
+    let labels = Labels::for_language(&frame.settings.site_language);
     let _ = write!(
         html,
         "<header class=\"wp-block-template-part\">\n<div class=\"wp-block-group alignfull \
@@ -223,31 +253,12 @@ fn layout(
         html.push_str("</ul>\n</div>\n</nav>\n");
     }
     html.push_str("</div>\n</div>\n</div>\n</header>\n");
+}
 
-    // Main: title and content, constrained to the theme's content width.
-    html.push_str(
-        "<main class=\"wp-block-group has-global-padding is-layout-constrained\" \
-         style=\"margin-top:var(--wp--preset--spacing--60, 2.5rem)\">\n<div \
-         class=\"wp-block-group alignfull has-global-padding is-layout-constrained\" \
-         style=\"padding-top:var(--wp--preset--spacing--60, \
-         2.5rem);padding-bottom:var(--wp--preset--spacing--60, 2.5rem)\">\n",
-    );
-    if let Some(heading) = heading {
-        let _ = writeln!(
-            html,
-            "<h1 class=\"wp-block-post-title\">{}</h1>",
-            escape(heading)
-        );
-    }
-    html.push_str(
-        "<div class=\"entry-content alignfull wp-block-post-content has-global-padding \
-         is-layout-constrained wm-adoc\">\n",
-    );
-    html.push_str(content);
-    html.push_str("\n</div>\n</div>\n</main>\n");
-
-    // Footer: site title, tagline and the footer text, when there is any;
-    // otherwise just the spacing, like a site whose footer was emptied.
+/// Footer: site title, tagline and the footer text, when there is any;
+/// otherwise just the spacing, like a site whose footer was emptied.
+fn write_footer(html: &mut String, frame: &Frame) {
+    let site_title = escape(&frame.settings.site_title);
     html.push_str(
         "<footer class=\"wp-block-template-part\">\n<div class=\"wp-block-group \
          has-global-padding is-layout-constrained\" \
@@ -278,8 +289,7 @@ fn layout(
     if has_footer {
         html.push_str("</div>\n");
     }
-    html.push_str("</div>\n</footer>\n</div>\n</body>\n</html>\n");
-    Html(html)
+    html.push_str("</div>\n</footer>\n");
 }
 
 /// The few words the page frame itself needs.
@@ -307,7 +317,7 @@ impl Labels {
     }
 }
 
-/// The icons WordPress's navigation block uses.
+/// The icons `WordPress`'s navigation block uses.
 const MENU_ICON: &str = "<svg width=\"24\" height=\"24\" xmlns=\"http://www.w3.org/2000/svg\" \
                          viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><path \
                          d=\"M4 7.5h16v1.5H4z M4 15h16v1.5H4z\"></path></svg>";
@@ -351,7 +361,7 @@ async fn theme_asset(
     let allowed = std::path::Path::new(&path)
         .extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| THEME_ASSET_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()));
+        .is_some_and(|ext| THEME_ASSET_EXTENSIONS.contains(&ext.to_lowercase().as_str()));
     if crate::theme::validate_slug(&theme).is_err() || !safe_path || !allowed {
         return StatusCode::NOT_FOUND.into_response();
     }

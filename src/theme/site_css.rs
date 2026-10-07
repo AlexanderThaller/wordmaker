@@ -1,7 +1,7 @@
-//! Put a compiled theme together with the rules for WordMaker's page frame
-//! and for AsciiDoc content.
+//! Put a compiled theme together with the rules for `WordMaker`'s page frame
+//! and for `AsciiDoc` content.
 //!
-//! The AsciiDoc rules from `adocers-html` go into a cascade layer, so every
+//! The `AsciiDoc` rules from `adocers-html` go into a cascade layer, so every
 //! rule the theme makes wins over them while they still cover what a theme
 //! knows nothing about: admonitions, callouts, syntax highlighting.
 
@@ -32,14 +32,14 @@ pub fn assemble(theme: &Value, compiled: &str, builtin: bool) -> String {
     out
 }
 
-/// Point the variables the AsciiDoc rules read at the theme's colours.
+/// Point the variables the `AsciiDoc` rules read at the theme's colours.
 fn bridge_variables(theme: &Value) -> String {
     let bg = css::css_at(theme, &["styles", "color", "background"])
         .unwrap_or_else(|| "var(--wp--preset--color--base, #fff)".into());
     let fg = css::css_at(theme, &["styles", "color", "text"])
         .unwrap_or_else(|| "var(--wp--preset--color--contrast, #111)".into());
     let link = css::css_at(theme, &["styles", "elements", "link", "color", "text"])
-        .filter(|c| !c.eq_ignore_ascii_case("currentcolor") && c != "inherit");
+        .filter(|c| c.to_lowercase() != "currentcolor" && c != "inherit");
     let accent = link.unwrap_or_else(|| "var(--fg)".into());
     let code_bg = css::css_at(
         theme,
@@ -109,7 +109,7 @@ const HIGHLIGHT_DARK: &str = "  --admon-note: #6ea8e8; --admon-tip: #e3b341; --a
 ";
 
 /// The few block-library rules the page frame relies on. They come before the
-/// theme's styles, as WordPress's own block CSS does, so a theme can override
+/// theme's styles, as `WordPress`'s own block CSS does, so a theme can override
 /// them.
 const FRAME_CSS: &str = r#"
 *, *::before, *::after { box-sizing: border-box; }
@@ -181,8 +181,9 @@ body { margin: 0; background: var(--bg); color: var(--fg); }
 .wp-block-gallery.is-cropped > figure.wp-block-image img { width: 100%; flex: 1 0 0%; object-fit: cover; aspect-ratio: 3 / 4; }
 "#;
 
-/// Fit Asciidoctor's markup into WordPress's flow layout: section wrappers act
-/// as constrained containers, block spacing comes from the theme's block gap.
+/// Fit Asciidoctor's markup into `WordPress`'s flow layout: section wrappers
+/// act as constrained containers, block spacing comes from the theme's block
+/// gap.
 const CONTENT_CSS: &str = r#"
 .wm-adoc :is(.sect1, .sect2, .sect3, .sect4, .sect5, .sect6, .sectionbody) { max-width: none !important; }
 .wm-adoc :is(.sect1, .sect2, .sect3, .sect4, .sect5, .sect6, .sectionbody) > * { margin-block-start: var(--wp--style--block-gap); margin-block-end: 0; }
