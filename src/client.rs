@@ -121,11 +121,83 @@ async fn connect(
         .filter(|t| !t.trim().is_empty())
         .context("WORDMAKER_TOKEN must be set to the server's token")?;
     let transport = StreamableHttpClientTransport::from_config(
-        StreamableHttpClientTransportConfig::with_uri(url.clone()).auth_header(token),
+        StreamableHttpClientTransportConfig::with_uri(url.clone()).auth_header(token.clone()),
     );
-    ().serve(transport)
-        .await
-        .with_context(|| format!("could not connect to the MCP server at {url}"))
+    match ().serve(transport).await {
+        Ok(client) => Ok(client),
+        // rmcp's worker logs the HTTP failure and hands back only "transport
+        // channel closed", so ask the endpoint again to say what went wrong.
+        Err(err) => match diagnose(&url, &token).await {
+            Some(cause) => bail!("could not connect to the MCP server at {url}: {cause}"),
+            None => Err(anyhow::Error::new(err)
+                .context(format!("could not connect to the MCP server at {url}"))),
+        },
+    }
+}
+
+/// Probe `url` with a plain `initialize` request and describe why it fails,
+/// or `None` when the endpoint answers fine and the cause lies elsewhere.
+async fn diagnose(url: &str, token: &str) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let response = client
+        .post(url)
+        .bearer_auth(token)
+        .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "wordmaker-client", "version": env!("CARGO_PKG_VERSION") },
+            },
+        })
+        .to_string())
+        .send()
+        .await;
+    match response {
+        Err(err) if err.is_connect() || err.is_timeout() => {
+            Some(format!("the server is not reachable ({err})"))
+        }
+        Err(err) => Some(err.to_string()),
+        Ok(response) if response.status().is_success() => None,
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            Some(describe_failure(status, &body))
+        }
+    }
+}
+
+fn describe_failure(status: reqwest::StatusCode, body: &str) -> String {
+    // The server answers errors as `{"error": "..."}`.
+    let detail = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v["error"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| body.trim().chars().take(200).collect());
+    let detail = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {detail}")
+    };
+    let hint = match status {
+        reqwest::StatusCode::UNAUTHORIZED => "; check WORDMAKER_TOKEN or --token",
+        reqwest::StatusCode::FORBIDDEN => {
+            "; the server may not accept this host name, see WORDMAKER_ALLOWED_HOSTS"
+        }
+        // A path the server does not route lands on the public site, which
+        // only answers GET.
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED => {
+            "; check WORDMAKER_MCP_URL or --url"
+        }
+        _ => "",
+    };
+    format!("HTTP {status}{detail}{hint}")
 }
 
 fn info(client: &RunningService<RoleClient, ()>) {
@@ -360,6 +432,25 @@ mod tests {
         assert!(call_arguments(&call(Some("[1]"), &[], &[])).is_err());
         assert!(call_arguments(&call(None, &["novalue"], &[])).is_err());
         assert!(call_arguments(&call(None, &[], &["x=nope"])).is_err());
+    }
+
+    #[test]
+    fn describes_http_failures() {
+        let msg = describe_failure(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":"missing or invalid API token"}"#,
+        );
+        assert_eq!(
+            msg,
+            "HTTP 401 Unauthorized: missing or invalid API token; check WORDMAKER_TOKEN or --token"
+        );
+        let msg = describe_failure(reqwest::StatusCode::NOT_FOUND, "");
+        assert_eq!(msg, "HTTP 404 Not Found; check WORDMAKER_MCP_URL or --url");
+        let msg = describe_failure(
+            reqwest::StatusCode::BAD_GATEWAY,
+            "<html>proxy down</html>\n",
+        );
+        assert_eq!(msg, "HTTP 502 Bad Gateway: <html>proxy down</html>");
     }
 
     #[test]

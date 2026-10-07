@@ -78,9 +78,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Logs go to stderr: in stdio mode stdout carries the MCP protocol. The
-    // client keeps quiet so agents only see results and errors.
+    // client keeps quiet so agents only see results and errors; it reports
+    // transport failures itself, so rmcp's own logging stays off.
     let default_level = match cli.command {
-        Some(Command::Client(_)) => "warn",
+        Some(Command::Client(_)) => "warn,rmcp=off",
         _ => "info",
     };
     tracing_subscriber::fmt()
