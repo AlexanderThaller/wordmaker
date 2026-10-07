@@ -28,7 +28,8 @@ The site is now at http://127.0.0.1:3000.
 |`WORDMAKER_BASE_URL` |`http://127.0.0.1:3000` |Public URL, used for links returned by the API
 |`WORDMAKER_MAX_UPLOAD` |`26214400` |Largest upload in bytes
 |`WORDMAKER_BIND` |`127.0.0.1:3000` |Listen address (`serve` only)
-|`WORDMAKER_TOKEN` |– |Bearer token for `/api` and `/mcp` (`serve` only, required)
+|`WORDMAKER_TOKEN` |– |Bearer token for `/api` and `/mcp` (required by `serve` and `client`)
+|`WORDMAKER_MCP_URL` |`$WORDMAKER_BASE_URL/mcp` |MCP endpoint (`client` only)
 |`WORDMAKER_ALLOWED_HOSTS` |– |Extra comma-separated `Host` values accepted by `/mcp`
 |===
 
@@ -72,6 +73,27 @@ When the server is not reached through `localhost`, set `WORDMAKER_BASE_URL` (or
 `list_revisions`, `get_revision`, `restore_revision`, `preview_adoc`,
 `upload_media`, `list_media`, `delete_media`, `get_settings`, `set_settings`,
 `list_themes`, `install_theme`, `activate_theme`, `delete_theme`.
+
+=== Command line client
+
+Agents that can run shell commands but have no MCP support can use `wordmaker client`, which talks to the `/mcp` endpoint of a running server.
+It reads `WORDMAKER_TOKEN` and connects to `$WORDMAKER_BASE_URL/mcp` (override with `--url` or `WORDMAKER_MCP_URL`).
+
+[source,sh]
+----
+wordmaker client info                 # server version and usage instructions
+wordmaker client tools                # every tool with its parameters
+wordmaker client tools create_page    # one tool; add --json for the full schema
+
+wordmaker client call create_page '{"title": "About"}' --file body=about.adoc --json publish=true
+wordmaker client call get_page --arg slug=about
+wordmaker client call upload_media --arg filename=logo.png --base64 content_base64=logo.png
+echo '{"slug": "about"}' | wordmaker client call get_page -
+----
+
+Arguments come from an optional JSON object (`-` reads it from stdin), overridden by
+`--arg KEY=VALUE` (string), `--json KEY=JSON`, `--file KEY=PATH` (file contents as a string) and `--base64 KEY=PATH`.
+The result goes to stdout; a failed tool call prints the error to stderr and exits with status 1.
 
 == REST API
 
