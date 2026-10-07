@@ -171,8 +171,7 @@ body { margin: 0; background: var(--bg); color: var(--fg); }
 }
 .wp-block-image { margin-left: 0; margin-right: 0; }
 .wp-block-image img { display: block; max-width: 100%; height: auto; box-sizing: border-box; }
-.wp-block-image img[style*="aspect-ratio"] { width: 100%; }
-.wp-block-image .wp-element-caption { margin-top: 0.5em; }
+.wp-block-image .wp-element-caption { margin-top: 0.5em; margin-bottom: 1em; }
 .wp-block-gallery.has-nested-images { display: flex; flex-wrap: wrap; align-items: normal; gap: var(--wp--style--block-gap, 0.5em); margin-left: 0; margin-right: 0; }
 .wp-block-gallery.has-nested-images > figure.wp-block-image { margin: 0; flex-grow: 1; width: calc(50% - var(--wp--style--block-gap, 0.5em) / 2); display: flex; flex-direction: column; }
 @media (min-width: 600px) {
