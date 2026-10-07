@@ -162,4 +162,26 @@ Content on the theme's section background.
 --
 ----
 
+Columns work like WordPress's columns block: an open block with the `wp-block-columns` role holds one example block with the `wp-block-column` role per column.
+They sit side by side from 782px and stack on narrower screens (add `is-not-stacked-on-mobile` to keep them side by side); `are-vertically-aligned-center` (or `-top`, `-bottom`) aligns them.
+
+[source,asciidoc]
+----
+[.wp-block-columns.are-vertically-aligned-center]
+--
+[.wp-block-column]
+====
+[discrete]
+== About me
+
+A paragraph next to the photo.
+====
+
+[.wp-block-column]
+====
+image::/media/1a2b3c4d-portrait.jpg[Portrait]
+====
+--
+----
+
 Without a theme, WordMaker uses a built-in look that follows the reader's light or dark preference.

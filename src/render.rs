@@ -50,4 +50,37 @@ mod tests {
         assert!(out.html.contains("Hello"), "{}", out.html);
         assert!(out.toc.is_some());
     }
+
+    #[test]
+    fn columns_markup_matches_the_column_css() {
+        // site_css styles `.openblock.wp-block-columns > .content` as the
+        // flex container and `.wp-block-column` blocks inside it.
+        let out = render(
+            "[.wp-block-columns]
+--
+[.wp-block-column]
+====
+Left
+====
+
+[.wp-block-column]
+====
+Right
+====
+--
+",
+        );
+        let html = out.html.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            html.contains(
+                r#"<div class="openblock wp-block-columns"> <div class="content"> <div class="exampleblock wp-block-column">"#
+            ),
+            "{html}"
+        );
+        assert_eq!(
+            html.matches("exampleblock wp-block-column").count(),
+            2,
+            "{html}"
+        );
+    }
 }

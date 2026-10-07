@@ -169,6 +169,27 @@ body { margin: 0; background: var(--bg); color: var(--fg); }
   .wp-block-columns { flex-wrap: nowrap; }
   .wp-block-columns > .wp-block-column[style*="flex-basis"] { flex-grow: 0; }
 }
+/* The same columns written in AsciiDoc: an open block with the
+   `wp-block-columns` role holding one block per column, usually example
+   blocks with the `wp-block-column` role. AsciiDoc wraps a block's children
+   in `.content`, so that wrapper is the flex container, and an example block
+   used as a column drops its frame. */
+.wm-adoc .openblock.wp-block-columns { display: block; }
+.wm-adoc .openblock.wp-block-columns > .content { display: flex; flex-wrap: wrap; align-items: normal; gap: var(--wp--style--block-gap, 2em); }
+.wm-adoc .openblock.wp-block-columns.are-vertically-aligned-top > .content { align-items: flex-start; }
+.wm-adoc .openblock.wp-block-columns.are-vertically-aligned-center > .content { align-items: center; }
+.wm-adoc .openblock.wp-block-columns.are-vertically-aligned-bottom > .content { align-items: flex-end; }
+.wm-adoc .openblock.wp-block-columns > .content > * { margin-block: 0; }
+.wm-adoc :is(.openblock, .exampleblock, .sidebarblock).wp-block-column { margin: 0; }
+.wm-adoc :is(.openblock, .exampleblock, .sidebarblock).wp-block-column > .content { border: 0; border-radius: 0; padding: 0; background: none; }
+.wm-adoc .wp-block-column > .content > * { margin-block: 0; }
+.wm-adoc .wp-block-column > .content > * + * { margin-block-start: var(--wp--style--block-gap); }
+@media (max-width: 781px) {
+  .wm-adoc .openblock.wp-block-columns:not(.is-not-stacked-on-mobile) > .content > .wp-block-column { flex-basis: 100% !important; }
+}
+@media (min-width: 782px) {
+  .wm-adoc .openblock.wp-block-columns > .content { flex-wrap: nowrap; }
+}
 .wp-block-image { margin-left: 0; margin-right: 0; }
 .wp-block-image img { display: block; max-width: 100%; height: auto; box-sizing: border-box; }
 .wp-block-image .wp-element-caption { margin-top: 0.5em; margin-bottom: 1em; }
