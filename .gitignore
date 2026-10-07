@@ -1,0 +1,5 @@
+/target
+/media
+*.db
+*.db-shm
+*.db-wal

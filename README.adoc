@@ -1,1 +1,107 @@
 = WordMaker
+
+A small CMS written in Rust. Pages are written in AsciiDoc, stored in SQLite and served as a plain website.
+Everything can be managed through a REST API or an MCP server, so Claude can write and publish pages for you.
+
+== Running
+
+Requires Rust 1.96 or newer.
+
+[source,sh]
+----
+cargo build --release
+export WORDMAKER_TOKEN=$(./target/release/wordmaker token)
+./target/release/wordmaker serve
+----
+
+The site is now at http://127.0.0.1:3000.
+
+=== Configuration
+
+[cols="1,1,2"]
+|===
+|Environment variable |Default |Meaning
+
+|`WORDMAKER_DB` |`sqlite://wordmaker.db` |SQLite database; created and migrated on start
+|`WORDMAKER_MEDIA_DIR` |`media` |Where uploaded files are stored
+|`WORDMAKER_BASE_URL` |`http://127.0.0.1:3000` |Public URL, used for links returned by the API
+|`WORDMAKER_MAX_UPLOAD` |`26214400` |Largest upload in bytes
+|`WORDMAKER_BIND` |`127.0.0.1:3000` |Listen address (`serve` only)
+|`WORDMAKER_TOKEN` |– |Bearer token for `/api` and `/mcp` (`serve` only, required)
+|`WORDMAKER_ALLOWED_HOSTS` |– |Extra comma-separated `Host` values accepted by `/mcp`
+|===
+
+Every variable also has a command line flag, see `wordmaker --help`.
+
+== Claude Desktop
+
+=== Local (stdio)
+
+Claude Desktop starts WordMaker itself. Add this to `claude_desktop_config.json` and point it at the same database as the web server:
+
+[source,json]
+----
+{
+  "mcpServers": {
+    "wordmaker": {
+      "command": "/path/to/wordmaker",
+      "args": ["mcp"],
+      "env": {
+        "WORDMAKER_DB": "sqlite:///path/to/wordmaker.db",
+        "WORDMAKER_MEDIA_DIR": "/path/to/media",
+        "WORDMAKER_BASE_URL": "http://127.0.0.1:3000"
+      }
+    }
+  }
+}
+----
+
+Use absolute paths: Claude Desktop does not start the process in your project directory.
+The stdio server needs no token, and does not need `wordmaker serve` to be running, though you will want it running to see the result.
+
+=== Remote (HTTP)
+
+`wordmaker serve` also speaks MCP (streamable HTTP) at `/mcp`, protected by the same bearer token as the API.
+When the server is not reached through `localhost`, set `WORDMAKER_BASE_URL` (or `WORDMAKER_ALLOWED_HOSTS`) to the public host name, otherwise MCP requests are rejected to prevent DNS rebinding.
+
+=== Tools
+
+`list_pages`, `get_page`, `create_page`, `update_page`, `delete_page`, `publish_page`, `unpublish_page`,
+`list_revisions`, `get_revision`, `restore_revision`, `preview_adoc`,
+`upload_media`, `list_media`, `delete_media`, `get_settings`, `set_settings`.
+
+== REST API
+
+All endpoints live under `/api/v1` and require `Authorization: Bearer $WORDMAKER_TOKEN`.
+
+[cols="1,2"]
+|===
+|Endpoint |Purpose
+
+|`GET /pages?status=draft\|published` |List pages
+|`POST /pages` |Create: `{"title", "slug"?, "body"?, "publish"?}`
+|`GET /pages/{slug}` |Page with AsciiDoc body
+|`PATCH /pages/{slug}` |Change `title`, `slug` and/or `body`
+|`DELETE /pages/{slug}` |Delete page and its history
+|`POST /pages/{slug}/publish`, `/unpublish` |Change visibility
+|`GET /pages/{slug}/revisions` |Revision list, newest first
+|`GET /pages/{slug}/revisions/{n}` |One revision
+|`POST /pages/{slug}/revisions/{n}/restore` |Make a revision current again
+|`POST /render` |Render `{"body"}` to HTML without saving
+|`GET /media`, `POST /media` (multipart), `DELETE /media/{filename}` |Uploaded files
+|`GET /settings`, `PUT /settings` |`site_title`, `home_slug`
+|===
+
+[source,sh]
+----
+curl -H "Authorization: Bearer $WORDMAKER_TOKEN" -H 'content-type: application/json' \
+  -d '{"title": "About", "body": "== Who we are\n\nHello!", "publish": true}' \
+  http://127.0.0.1:3000/api/v1/pages
+----
+
+== Writing pages
+
+* The page title is rendered as the heading, so start the body with `==` sections rather than a `= Title` line.
+* Reference uploaded images by their path: `image::/media/1a2b3c4d-logo.png[Logo]`.
+* Link to other pages with `link:/about[About]`.
+* Only published pages are visible on the site. `/` shows the page chosen as `home_slug`, or a list of all published pages.
