@@ -122,16 +122,64 @@ body { margin: 0; background: var(--bg); color: var(--fg); }
 .wp-block-navigation { display: flex; align-items: center; }
 .wp-block-navigation__container { list-style: none; margin: 0; padding-left: 0; display: flex; flex-wrap: wrap; align-items: center; gap: inherit; }
 .wp-block-navigation .wp-block-navigation-item__content { color: inherit; display: block; }
-.wp-block-navigation .current-menu-item > .wp-block-navigation-item__content { text-decoration: underline; }
 .wp-block-post-title { word-break: break-word; box-sizing: border-box; }
 .wm-header-row { justify-content: space-between; flex-wrap: nowrap; }
 .wm-header-row .wp-block-navigation { justify-content: flex-end; }
 .wm-page-list { list-style: none; padding: 0; }
 .wm-page-list > li + li { margin-top: var(--wp--style--block-gap); }
 .wm-footer-text > :first-child { margin-top: 0; }
-@media (max-width: 600px) {
-  .wm-header-row { flex-wrap: wrap; }
+
+/* Responsive navigation: inline from 600px, an overlay behind a menu button
+   below, as WordPress's navigation block lays it out. The overlay is a
+   popover, so the browser's own popover styles are reset here. */
+.wp-block-navigation__responsive-container-open,
+.wp-block-navigation__responsive-container-close { display: flex; align-items: center; justify-content: center; padding: 0; border: 0; background: transparent; color: currentColor; cursor: pointer; }
+.wp-block-navigation__responsive-container-open svg,
+.wp-block-navigation__responsive-container-close svg { fill: currentColor; display: block; }
+.wp-block-navigation__responsive-container[popover] { position: static; inset: auto; width: auto; height: auto; margin: 0; padding: 0; border: 0; background: transparent; color: inherit; overflow: visible; }
+.wp-block-navigation__responsive-container-close { display: none; }
+@media (min-width: 600px) {
+  .wp-block-navigation__responsive-container-open { display: none; }
+  .wp-block-navigation__responsive-container[popover] { display: block; }
 }
+@media (max-width: 599.98px) {
+  .wp-block-navigation__responsive-container:popover-open { position: fixed; inset: 0; width: 100%; height: 100%; max-width: none; max-height: none; z-index: 100000; display: flex; flex-direction: column; overflow: auto; background: var(--wp--preset--color--base, var(--bg)); color: var(--wp--preset--color--contrast, var(--fg)); padding: clamp(1rem, var(--wp--style--root--padding-top), 20rem) clamp(1rem, var(--wp--style--root--padding-right), 20rem) clamp(1rem, var(--wp--style--root--padding-bottom), 20rem) clamp(1rem, var(--wp--style--root--padding-left), 20rem); }
+  .wp-block-navigation__responsive-container:popover-open .wp-block-navigation__responsive-container-close { display: flex; align-self: flex-end; }
+  .wp-block-navigation__responsive-container:popover-open .wp-block-navigation__container { flex-direction: column; flex-wrap: nowrap; align-items: flex-end; gap: var(--wp--style--block-gap, 2em); padding-top: calc(2rem + 24px); }
+  :root:has(.wp-block-navigation__responsive-container:popover-open) { overflow: hidden; }
+}
+
+/* Core blocks, for WordPress block markup pasted into a page as a
+   passthrough. WordPress adds layout classes when it renders a post; saved
+   markup has none, so these rules stand in for both. */
+.wp-block-columns { display: flex; flex-wrap: wrap; align-items: normal; gap: var(--wp--style--block-gap, 2em); }
+.wp-block-columns.are-vertically-aligned-top { align-items: flex-start; }
+.wp-block-columns.are-vertically-aligned-center { align-items: center; }
+.wp-block-columns.are-vertically-aligned-bottom { align-items: flex-end; }
+.wp-block-column { flex-grow: 1; flex-basis: 0; min-width: 0; overflow-wrap: break-word; }
+.wp-block-column.is-vertically-aligned-top { align-self: flex-start; }
+.wp-block-column.is-vertically-aligned-center { align-self: center; }
+.wp-block-column.is-vertically-aligned-bottom { align-self: flex-end; }
+.wp-block-column > * { margin-block: 0; }
+.wp-block-column > * + * { margin-block-start: var(--wp--style--block-gap); }
+@media (max-width: 781px) {
+  .wp-block-columns:not(.is-not-stacked-on-mobile) > .wp-block-column { flex-basis: 100% !important; }
+}
+@media (min-width: 782px) {
+  .wp-block-columns { flex-wrap: nowrap; }
+  .wp-block-columns > .wp-block-column[style*="flex-basis"] { flex-grow: 0; }
+}
+.wp-block-image { margin-left: 0; margin-right: 0; }
+.wp-block-image img { display: block; max-width: 100%; height: auto; box-sizing: border-box; }
+.wp-block-image img[style*="aspect-ratio"] { width: 100%; }
+.wp-block-image .wp-element-caption { margin-top: 0.5em; }
+.wp-block-gallery.has-nested-images { display: flex; flex-wrap: wrap; align-items: normal; gap: var(--wp--style--block-gap, 0.5em); margin-left: 0; margin-right: 0; }
+.wp-block-gallery.has-nested-images > figure.wp-block-image { margin: 0; flex-grow: 1; width: calc(50% - var(--wp--style--block-gap, 0.5em) / 2); display: flex; flex-direction: column; }
+@media (min-width: 600px) {
+  .wp-block-gallery.columns-3 > figure.wp-block-image { width: calc(33.333% - var(--wp--style--block-gap, 0.5em) * 2 / 3); }
+  .wp-block-gallery.columns-4 > figure.wp-block-image { width: calc(25% - var(--wp--style--block-gap, 0.5em) * 3 / 4); }
+}
+.wp-block-gallery.is-cropped > figure.wp-block-image img { width: 100%; flex: 1 0 0%; object-fit: cover; aspect-ratio: 3 / 4; }
 "#;
 
 /// Fit Asciidoctor's markup into WordPress's flow layout: section wrappers act
@@ -145,7 +193,7 @@ const CONTENT_CSS: &str = r#"
 .wm-adoc :is(.sect1, .sect2, .sect3, .sect4, .sect5, .sect6, .sectionbody) > .alignfull { margin-left: calc(var(--wp--style--root--padding-left) * -1); margin-right: calc(var(--wp--style--root--padding-right) * -1); }
 .wm-adoc :is(.sect1, .sect2, .sect3, .sect4, .sect5, .sect6):not(:first-child) { margin-block-start: calc(var(--wp--style--block-gap) * 2); }
 .wm-adoc :where(h1, h2, h3, h4, h5, h6) { margin-bottom: 0; padding-bottom: 0; border-bottom: 0; }
-.wm-adoc :where(p) { margin: 0; }
+.wm-adoc :where(.paragraph, li, dd, td, th) > p { margin: 0; }
 .wm-adoc :where(.content, td.content, li, dd, blockquote) > * + * { margin-block-start: 0.75em; }
 .wm-adoc :where(.ulist, .olist) > :where(ul, ol) { margin: 0; }
 .wm-adoc :where(.openblock, .exampleblock)[class*="is-style-"] { padding: var(--wp--preset--spacing--50, 2rem); }

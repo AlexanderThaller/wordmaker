@@ -266,6 +266,35 @@ mod tests {
         let (_, html) = send(&app, Method::GET, "/", None).await;
         assert!(html.contains("Welcome text."), "{html}");
         assert!(html.contains("<title>My Site</title>"), "{html}");
+        assert!(html.contains("<html lang=\"en\">"), "{html}");
+        assert!(html.contains("aria-label=\"Open menu\""), "{html}");
+        assert!(html.contains("popovertarget=\"wm-menu\""), "{html}");
+        // No tagline or footer text: the footer stays empty.
+        assert!(
+            !html[html.find("<footer").unwrap()..].contains("site-title"),
+            "{html}"
+        );
+
+        let (status, body) = send(
+            &app,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(json!({ "site_language": "de" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, html) = send(&app, Method::GET, "/", None).await;
+        assert!(html.contains("<html lang=\"de\">"), "{html}");
+        assert!(html.contains("aria-label=\"Menü öffnen\""), "{html}");
+
+        let (status, _) = send(
+            &app,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(json!({ "site_language": "de\"><script>" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

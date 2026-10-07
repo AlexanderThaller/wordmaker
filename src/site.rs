@@ -130,8 +130,14 @@ async fn render_page(
     } else {
         format!("{} – {site_title}", page.title)
     };
-    let heading = (!is_home).then_some(page.title.as_str());
-    Ok(layout(frame, &title, heading, Some(&page.slug), &rendered.html).into_response())
+    Ok(layout(
+        frame,
+        &title,
+        Some(&page.title),
+        Some(&page.slug),
+        &rendered.html,
+    )
+    .into_response())
 }
 
 /// The page, laid out like Twenty Twenty-Five's `page` template so a
@@ -144,11 +150,14 @@ fn layout(
     content: &str,
 ) -> Html<String> {
     let site_title = escape(&frame.settings.site_title);
+    let language = &frame.settings.site_language;
+    let labels = Labels::for_language(language);
     let mut html = String::with_capacity(content.len() + 4096);
     let _ = write!(
         html,
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta \
+        "<!DOCTYPE html>\n<html lang=\"{}\">\n<head>\n<meta charset=\"utf-8\">\n<meta \
          name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n",
+        escape(language),
         escape(title)
     );
     if let Some(tagline) = &frame.settings.site_tagline {
@@ -176,9 +185,23 @@ fn layout(
          class=\"wp-block-site-title\"><a href=\"/\" rel=\"home\">{site_title}</a></p>\n"
     );
     if !frame.nav.is_empty() {
-        html.push_str(
-            "<nav class=\"wp-block-navigation is-layout-flex\" aria-label=\"Main\">\n<ul \
+        // Below 600px the list moves into an overlay behind a menu button, as
+        // WordPress's navigation block does. The popover attribute gives the
+        // overlay its open/close behaviour, Escape included, without script.
+        let _ = write!(
+            html,
+            "<nav class=\"wp-block-navigation is-responsive is-layout-flex\" \
+             aria-label=\"{menu}\">\n<button type=\"button\" \
+             class=\"wp-block-navigation__responsive-container-open\" popovertarget=\"wm-menu\" \
+             aria-label=\"{open}\">{MENU_ICON}</button>\n<div \
+             class=\"wp-block-navigation__responsive-container\" id=\"wm-menu\" popover>\n<button \
+             type=\"button\" class=\"wp-block-navigation__responsive-container-close\" \
+             popovertarget=\"wm-menu\" popovertargetaction=\"hide\" \
+             aria-label=\"{close}\">{CLOSE_ICON}</button>\n<ul \
              class=\"wp-block-navigation__container is-layout-flex\">\n",
+            menu = labels.menu,
+            open = labels.open_menu,
+            close = labels.close_menu,
         );
         for page in &frame.nav {
             let is_current = current == Some(page.slug.as_str());
@@ -197,7 +220,7 @@ fn layout(
                 escape(&page.title)
             );
         }
-        html.push_str("</ul>\n</nav>\n");
+        html.push_str("</ul>\n</div>\n</nav>\n");
     }
     html.push_str("</div>\n</div>\n</div>\n</header>\n");
 
@@ -223,16 +246,22 @@ fn layout(
     html.push_str(content);
     html.push_str("\n</div>\n</div>\n</main>\n");
 
-    // Footer: site title, tagline and the footer text.
-    let _ = write!(
-        html,
+    // Footer: site title, tagline and the footer text, when there is any;
+    // otherwise just the spacing, like a site whose footer was emptied.
+    html.push_str(
         "<footer class=\"wp-block-template-part\">\n<div class=\"wp-block-group \
          has-global-padding is-layout-constrained\" \
          style=\"padding-top:var(--wp--preset--spacing--60, \
-         2.5rem);padding-bottom:var(--wp--preset--spacing--50, 2rem)\">\n<div \
-         class=\"wp-block-group alignwide is-layout-flow\">\n<p class=\"wp-block-site-title\"><a \
-         href=\"/\" rel=\"home\">{site_title}</a></p>\n"
+         2.5rem);padding-bottom:var(--wp--preset--spacing--50, 2rem)\">\n",
     );
+    let has_footer = frame.settings.site_tagline.is_some() || frame.footer_html.is_some();
+    if has_footer {
+        let _ = write!(
+            html,
+            "<div class=\"wp-block-group alignwide is-layout-flow\">\n<p \
+             class=\"wp-block-site-title\"><a href=\"/\" rel=\"home\">{site_title}</a></p>\n"
+        );
+    }
     if let Some(tagline) = &frame.settings.site_tagline {
         let _ = writeln!(
             html,
@@ -246,9 +275,47 @@ fn layout(
             "<div class=\"wm-footer-text wm-adoc has-small-font-size\">{footer}</div>"
         );
     }
-    html.push_str("</div>\n</div>\n</footer>\n</div>\n</body>\n</html>\n");
+    if has_footer {
+        html.push_str("</div>\n");
+    }
+    html.push_str("</div>\n</footer>\n</div>\n</body>\n</html>\n");
     Html(html)
 }
+
+/// The few words the page frame itself needs.
+struct Labels {
+    menu: &'static str,
+    open_menu: &'static str,
+    close_menu: &'static str,
+}
+
+impl Labels {
+    fn for_language(language: &str) -> Self {
+        if language == "de" || language.starts_with("de-") {
+            Self {
+                menu: "Menü",
+                open_menu: "Menü öffnen",
+                close_menu: "Menü schließen",
+            }
+        } else {
+            Self {
+                menu: "Menu",
+                open_menu: "Open menu",
+                close_menu: "Close menu",
+            }
+        }
+    }
+}
+
+/// The icons WordPress's navigation block uses.
+const MENU_ICON: &str = "<svg width=\"24\" height=\"24\" xmlns=\"http://www.w3.org/2000/svg\" \
+                         viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><path \
+                         d=\"M4 7.5h16v1.5H4z M4 15h16v1.5H4z\"></path></svg>";
+const CLOSE_ICON: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" \
+                          width=\"24\" height=\"24\" aria-hidden=\"true\" \
+                          focusable=\"false\"><path d=\"m13.06 12 6.47-6.47-1.06-1.06L12 10.94 \
+                          5.53 4.47 4.47 5.53 10.94 12l-6.47 6.47 1.06 1.06L12 13.06l6.47 6.47 \
+                          1.06-1.06L13.06 12Z\"></path></svg>";
 
 async fn stylesheet(State(state): State<AppState>) -> Result<Response, SiteError> {
     let settings = settings::get(&state.pool).await?;
