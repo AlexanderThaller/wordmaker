@@ -39,7 +39,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 mime_guess = "2.0.5"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2"] }
-rmcp = { version = "3.5.1", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "3.5.1", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "client", "transport-streamable-http-client-reqwest"] }
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

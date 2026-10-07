@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod client;
 mod config;
 mod db;
 mod domain;
@@ -45,6 +46,9 @@ enum Command {
     Serve(ServeArgs),
     /// Run the MCP server over stdio, for Claude Desktop.
     Mcp,
+    /// Talk to a running server's MCP endpoint from the shell, for agents
+    /// without MCP support.
+    Client(client::ClientArgs),
     /// Print a new random API token.
     Token,
 }
@@ -71,18 +75,25 @@ struct ServeArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Logs go to stderr: in stdio mode stdout carries the MCP protocol.
+    let cli = Cli::parse();
+
+    // Logs go to stderr: in stdio mode stdout carries the MCP protocol. The
+    // client keeps quiet so agents only see results and errors.
+    let default_level = match cli.command {
+        Some(Command::Client(_)) => "warn",
+        _ => "info",
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
         )
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Serve(ServeArgs::default())) {
         Command::Serve(args) => serve(cli.config, args).await,
         Command::Mcp => mcp_stdio(cli.config).await,
+        Command::Client(args) => client::run(&cli.config, args).await,
         Command::Token => {
             let token = format!(
                 "{}{}",
