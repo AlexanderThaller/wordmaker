@@ -1,11 +1,17 @@
 use std::path::Path;
 
-use chrono::{DateTime, Utc};
+use chrono::{
+    DateTime,
+    Utc,
+};
 use schemars::JsonSchema;
 use serde::Serialize;
 use sqlx::SqlitePool;
 
-use crate::error::{AppError, AppResult};
+use crate::error::{
+    AppError,
+    AppResult,
+};
 
 #[derive(Debug, Clone, Serialize, JsonSchema, sqlx::FromRow)]
 pub struct Media {

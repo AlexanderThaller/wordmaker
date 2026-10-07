@@ -1,6 +1,9 @@
 use serde::Serialize;
 
-use crate::error::{AppError, AppResult};
+use crate::error::{
+    AppError,
+    AppResult,
+};
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct Rendered {

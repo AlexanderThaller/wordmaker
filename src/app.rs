@@ -2,25 +2,41 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::{Request, State},
+    extract::{
+        Request,
+        State,
+    },
     http::header,
-    middleware::{self, Next},
+    middleware::{
+        self,
+        Next,
+    },
     response::Response,
 };
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    StreamableHttpServerConfig,
+    StreamableHttpService,
+    session::local::LocalSessionManager,
 };
 use sqlx::SqlitePool;
 use subtle::ConstantTimeEq;
 use tower_http::trace::TraceLayer;
 
-use crate::{api, config::Config, error::AppError, mcp::WordMakerMcp, site};
+use crate::{
+    api,
+    config::Config,
+    error::AppError,
+    mcp::WordMakerMcp,
+    site,
+    theme::ThemeCache,
+};
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
     pub config: Arc<Config>,
     pub token: Arc<str>,
+    pub themes: Arc<ThemeCache>,
 }
 
 /// The whole application: public site, `/api/v1` and `/mcp`.
@@ -72,10 +88,17 @@ async fn require_token(
 mod tests {
     use axum::{
         body::Body,
-        http::{Method, Request, StatusCode},
+        http::{
+            Method,
+            Request,
+            StatusCode,
+        },
     };
     use http_body_util::BodyExt;
-    use serde_json::{Value, json};
+    use serde_json::{
+        Value,
+        json,
+    };
     use tower::ServiceExt;
 
     use super::*;
@@ -84,6 +107,10 @@ mod tests {
         let config = Config {
             database_url: String::new(),
             media_dir: std::env::temp_dir().join("wordmaker-app-test"),
+            themes_dir: std::env::temp_dir().join(format!(
+                "wordmaker-app-test-themes-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
             base_url: "http://localhost:3000".into(),
             max_upload_bytes: 1024,
         };
@@ -91,6 +118,7 @@ mod tests {
             pool: crate::db::connect_memory().await,
             config: Arc::new(config),
             token: "secret".into(),
+            themes: Arc::default(),
         };
         router(state, vec!["localhost".into()])
     }
@@ -175,7 +203,11 @@ mod tests {
         let (status, html) = send(&app, Method::GET, "/hello-world", None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("<strong>bold</strong>"), "{html}");
-        assert!(html.contains("<h1>Hello World</h1>"), "{html}");
+        assert!(
+            html.contains("<h1 class=\"wp-block-post-title\">Hello World</h1>"),
+            "{html}"
+        );
+        assert!(html.contains("href=\"/_wm/style.css?v="), "{html}");
 
         let (_, index) = send(&app, Method::GET, "/", None).await;
         assert!(index.contains("href=\"/hello-world\""), "{index}");
@@ -234,5 +266,166 @@ mod tests {
         let (_, html) = send(&app, Method::GET, "/", None).await;
         assert!(html.contains("Welcome text."), "{html}");
         assert!(html.contains("<title>My Site</title>"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn navigation_order_and_visibility() {
+        let app = app().await;
+        for (title, order, in_nav) in [("Zeta", 1, true), ("Alpha", 2, true), ("Hidden", 0, false)]
+        {
+            send(
+                &app,
+                Method::POST,
+                "/api/v1/pages",
+                Some(json!({
+                    "title": title, "publish": true, "nav_order": order, "in_nav": in_nav
+                })),
+            )
+            .await;
+        }
+        let (_, html) = send(&app, Method::GET, "/zeta", None).await;
+        let nav = &html[html.find("<nav").unwrap()..html.find("</nav>").unwrap()];
+        let zeta = nav.find("Zeta").unwrap();
+        let alpha = nav.find("Alpha").unwrap();
+        assert!(zeta < alpha, "{nav}");
+        assert!(!nav.contains("Hidden"), "{nav}");
+        assert!(nav.contains("current-menu-item"), "{nav}");
+    }
+
+    fn theme_zip() -> Vec<u8> {
+        use std::io::Write;
+
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        let files: &[(&str, &str)] = &[
+            (
+                "mytheme/style.css",
+                "/*\nTheme Name: My Theme\nVersion: 1.2\n*/\na { text-underline-offset: .1em; }\n",
+            ),
+            (
+                "mytheme/theme.json",
+                r##"{"version":3,"settings":{"color":{"defaultPalette":false,"palette":[
+                    {"slug":"base","color":"#ffffff"},{"slug":"contrast","color":"#111111"}]},
+                  "typography":{"fontFamilies":[{"slug":"body","fontFamily":"Body, sans-serif",
+                    "fontFace":[{"fontFamily":"Body","src":["file:./assets/fonts/body.woff2"]}]}]}},
+                  "styles":{"color":{"background":"var:preset|color|base","text":"var:preset|color|contrast"}}}"##,
+            ),
+            (
+                "mytheme/styles/01-night.json",
+                r##"{"title":"Night","settings":{"color":{"palette":[
+                    {"slug":"base","color":"#000000"},{"slug":"contrast","color":"#eeeeee"}]}}}"##,
+            ),
+            (
+                "mytheme/styles/sections/section-1.json",
+                r##"{"slug":"section-1","blockTypes":["core/group"],
+                     "styles":{"color":{"background":"var:preset|color|contrast"}}}"##,
+            ),
+            ("mytheme/assets/fonts/body.woff2", "font-bytes"),
+            ("mytheme/functions.php", "<?php echo 'never extracted';"),
+        ];
+        for (name, content) in files {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    #[tokio::test]
+    async fn install_and_activate_theme() {
+        let app = app().await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/themes/upload")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/zip")
+                    .body(Body::from(theme_zip()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(status, StatusCode::CREATED, "{body:?}");
+        let info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(info["slug"], "mytheme");
+        assert_eq!(info["name"], "My Theme");
+        assert_eq!(info["version"], "1.2");
+        // Section styles are block styles, not global variations.
+        assert_eq!(
+            info["variations"],
+            json!([{ "id": "01-night", "title": "Night", "kind": "style" }])
+        );
+
+        let (status, body) = send(
+            &app,
+            Method::PUT,
+            "/api/v1/themes/active",
+            Some(json!({ "theme": "mytheme", "variations": ["nope"] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        let (status, body) = send(
+            &app,
+            Method::PUT,
+            "/api/v1/themes/active",
+            Some(json!({ "theme": "mytheme", "variations": ["01-night"] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, css) = send(&app, Method::GET, "/_wm/style.css", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            css.contains("--wp--preset--color--base: #000000;"),
+            "variation applied"
+        );
+        assert!(css.contains("url('/_wm/theme/mytheme/assets/fonts/body.woff2')"));
+        assert!(css.contains(":root :where(.is-style-section-1)"));
+        assert!(
+            css.contains("text-underline-offset: .1em"),
+            "style.css included"
+        );
+        assert!(
+            css.contains("color-scheme: dark"),
+            "dark background detected"
+        );
+
+        let (status, font) = send(
+            &app,
+            Method::GET,
+            "/_wm/theme/mytheme/assets/fonts/body.woff2",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(font, "font-bytes");
+        for path in ["functions.php", "theme.json", "../mytheme/style.css"] {
+            let (status, _) = send(
+                &app,
+                Method::GET,
+                &format!("/_wm/theme/mytheme/{path}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        }
+
+        let (status, _) = send(&app, Method::DELETE, "/api/v1/themes/mytheme", None).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "active theme cannot be deleted"
+        );
+        send(
+            &app,
+            Method::PUT,
+            "/api/v1/themes/active",
+            Some(json!({ "theme": null })),
+        )
+        .await;
+        let (status, _) = send(&app, Method::DELETE, "/api/v1/themes/mytheme", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 }

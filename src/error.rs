@@ -1,7 +1,10 @@
 use axum::{
     Json,
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse,
+        Response,
+    },
 };
 use serde_json::json;
 

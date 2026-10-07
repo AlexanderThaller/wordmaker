@@ -1,14 +1,29 @@
 use axum::{
-    Json, Router,
-    extract::{DefaultBodyLimit, Multipart, Path, State},
+    Json,
+    Router,
+    extract::{
+        DefaultBodyLimit,
+        Multipart,
+        Path,
+        State,
+    },
     http::StatusCode,
-    routing::{delete, get},
+    routing::{
+        delete,
+        get,
+    },
 };
 
 use crate::{
     app::AppState,
-    domain::media::{self, MediaView},
-    error::{AppError, AppResult},
+    domain::media::{
+        self,
+        MediaView,
+    },
+    error::{
+        AppError,
+        AppResult,
+    },
 };
 
 pub fn router(state: &AppState) -> Router<AppState> {

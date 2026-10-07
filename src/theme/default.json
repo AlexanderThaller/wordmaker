@@ -1,0 +1,59 @@
+{
+  "version": 3,
+  "settings": {
+    "color": {
+      "defaultPalette": false,
+      "palette": [
+        { "slug": "base", "name": "Base", "color": "var(--bg)" },
+        { "slug": "contrast", "name": "Contrast", "color": "var(--fg)" },
+        { "slug": "accent", "name": "Accent", "color": "var(--accent)" },
+        { "slug": "muted", "name": "Muted", "color": "var(--muted)" },
+        { "slug": "subtle", "name": "Subtle", "color": "var(--sidebar-bg)" }
+      ]
+    },
+    "layout": { "contentSize": "760px", "wideSize": "1140px" },
+    "spacing": { "defaultSpacingSizes": true },
+    "typography": {
+      "fluid": true,
+      "defaultFontSizes": false,
+      "fontSizes": [
+        { "slug": "small", "name": "Small", "size": "0.875rem", "fluid": false },
+        { "slug": "medium", "name": "Medium", "size": "1rem", "fluid": false },
+        { "slug": "large", "name": "Large", "size": "1.25rem" },
+        { "slug": "x-large", "name": "Extra Large", "size": "1.75rem" },
+        { "slug": "xx-large", "name": "Extra Extra Large", "size": "2.25rem" }
+      ],
+      "fontFamilies": [
+        {
+          "slug": "system",
+          "name": "System",
+          "fontFamily": "-apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif"
+        },
+        {
+          "slug": "monospace",
+          "name": "Monospace",
+          "fontFamily": "ui-monospace, SFMono-Regular, \"SF Mono\", Menlo, Consolas, monospace"
+        }
+      ]
+    },
+    "useRootPaddingAwareAlignments": true
+  },
+  "styles": {
+    "color": { "background": "var:preset|color|base", "text": "var:preset|color|contrast" },
+    "spacing": {
+      "blockGap": "1.25rem",
+      "padding": { "left": "1.25rem", "right": "1.25rem" }
+    },
+    "typography": {
+      "fontFamily": "var:preset|font-family|system",
+      "fontSize": "var:preset|font-size|medium",
+      "lineHeight": "1.6"
+    },
+    "elements": {
+      "h1": { "typography": { "fontSize": "var:preset|font-size|xx-large" } }
+    },
+    "blocks": {
+      "core/site-title": { "typography": { "fontSize": "var:preset|font-size|large", "fontWeight": "600" } }
+    }
+  }
+}

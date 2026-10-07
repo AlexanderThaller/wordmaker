@@ -15,6 +15,10 @@ pub struct Config {
     #[arg(long, env = "WORDMAKER_MEDIA_DIR", default_value = "media")]
     pub media_dir: PathBuf,
 
+    /// Directory installed themes are stored in.
+    #[arg(long, env = "WORDMAKER_THEMES_DIR", default_value = "themes")]
+    pub themes_dir: PathBuf,
+
     /// Public URL of the site, used to build links to pages and media.
     #[arg(
         long,

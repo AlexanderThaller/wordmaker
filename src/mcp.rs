@@ -2,40 +2,83 @@ use std::sync::Arc;
 
 use base64::Engine;
 use rmcp::{
-    ErrorData, ServerHandler,
+    ErrorData,
+    ServerHandler,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
-    tool, tool_handler, tool_router,
+    model::{
+        CallToolResult,
+        ContentBlock,
+        Implementation,
+        ServerCapabilities,
+        ServerConfig,
+    },
+    tool,
+    tool_handler,
+    tool_router,
 };
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use sqlx::SqlitePool;
 
 use crate::{
     config::Config,
     domain::{
         media,
-        pages::{self, NewPage, PageUpdate, Status},
-        settings::{self, SettingsUpdate},
+        pages::{
+            self,
+            NewPage,
+            PageUpdate,
+            Status,
+        },
+        settings::{
+            self,
+            SettingsUpdate,
+        },
     },
-    error::AppResult,
+    error::{
+        AppError,
+        AppResult,
+    },
     render,
+    theme,
 };
 
-const INSTRUCTIONS: &str = "\
+const INSTRUCTIONS: &str =
+    "\
 WordMaker is a small CMS. Each page has a title, a URL slug and a body written in AsciiDoc.
 
-- Pages are created as drafts and only appear on the public site once published \
-  (pass `publish: true` to create_page, or call publish_page).
-- Write the body in AsciiDoc. The title is rendered as the page heading, so do not start \
-  the body with a `= Title` line; use `==` for top-level sections.
+- Pages are created as drafts and only appear on the public site once published (pass `publish: \
+     true` to create_page, or call publish_page).
+- Write the body in AsciiDoc. The title is rendered as the page heading, so do not start the body \
+     with a `= Title` line; use `==` for top-level sections.
 - Use preview_adoc to check how AsciiDoc renders before saving.
-- Every change to title or body is kept as a revision; list_revisions and restore_revision \
-  undo mistakes.
-- Upload images with upload_media and reference them by the returned `path`, \
-  e.g. `image::/media/1a2b3c4d-logo.png[Logo]`.
+- Every change to title or body is kept as a revision; list_revisions and restore_revision undo \
+     mistakes.
+- Upload images with upload_media and reference them by the returned `path`, e.g. \
+     `image::/media/1a2b3c4d-logo.png[Logo]`.
 - Link to other pages with `link:/other-slug[Other page]`.
-- set_settings controls the site title and which page is shown at `/`.";
+- set_settings controls the site title, tagline, footer text and which page is shown at `/`. \
+     Published pages appear in the navigation unless `in_nav` is false; `nav_order` sorts them.
+
+Themes: the site can use WordPress block themes (themes with a theme.json, such as \
+     twentytwentyfive). install_theme fetches one from wordpress.org or a URL; list_themes shows \
+     installed themes and their style variations; activate_theme switches theme and variations (a \
+     full `style` variation, or combine one `colors` and one `typography` variation). Only the \
+     theme's design (colors, fonts, spacing, element and block styles) is used, not its templates.
+
+Theme styling in AsciiDoc, via roles:
+- Palette colors: `[.has-accent-3-color]#text#`, or `[.has-accent-5-background-color]` on a block.
+- Font sizes: `[.has-x-large-font-size]` (preset slugs from the theme).
+- Width: `[.alignwide]` or `[.alignfull]` on a block or image, e.g. `[.alignwide]` above \
+     `image::...[]`.
+- Section styles: wrap content in an open block with a theme section style, e.g. \
+     `[.is-style-section-1.alignfull]` followed by a `--` delimited block (twentytwentyfive has \
+     section-1 to section-5). Inside such a block use `[discrete]` before a heading, since \
+     AsciiDoc does not allow section titles in delimited blocks.
+- Centered text: `[.has-text-align-center]`.";
 
 #[derive(Clone)]
 pub struct WordMakerMcp {
@@ -69,6 +112,45 @@ pub struct UpdatePageArgs {
     /// New AsciiDoc body, replacing the old one entirely.
     #[serde(default)]
     pub body: Option<String>,
+    /// Whether the page is linked from the site navigation.
+    #[serde(default)]
+    pub in_nav: Option<bool>,
+    /// Position in the navigation; lower comes first.
+    #[serde(default)]
+    pub nav_order: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct InstallThemeArgs {
+    /// Theme slug in the wordpress.org theme directory, e.g.
+    /// `twentytwentyfive`.
+    #[serde(default)]
+    pub wordpress_org: Option<String>,
+    /// Version for `wordpress_org`, e.g. `1.5`; latest when omitted.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// URL of a theme zip, instead of `wordpress_org`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Name to install the theme under; defaults to the theme's folder name.
+    #[serde(default)]
+    pub slug: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ActivateThemeArgs {
+    /// Installed theme slug, or omit/null to switch back to the built-in look.
+    #[serde(default)]
+    pub theme: Option<String>,
+    /// Style variation ids from list_themes, applied in order.
+    #[serde(default)]
+    pub variations: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ThemeArgs {
+    /// Installed theme slug.
+    pub slug: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -144,7 +226,7 @@ impl WordMakerMcp {
 
     #[tool(
         description = "Change a page's title, slug and/or body. Omitted fields stay as they are; \
-                          a given body replaces the whole body."
+                       a given body replaces the whole body."
     )]
     async fn update_page(
         &self,
@@ -158,6 +240,8 @@ impl WordMakerMcp {
                     title: args.title,
                     slug: args.new_slug,
                     body: args.body,
+                    in_nav: args.in_nav,
+                    nav_order: args.nav_order,
                 },
             )
             .await
@@ -241,7 +325,7 @@ impl WordMakerMcp {
 
     #[tool(
         description = "Upload a file (e.g. an image) given as base64. Returns the path to \
-                          reference it from AsciiDoc."
+                       reference it from AsciiDoc."
     )]
     async fn upload_media(
         &self,
@@ -291,14 +375,77 @@ impl WordMakerMcp {
         )
     }
 
-    #[tool(description = "Get site settings: site title and the slug of the home page.")]
+    #[tool(description = "List installed themes and their style variations.")]
+    async fn list_themes(&self) -> Result<CallToolResult, ErrorData> {
+        respond(theme::list(&self.config.themes_dir).await)
+    }
+
+    #[tool(
+        description = "Install a WordPress block theme from wordpress.org (`wordpress_org`) or \
+                       from a zip `url`. Replaces an installed theme of the same name. Does not \
+                       activate it."
+    )]
+    async fn install_theme(
+        &self,
+        Parameters(args): Parameters<InstallThemeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let source = match (&args.url, &args.wordpress_org) {
+            (Some(url), None) => Ok((url.clone(), args.slug.clone())),
+            (None, Some(name)) => theme::wordpress_org_url(name, args.version.as_deref())
+                .map(|url| (url, args.slug.clone().or_else(|| Some(name.clone())))),
+            _ => Err(AppError::BadRequest(
+                "give exactly one of `url` or `wordpress_org`".into(),
+            )),
+        };
+        let result = match source {
+            Ok((url, slug)) => {
+                theme::install_from_url(&self.config.themes_dir, &url, slug.as_deref()).await
+            }
+            Err(err) => Err(err),
+        };
+        respond(result)
+    }
+
+    #[tool(
+        description = "Activate an installed theme with optional style variations, or switch back \
+                       to the built-in look by omitting `theme`."
+    )]
+    async fn activate_theme(
+        &self,
+        Parameters(args): Parameters<ActivateThemeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        respond(
+            theme::activate(
+                &self.pool,
+                &self.config.themes_dir,
+                args.theme.as_deref(),
+                args.variations,
+            )
+            .await,
+        )
+    }
+
+    #[tool(description = "Delete an installed theme. The active theme cannot be deleted.")]
+    async fn delete_theme(
+        &self,
+        Parameters(args): Parameters<ThemeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        respond(
+            theme::delete(&self.pool, &self.config.themes_dir, &args.slug)
+                .await
+                .map(|()| serde_json::json!({ "deleted": args.slug })),
+        )
+    }
+
+    #[tool(description = "Get site settings: title, tagline, footer text, home page and theme.")]
     async fn get_settings(&self) -> Result<CallToolResult, ErrorData> {
         respond(settings::get(&self.pool).await)
     }
 
     #[tool(
-        description = "Change site settings. Set `home_slug` to a page slug to show that page \
-                          at `/`, or to an empty string to show the list of pages instead."
+        description = "Change site title, tagline, footer text (AsciiDoc) or home page. Set \
+                       `home_slug` to a page slug to show that page at `/`; an empty string \
+                       clears a field."
     )]
     async fn set_settings(
         &self,

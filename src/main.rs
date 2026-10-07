@@ -7,15 +7,26 @@ mod error;
 mod mcp;
 mod render;
 mod site;
+mod theme;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+};
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{
+    Parser,
+    Subcommand,
+};
 use rmcp::ServiceExt;
 use tracing_subscriber::EnvFilter;
 
-use crate::{app::AppState, config::Config, mcp::WordMakerMcp};
+use crate::{
+    app::AppState,
+    config::Config,
+    mcp::WordMakerMcp,
+};
 
 /// A small AsciiDoc CMS with a REST API and an MCP server.
 #[derive(Parser)]
@@ -48,7 +59,8 @@ struct ServeArgs {
     #[arg(long, env = "WORDMAKER_TOKEN", hide_env_values = true)]
     token: Option<String>,
 
-    /// Extra `Host` values accepted by `/mcp`, besides loopback and the base URL's host.
+    /// Extra `Host` values accepted by `/mcp`, besides loopback and the base
+    /// URL's host.
     #[arg(
         long = "allowed-host",
         env = "WORDMAKER_ALLOWED_HOSTS",
@@ -104,6 +116,7 @@ async fn serve(config: Config, args: ServeArgs) -> anyhow::Result<()> {
         pool,
         config: Arc::new(config),
         token: token.into(),
+        themes: Arc::default(),
     };
     let router = app::router(state, allowed_hosts);
 

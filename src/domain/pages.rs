@@ -1,9 +1,21 @@
-use chrono::{DateTime, Utc};
+use chrono::{
+    DateTime,
+    Utc,
+};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use sqlx::{SqliteConnection, SqlitePool};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use sqlx::{
+    SqliteConnection,
+    SqlitePool,
+};
 
-use crate::error::{AppError, AppResult};
+use crate::error::{
+    AppError,
+    AppResult,
+};
 
 /// Slugs that would collide with the site's own routes.
 const RESERVED_SLUGS: &[&str] = &["api", "mcp", "media", "favicon-ico", "robots-txt"];
@@ -24,6 +36,10 @@ pub struct Page {
     /// AsciiDoc source.
     pub body: String,
     pub status: Status,
+    /// Whether the page is linked from the site navigation.
+    pub in_nav: bool,
+    /// Position in the navigation; lower comes first, ties sort by title.
+    pub nav_order: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub published_at: Option<DateTime<Utc>>,
@@ -35,6 +51,8 @@ pub struct PageSummary {
     pub slug: String,
     pub title: String,
     pub status: Status,
+    pub in_nav: bool,
+    pub nav_order: i64,
     pub updated_at: DateTime<Utc>,
     pub published_at: Option<DateTime<Utc>>,
 }
@@ -58,7 +76,8 @@ pub struct RevisionSummary {
 pub struct NewPage {
     /// Page title, shown as the page heading.
     pub title: String,
-    /// URL slug (lowercase letters, digits and dashes). Derived from the title when omitted.
+    /// URL slug (lowercase letters, digits and dashes). Derived from the title
+    /// when omitted.
     #[serde(default)]
     pub slug: Option<String>,
     /// Page content in AsciiDoc. Do not repeat the title as a `= Title` line.
@@ -67,6 +86,12 @@ pub struct NewPage {
     /// Publish immediately instead of creating a draft.
     #[serde(default)]
     pub publish: bool,
+    /// Link the page from the site navigation (default true).
+    #[serde(default)]
+    pub in_nav: Option<bool>,
+    /// Position in the navigation; lower comes first (default 0).
+    #[serde(default)]
+    pub nav_order: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
@@ -80,17 +105,36 @@ pub struct PageUpdate {
     /// New AsciiDoc body, replacing the old one entirely.
     #[serde(default)]
     pub body: Option<String>,
+    /// Whether the page is linked from the site navigation.
+    #[serde(default)]
+    pub in_nav: Option<bool>,
+    /// Position in the navigation; lower comes first.
+    #[serde(default)]
+    pub nav_order: Option<i64>,
 }
 
-const PAGE_COLUMNS: &str = "id, slug, title, body, status, created_at, updated_at, published_at";
+const PAGE_COLUMNS: &str =
+    "id, slug, title, body, status, in_nav, nav_order, created_at, updated_at, published_at";
 
 pub async fn list(pool: &SqlitePool, status: Option<Status>) -> AppResult<Vec<PageSummary>> {
     let pages = sqlx::query_as(
-        "SELECT id, slug, title, status, updated_at, published_at FROM pages
+        "SELECT id, slug, title, status, in_nav, nav_order, updated_at, published_at FROM pages
          WHERE ?1 IS NULL OR status = ?1
          ORDER BY title COLLATE NOCASE",
     )
     .bind(status)
+    .fetch_all(pool)
+    .await?;
+    Ok(pages)
+}
+
+/// Published pages that belong in the site navigation, in order.
+pub async fn navigation(pool: &SqlitePool) -> AppResult<Vec<PageSummary>> {
+    let pages = sqlx::query_as(
+        "SELECT id, slug, title, status, in_nav, nav_order, updated_at, published_at FROM pages
+         WHERE status = 'published' AND in_nav
+         ORDER BY nav_order, title COLLATE NOCASE",
+    )
     .fetch_all(pool)
     .await?;
     Ok(pages)
@@ -126,13 +170,16 @@ pub async fn create(pool: &SqlitePool, new: NewPage) -> AppResult<Page> {
 
     let mut tx = pool.begin().await?;
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO pages (slug, title, body, status, created_at, updated_at, published_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO pages (slug, title, body, status, in_nav, nav_order, created_at, updated_at,
+                            published_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(&slug)
     .bind(title)
     .bind(&new.body)
     .bind(status)
+    .bind(new.in_nav.unwrap_or(true))
+    .bind(new.nav_order.unwrap_or(0))
     .bind(now)
     .bind(now)
     .bind(published_at)
@@ -160,15 +207,20 @@ pub async fn update(pool: &SqlitePool, slug: &str, update: PageUpdate) -> AppRes
     let body = update.body.unwrap_or_else(|| page.body.clone());
     let now = Utc::now();
 
-    sqlx::query("UPDATE pages SET slug = ?, title = ?, body = ?, updated_at = ? WHERE id = ?")
-        .bind(&new_slug)
-        .bind(&title)
-        .bind(&body)
-        .bind(now)
-        .bind(page.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|err| slug_conflict(err, &new_slug))?;
+    sqlx::query(
+        "UPDATE pages SET slug = ?, title = ?, body = ?, in_nav = ?, nav_order = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&new_slug)
+    .bind(&title)
+    .bind(&body)
+    .bind(update.in_nav.unwrap_or(page.in_nav))
+    .bind(update.nav_order.unwrap_or(page.nav_order))
+    .bind(now)
+    .bind(page.id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|err| slug_conflict(err, &new_slug))?;
 
     if title != page.title || body != page.body {
         record_revision(&mut tx, page.id, &title, &body, now).await?;
@@ -247,7 +299,7 @@ pub async fn restore_revision(pool: &SqlitePool, slug: &str, revision: i64) -> A
         PageUpdate {
             title: Some(old.title),
             body: Some(old.body),
-            slug: None,
+            ..Default::default()
         },
     )
     .await
@@ -262,7 +314,8 @@ async fn record_revision(
 ) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO page_revisions (page_id, revision, title, body, created_at)
-         VALUES (?1, (SELECT COALESCE(MAX(revision), 0) + 1 FROM page_revisions WHERE page_id = ?1),
+         VALUES (?1, (SELECT COALESCE(MAX(revision), 0) + 1 FROM page_revisions WHERE page_id = \
+         ?1),
                  ?2, ?3, ?4)",
     )
     .bind(page_id)
@@ -356,6 +409,8 @@ mod tests {
             slug: None,
             body: body.into(),
             publish: false,
+            in_nav: None,
+            nav_order: None,
         }
     }
 

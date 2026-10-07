@@ -1,15 +1,30 @@
 use axum::{
-    Json, Router,
-    extract::{Path, Query, State},
+    Json,
+    Router,
+    extract::{
+        Path,
+        Query,
+        State,
+    },
     http::StatusCode,
-    routing::{get, post},
+    routing::{
+        get,
+        post,
+    },
 };
 use serde::Deserialize;
 
 use crate::{
     app::AppState,
     domain::pages::{
-        self, NewPage, PageSummary, PageUpdate, PageView, Revision, RevisionSummary, Status,
+        self,
+        NewPage,
+        PageSummary,
+        PageUpdate,
+        PageView,
+        Revision,
+        RevisionSummary,
+        Status,
     },
     error::AppResult,
 };

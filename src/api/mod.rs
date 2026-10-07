@@ -1,24 +1,37 @@
 mod media;
 mod pages;
+mod themes;
 
 use axum::{
-    Json, Router,
+    Json,
+    Router,
     extract::State,
-    routing::{get, post},
+    routing::{
+        get,
+        post,
+    },
 };
 use serde::Deserialize;
 
 use crate::{
     app::AppState,
-    domain::settings::{self, Settings, SettingsUpdate},
+    domain::settings::{
+        self,
+        Settings,
+        SettingsUpdate,
+    },
     error::AppResult,
-    render::{self, Rendered},
+    render::{
+        self,
+        Rendered,
+    },
 };
 
 pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .merge(pages::router())
         .merge(media::router(state))
+        .merge(themes::router())
         .route("/render", post(render_preview))
         .route("/settings", get(get_settings).put(put_settings))
 }

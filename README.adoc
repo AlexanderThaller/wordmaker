@@ -24,6 +24,7 @@ The site is now at http://127.0.0.1:3000.
 
 |`WORDMAKER_DB` |`sqlite://wordmaker.db` |SQLite database; created and migrated on start
 |`WORDMAKER_MEDIA_DIR` |`media` |Where uploaded files are stored
+|`WORDMAKER_THEMES_DIR` |`themes` |Where installed themes are stored
 |`WORDMAKER_BASE_URL` |`http://127.0.0.1:3000` |Public URL, used for links returned by the API
 |`WORDMAKER_MAX_UPLOAD` |`26214400` |Largest upload in bytes
 |`WORDMAKER_BIND` |`127.0.0.1:3000` |Listen address (`serve` only)
@@ -49,6 +50,7 @@ Claude Desktop starts WordMaker itself. Add this to `claude_desktop_config.json`
       "env": {
         "WORDMAKER_DB": "sqlite:///path/to/wordmaker.db",
         "WORDMAKER_MEDIA_DIR": "/path/to/media",
+        "WORDMAKER_THEMES_DIR": "/path/to/themes",
         "WORDMAKER_BASE_URL": "http://127.0.0.1:3000"
       }
     }
@@ -68,7 +70,8 @@ When the server is not reached through `localhost`, set `WORDMAKER_BASE_URL` (or
 
 `list_pages`, `get_page`, `create_page`, `update_page`, `delete_page`, `publish_page`, `unpublish_page`,
 `list_revisions`, `get_revision`, `restore_revision`, `preview_adoc`,
-`upload_media`, `list_media`, `delete_media`, `get_settings`, `set_settings`.
+`upload_media`, `list_media`, `delete_media`, `get_settings`, `set_settings`,
+`list_themes`, `install_theme`, `activate_theme`, `delete_theme`.
 
 == REST API
 
@@ -81,7 +84,7 @@ All endpoints live under `/api/v1` and require `Authorization: Bearer $WORDMAKER
 |`GET /pages?status=draft\|published` |List pages
 |`POST /pages` |Create: `{"title", "slug"?, "body"?, "publish"?}`
 |`GET /pages/{slug}` |Page with AsciiDoc body
-|`PATCH /pages/{slug}` |Change `title`, `slug` and/or `body`
+|`PATCH /pages/{slug}` |Change `title`, `slug`, `body`, `in_nav` and/or `nav_order`
 |`DELETE /pages/{slug}` |Delete page and its history
 |`POST /pages/{slug}/publish`, `/unpublish` |Change visibility
 |`GET /pages/{slug}/revisions` |Revision list, newest first
@@ -89,7 +92,12 @@ All endpoints live under `/api/v1` and require `Authorization: Bearer $WORDMAKER
 |`POST /pages/{slug}/revisions/{n}/restore` |Make a revision current again
 |`POST /render` |Render `{"body"}` to HTML without saving
 |`GET /media`, `POST /media` (multipart), `DELETE /media/{filename}` |Uploaded files
-|`GET /settings`, `PUT /settings` |`site_title`, `home_slug`
+|`GET /settings`, `PUT /settings` |`site_title`, `site_tagline`, `footer_text`, `home_slug`
+|`GET /themes` |Installed themes and their style variations
+|`POST /themes/install` |Install from `{"wordpress_org": "twentytwentyfive", "version"?}` or `{"url"}`
+|`POST /themes/upload?slug=` |Install from a zip sent as the request body
+|`PUT /themes/active` |Activate `{"theme", "variations": [...]}`; `{"theme": null}` for the built-in look
+|`DELETE /themes/{slug}` |Remove a theme that is not active
 |===
 
 [source,sh]
@@ -105,3 +113,53 @@ curl -H "Authorization: Bearer $WORDMAKER_TOKEN" -H 'content-type: application/j
 * Reference uploaded images by their path: `image::/media/1a2b3c4d-logo.png[Logo]`.
 * Link to other pages with `link:/about[About]`.
 * Only published pages are visible on the site. `/` shows the page chosen as `home_slug`, or a list of all published pages.
+* Published pages appear in the header navigation, ordered by `nav_order` then title; set `in_nav` to false to leave one out.
+
+== Themes
+
+WordMaker can use the design of WordPress *block themes*, the ones with a `theme.json`, such as Twenty Twenty-Five:
+
+[source,sh]
+----
+curl -H "Authorization: Bearer $WORDMAKER_TOKEN" -H 'content-type: application/json' \
+  -d '{"wordpress_org": "twentytwentyfive", "version": "1.5"}' http://127.0.0.1:3000/api/v1/themes/install
+curl -X PUT -H "Authorization: Bearer $WORDMAKER_TOKEN" -H 'content-type: application/json' \
+  -d '{"theme": "twentytwentyfive", "variations": ["01-evening"]}' http://127.0.0.1:3000/api/v1/themes/active
+----
+
+Or just ask Claude: "install Twenty Twenty-Five and use the Evening style".
+
+=== What is used
+
+`theme.json` is compiled into the same CSS WordPress generates:
+
+* Presets: palette, gradients, font sizes (including fluid sizes), font families, spacing, shadows and `custom` values, as `--wp--preset--*` and `--wp--custom--*` properties, plus the `has-*-color`, `has-*-background-color`, `has-*-font-size` classes.
+* The fonts bundled with the theme (`fontFace`), served from the theme folder.
+* Layout: content and wide sizes, root padding, block gap.
+* Styles for the body, elements (links, headings, buttons, captions) and blocks. Blocks that have an AsciiDoc counterpart (paragraph, list, code, quote, separator, table, image) style that too.
+* Style variations from `styles/`, combinable, e.g. a `colors/…` and a `typography/…` preset.
+* Section and block styles (`styles/sections`, `styles/blocks`) as `is-style-*` classes.
+* The theme's `style.css`.
+
+Templates, template parts and PHP patterns are *not* used, and PHP files are not even unpacked.
+Pages use WordMaker's own frame, laid out like Twenty Twenty-Five's page template with WordPress's class names: a header with site title and navigation, the title and content in the content width, and a footer with site title, tagline and footer text.
+
+=== Using theme styles in AsciiDoc
+
+[source,asciidoc]
+----
+[.has-accent-3-color]#Text in a palette color#
+
+[.alignwide]
+image::/media/1a2b3c4d-hero.jpg[Hero]
+
+[.is-style-section-1.alignfull]
+--
+[discrete]
+=== A highlighted section
+
+Content on the theme's section background.
+--
+----
+
+Without a theme, WordMaker uses a built-in look that follows the reader's light or dark preference.

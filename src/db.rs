@@ -1,8 +1,15 @@
-use std::{str::FromStr, time::Duration};
+use std::{
+    str::FromStr,
+    time::Duration,
+};
 
 use sqlx::{
     SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    sqlite::{
+        SqliteConnectOptions,
+        SqliteJournalMode,
+        SqlitePoolOptions,
+    },
 };
 
 pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
