@@ -981,6 +981,64 @@ button.icon:hover {
   gap: 16px;
 }
 
+.dashboard-view .view-head {
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+
+.dashboard-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px 12px;
+}
+
+.refresh-status {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.refresh-status.failed {
+  color: var(--warn);
+}
+
+/* The button and the interval read as one control. */
+.refresh-picker {
+  display: inline-flex;
+}
+
+.refresh-picker button {
+  padding: 5px 8px;
+  border-radius: var(--radius) 0 0 var(--radius);
+  color: var(--muted);
+}
+
+.refresh-picker button:hover {
+  color: var(--text);
+}
+
+.refresh-picker select {
+  margin-left: -1px;
+  border-radius: 0 var(--radius) var(--radius) 0;
+}
+
+.refresh-picker button.spinning svg {
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .refresh-picker button.spinning svg {
+    animation: none;
+  }
+}
+
 .dashboard-message {
   max-width: 640px;
   padding: 14px 16px;

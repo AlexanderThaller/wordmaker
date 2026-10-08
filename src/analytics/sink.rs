@@ -452,10 +452,14 @@ mod tests {
         assert_eq!(primary_language(""), "");
     }
 
-    /// Against a real server in Docker, which unlike the mock checks rows
-    /// against the table schema. Skipped when Docker is not available.
-    #[tokio::test]
-    async fn writes_to_a_real_clickhouse() {
+    /// A real server in Docker, which unlike the mock checks rows against
+    /// the table schema; `None` (and the test skipped) without Docker.
+    async fn real_clickhouse() -> Option<(
+        testcontainers_modules::testcontainers::ContainerAsync<
+            testcontainers_modules::clickhouse::ClickHouse,
+        >,
+        clickhouse::Client,
+    )> {
         use testcontainers_modules::{
             clickhouse::{
                 CLICKHOUSE_PORT,
@@ -477,7 +481,7 @@ mod tests {
             Ok(container) => container,
             Err(err) => {
                 eprintln!("skipped: cannot start ClickHouse in Docker: {err}");
-                return;
+                return None;
             }
         };
         let host = container.get_host().await.unwrap();
@@ -486,15 +490,29 @@ mod tests {
             .with_database("wordmaker")
             .with_user("default")
             .with_password("secret");
+        Some((container, db))
+    }
 
-        let (first, tx) = sink(db.clone());
-        let task = tokio::spawn(first.run());
+    /// Runs a sink over `hits` until it has written them.
+    async fn write(db: &clickhouse::Client, hits: impl IntoIterator<Item = Hit>) {
+        let (sink, tx) = sink(db.clone());
+        let task = tokio::spawn(sink.run());
+        for hit in hits {
+            tx.send(hit).await.unwrap();
+        }
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writes_to_a_real_clickhouse() {
+        let Some((_container, db)) = real_clickhouse().await else {
+            return;
+        };
         let time = DateTime::parse_from_rfc3339("2025-01-01T10:00:00.123Z")
             .unwrap()
             .to_utc();
-        tx.send(hit(time)).await.unwrap();
-        drop(tx);
-        task.await.unwrap();
+        write(&db, [hit(time)]).await;
 
         let rows = db
             .query("SELECT ?fields FROM page_views")
@@ -506,26 +524,45 @@ mod tests {
         assert_eq!(rows[0].site, "https://site.example");
         assert_eq!(rows[0].browser, "Chrome");
         assert_eq!(rows[0].utm_source, "newsletter");
+    }
 
-        // And the dashboard's report reads it back.
-        let mut bot = hit(Utc::now());
-        bot.user_agent = "Googlebot/2.1".into();
+    #[tokio::test]
+    async fn reports_from_a_real_clickhouse() {
+        let Some((_container, db)) = real_clickhouse().await else {
+            return;
+        };
+        let old = DateTime::parse_from_rfc3339("2025-01-01T10:00:00.123Z")
+            .unwrap()
+            .to_utc();
         let mut missing = hit(Utc::now());
         missing.status = 404;
         missing.path = "/gone".into();
-        let (more, tx) = sink(db.clone());
-        let task = tokio::spawn(more.run());
-        for hit in [hit(Utc::now()), hit(Utc::now()), bot, missing] {
-            tx.send(hit).await.unwrap();
-        }
-        drop(tx);
-        task.await.unwrap();
+        let bot = |user_agent: &str| Hit {
+            user_agent: user_agent.into(),
+            ..hit(Utc::now())
+        };
+        let bots = [
+            bot("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"),
+            bot("Googlebot/2.1"),
+            bot("Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.2)"),
+            bot("Mozilla/5.0 (Linux; Android 5.0) Mobile Safari/537.36 (compatible; Bytespider)"),
+            bot("Mozilla/5.0 (X11; Linux x86_64) HeadlessChrome/129.0.0.0 Safari/537.36"),
+            bot("facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"),
+            bot(""),
+        ];
+        write(
+            &db,
+            [hit(old), hit(Utc::now()), hit(Utc::now()), missing]
+                .into_iter()
+                .chain(bots),
+        )
+        .await;
 
         let report = super::super::report::report(&db, "https://site.example", 7)
             .await
             .unwrap();
         assert_eq!(report.views, 2, "the one from 2025 is out of range");
-        assert_eq!(report.bot_views, 1);
+        assert_eq!(report.bot_views, 7);
         assert_eq!(report.visitor_days, 1);
         assert_eq!(report.daily.len(), 7);
         assert_eq!(report.daily.last().unwrap().views, 2);
@@ -534,6 +571,23 @@ mod tests {
         assert_eq!(report.countries[0].name, "Unknown");
         assert_eq!(report.browsers[0].name, "Chrome");
         assert_eq!(report.not_found[0].name, "/gone");
+        let mut bots: Vec<_> = report
+            .bots
+            .iter()
+            .map(|bot| (bot.name.as_str(), bot.views))
+            .collect();
+        bots.sort_unstable();
+        assert_eq!(
+            bots,
+            [
+                ("Bytespider", 1),
+                ("GPTBot", 1),
+                ("Googlebot", 2),
+                ("HeadlessChrome", 1),
+                ("No user agent", 1),
+                ("facebookexternalhit", 1),
+            ]
+        );
 
         let other = super::super::report::report(&db, "https://other.example", 7)
             .await
