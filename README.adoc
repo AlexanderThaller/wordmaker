@@ -60,6 +60,8 @@ Each row has the path and slug, status and render time, referrer and its host, `
 `wordmaker geoip` downloads the free https://db-ip.com/db/lite.php[DB-IP Lite] city and ASN databases (no account needed) into `WORDMAKER_GEOIP_DIR` and prints the settings that point at them; DB-IP publishes a new edition every month.
 MaxMind's GeoLite2 files work as well, kept current with https://github.com/maxmind/geoipupdate[geoipupdate].
 A running `serve` checks the files every minute and loads new versions by itself; if a new file cannot be opened, it keeps using the old one.
+The databases are memory-mapped rather than read into memory, so only the parts lookups touch take up RAM, as page cache the system can reclaim.
+That is why a database file must never be changed in place while `serve` runs: replace it by renaming a new file over it, as `wordmaker geoip` and `geoipupdate` do (`cp` straight onto it could crash the server).
 The DB-IP Lite data is licensed under https://creativecommons.org/licenses/by/4.0/[CC BY 4.0]; credit it as "IP Geolocation by DB-IP" wherever you show results based on it.
 
 [source,sh]

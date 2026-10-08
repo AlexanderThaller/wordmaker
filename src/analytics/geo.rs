@@ -12,6 +12,7 @@ use std::{
 };
 
 use maxminddb::{
+    Mmap,
     Reader,
     geoip2,
 };
@@ -32,7 +33,7 @@ pub struct Geo {
 struct Source {
     path: Option<PathBuf>,
     what: &'static str,
-    reader: Option<Reader<Vec<u8>>>,
+    reader: Option<Reader<Mmap>>,
     /// The file's modification time and size when last opened (or tried).
     seen: Option<(SystemTime, u64)>,
 }
@@ -173,8 +174,17 @@ impl Geo {
     }
 }
 
-fn open(path: &Path, what: &str) -> Option<Reader<Vec<u8>>> {
-    match Reader::open_readfile(path) {
+/// Maps the database into memory rather than reading it: a city database
+/// is over 100 MB, and mapped, only the parts lookups touch are resident,
+/// as page cache the kernel can reclaim.
+fn open(path: &Path, what: &str) -> Option<Reader<Mmap>> {
+    // SAFETY: the file must not be changed while it is mapped. Updates
+    // replace it instead, by renaming a new file over it, as `wordmaker
+    // geoip` and `geoipupdate` do: the mapping keeps the old file, and
+    // `reload_if_changed` maps the new one. The README says so.
+    #[expect(unsafe_code, reason = "memory-mapping is unsafe; see SAFETY")]
+    let opened = unsafe { Reader::open_mmap(path) };
+    match opened {
         Ok(reader) => Some(reader),
         Err(err) => {
             tracing::warn!(
@@ -207,22 +217,30 @@ mod tests {
 
         // A file that is not a database is tried once, and not again until
         // it changes.
-        std::fs::write(&path, "not a database").unwrap();
+        replace(&path, "not a database");
         geo.reload_if_changed().await;
         assert!(geo.city.reader.is_none());
         assert_eq!(geo.city.seen, stamp(&path));
 
-        std::fs::write(&path, test_database()).unwrap();
+        replace(&path, test_database());
         geo.reload_if_changed().await;
         assert!(geo.city.reader.is_some(), "loaded the new file");
 
-        std::fs::write(&path, "broken replacement").unwrap();
+        replace(&path, "broken replacement");
         geo.reload_if_changed().await;
         assert!(geo.city.reader.is_some(), "kept the loaded database");
 
         std::fs::remove_file(&path).unwrap();
         geo.reload_if_changed().await;
         assert!(geo.city.reader.is_some(), "a missing file keeps it too");
+    }
+
+    /// Puts `contents` at `path` the way updaters must: a new file renamed
+    /// over the old one, never written into a file that may be mapped.
+    fn replace(path: &Path, contents: impl AsRef<[u8]>) {
+        let new = path.with_extension("new");
+        std::fs::write(&new, contents).unwrap();
+        std::fs::rename(&new, path).unwrap();
     }
 
     /// The smallest valid database: an empty IPv4 tree and its metadata.
