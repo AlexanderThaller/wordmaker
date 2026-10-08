@@ -1,0 +1,1079 @@
+// The admin interface: one page, three views, all talking to the WordMaker
+// REST API through this server, which adds the token on the way.
+
+import initEditor, { mount } from "/vendor/asciidoc_editor.js";
+
+const $ = (selector) => document.querySelector(selector);
+
+// ---- Talking to the server ------------------------------------------------
+
+/** Calls the REST API; resolves to its JSON (or text), rejects with its error. */
+async function api(method, path, body) {
+  // The server refuses API calls without this header; see API_GUARD_HEADER.
+  const init = { method, headers: { "x-wordmaker-admin": "1" } };
+  if (body instanceof FormData) {
+    init.body = body;
+  } else if (body !== undefined) {
+    init.headers["content-type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  const response = await fetch(`/api/v1${path}`, init);
+  const text = await response.text();
+  if (!response.ok) {
+    let message = text.trim() || `${response.status} ${response.statusText}`;
+    try {
+      message = JSON.parse(text).error ?? message;
+    } catch {
+      // Not JSON: axum's own rejections are plain text.
+    }
+    throw Object.assign(new Error(message), { status: response.status });
+  }
+  if (!text) return null;
+  return (response.headers.get("content-type") ?? "").includes("json") ? JSON.parse(text) : text;
+}
+
+const pagePath = (slug) => `/pages/${encodeURIComponent(slug)}`;
+
+// ---- Small helpers --------------------------------------------------------
+
+/** Builds an element; text children are inserted as text, never as HTML. */
+function h(tag, attributes = {}, ...children) {
+  const element = document.createElement(tag);
+  for (const [name, value] of Object.entries(attributes)) {
+    if (value === false || value == null) continue;
+    if (name.startsWith("on")) element.addEventListener(name.slice(2), value);
+    else if (name === "class") element.className = value;
+    else element.setAttribute(name, value === true ? "" : value);
+  }
+  element.append(...children.flat().filter((child) => child != null));
+  return element;
+}
+
+function toast(message, { error = false } = {}) {
+  const item = h("div", { class: error ? "toast error" : "toast" }, message);
+  $("#toasts").append(item);
+  setTimeout(() => item.remove(), error ? 6000 : 3000);
+}
+
+/** Runs `action`, reporting a failure instead of throwing it. */
+async function attempt(action) {
+  try {
+    return await action();
+  } catch (error) {
+    toast(error.message, { error: true });
+    return undefined;
+  }
+}
+
+const relative = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+
+function ago(iso) {
+  const seconds = (new Date(iso) - Date.now()) / 1000;
+  for (const [unit, size] of [
+    ["year", 31536000],
+    ["month", 2592000],
+    ["day", 86400],
+    ["hour", 3600],
+    ["minute", 60],
+  ]) {
+    if (Math.abs(seconds) >= size) return relative.format(Math.round(seconds / size), unit);
+  }
+  return "just now";
+}
+
+function size(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/**
+ * Asks something in a modal. Resolves to the field values (an empty object
+ * when there are no fields), or null when cancelled.
+ */
+function ask({ title, message = "", fields = [], confirm = "OK", danger = false }) {
+  const dialog = $("#dialog");
+  $("#dialog-title").textContent = title;
+  $("#dialog-message").textContent = message;
+  const inputs = fields.map((field) =>
+    h("input", {
+      name: field.name,
+      value: field.value ?? "",
+      placeholder: field.placeholder,
+      required: field.required,
+      spellcheck: field.spellcheck,
+    }),
+  );
+  $("#dialog-fields").replaceChildren(
+    ...fields.map((field, i) => h("label", { class: "stacked" }, h("span", {}, field.label), inputs[i])),
+  );
+  const button = $("#dialog-confirm");
+  button.textContent = confirm;
+  button.className = danger ? "primary danger" : "primary";
+
+  answerDialog(null);
+  dialog.showModal();
+  (inputs[0] ?? button).focus();
+
+  return new Promise((resolve) => {
+    // Answered from the submit and cancel handlers rather than the dialog's
+    // `close` event, which Chrome holds back while the tab is not rendering.
+    pendingAnswer = (confirmed) =>
+      resolve(confirmed ? Object.fromEntries(inputs.map((input) => [input.name, input.value.trim()])) : null);
+  });
+}
+
+let pendingAnswer = null;
+
+/** Settles the open question, if any, and closes the dialog. */
+function answerDialog(confirmed) {
+  const answer = pendingAnswer;
+  pendingAnswer = null;
+  answer?.(confirmed);
+  if ($("#dialog").open) $("#dialog").close();
+}
+
+// Submitting passes the form's own validation first, so required fields hold.
+$("#dialog-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  answerDialog(true);
+});
+$("#dialog-cancel").addEventListener("click", () => answerDialog(false));
+// Escape.
+$("#dialog").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  answerDialog(false);
+});
+
+// ---- State ----------------------------------------------------------------
+
+const state = {
+  /** Page summaries, as listed by the API. */
+  pages: [],
+  settings: null,
+  /** The page being edited, as last saved. */
+  current: null,
+  /** The mounted editor, once the wasm has loaded. */
+  editor: null,
+  /** A revision shown in the preview instead of the draft. */
+  revision: null,
+  layout: readLayout(),
+  saving: false,
+};
+
+function readLayout() {
+  try {
+    return localStorage.getItem("wordmaker-admin-layout") ?? "split";
+  } catch {
+    return "split";
+  }
+}
+
+// ---- Routing --------------------------------------------------------------
+
+const views = ["pages", "media", "settings"];
+
+async function route() {
+  const [, view = "pages", ...rest] = location.hash.split("/");
+  const name = views.includes(view) ? view : "pages";
+  for (const other of views) $(`#view-${other}`).hidden = other !== name;
+  for (const link of document.querySelectorAll(".tabs a")) {
+    if (link.dataset.view === name) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  }
+
+  if (name === "media") return loadMedia();
+  if (name === "settings") return loadSettings();
+
+  const slug = rest.length ? decodeURIComponent(rest.join("/")) : null;
+  if (!slug) {
+    // Back to the pages view: keep showing what was open.
+    if (state.current) history.replaceState(null, "", `#/pages/${state.current.slug}`);
+    return;
+  }
+  if (slug === state.current?.slug) return;
+  if (state.current && isDirty()) {
+    const discard = await ask({
+      title: "Discard changes?",
+      message: `“${state.current.title}” has unsaved changes.`,
+      confirm: "Discard",
+      danger: true,
+    });
+    if (!discard) {
+      history.replaceState(null, "", `#/pages/${state.current.slug}`);
+      return;
+    }
+  }
+  await openPage(slug);
+}
+
+window.addEventListener("hashchange", route);
+
+// ---- Page list ------------------------------------------------------------
+
+async function loadPages() {
+  const pages = await attempt(() => api("GET", "/pages"));
+  if (!pages) return;
+  state.pages = pages.sort((a, b) => a.title.localeCompare(b.title));
+  renderPageList();
+}
+
+function renderPageList() {
+  const filter = $("#page-filter").value.trim().toLowerCase();
+  const pages = state.pages.filter(
+    (page) => !filter || page.title.toLowerCase().includes(filter) || page.slug.includes(filter),
+  );
+  const home = state.settings?.home_slug;
+  $("#page-list").replaceChildren(
+    ...pages.map((page) =>
+      h(
+        "li",
+        {},
+        h(
+          "a",
+          {
+            href: `#/pages/${page.slug}`,
+            "aria-current": page.slug === state.current?.slug ? "page" : null,
+          },
+          h(
+            "span",
+            { class: "page-title" },
+            h("span", {
+              class: `dot ${page.status}${page.has_draft ? " pending" : ""}`,
+              title: statusLabel(page.status === "published", page.has_draft),
+            }),
+            page.title,
+            page.slug === home ? h("span", { class: "home" }, "· home") : null,
+          ),
+          h(
+            "span",
+            { class: "page-sub" },
+            `/${page.slug} · ${page.has_draft ? "changes pending" : ago(page.updated_at)}`,
+          ),
+        ),
+      ),
+    ),
+  );
+  if (!pages.length) {
+    $("#page-list").append(
+      h("li", { class: "none" }, state.pages.length ? "No page matches." : "No pages yet."),
+    );
+  }
+}
+
+$("#page-filter").addEventListener("input", renderPageList);
+
+$("#new-page").addEventListener("click", async () => {
+  const answer = await ask({
+    title: "New page",
+    fields: [
+      { name: "title", label: "Title", required: true },
+      { name: "slug", label: "Slug (optional)", placeholder: "from the title", spellcheck: "false" },
+    ],
+    confirm: "Create",
+  });
+  if (!answer) return;
+  const page = await attempt(() =>
+    api("POST", "/pages", { title: answer.title, slug: answer.slug || undefined }),
+  );
+  if (!page) return;
+  await loadPages();
+  location.hash = `#/pages/${page.slug}`;
+});
+
+// ---- The page being edited ------------------------------------------------
+
+const fields = {
+  title: $("#page-title"),
+  slug: $("#page-slug"),
+  inNav: $("#page-in-nav"),
+  navOrder: $("#page-nav-order"),
+};
+
+async function openPage(slug) {
+  const page = await attempt(() => api("GET", pagePath(slug)));
+  if (!page) {
+    state.current = null;
+    showPageEditor(false);
+    renderPageList();
+    return;
+  }
+  closeRevision();
+  showPageEditor(true);
+  show(page);
+  renderPageList();
+  if (!$("#history").hidden) loadRevisions();
+  await ensureEditor();
+  state.editor.setValue(savedContent(page).body);
+  updateDirty();
+  refreshPreview(0);
+}
+
+function showPageEditor(visible) {
+  $("#page-editor").hidden = !visible;
+  $("#no-page").hidden = visible;
+  // Without a page open the list is all there is; never leave it hidden then.
+  applySidebar();
+}
+
+// ---- Sidebar --------------------------------------------------------------
+
+let sidebarHidden = false;
+try {
+  sidebarHidden = localStorage.getItem("wordmaker-admin-sidebar") === "hidden";
+} catch {
+  // Shown, then.
+}
+
+function applySidebar() {
+  const hidden = sidebarHidden && !$("#page-editor").hidden;
+  $("#view-pages").classList.toggle("sidebar-hidden", hidden);
+  const button = $("#toggle-sidebar");
+  button.setAttribute("aria-pressed", String(!hidden));
+  button.title = hidden ? "Show the page list (Ctrl+\\)" : "Hide the page list (Ctrl+\\)";
+}
+
+function toggleSidebar() {
+  sidebarHidden = !sidebarHidden;
+  try {
+    localStorage.setItem("wordmaker-admin-sidebar", sidebarHidden ? "hidden" : "shown");
+  } catch {
+    // Not remembered, then.
+  }
+  applySidebar();
+  // The panes changed width; the split preview may want a new layout.
+  refreshPreview(0);
+}
+
+$("#toggle-sidebar").addEventListener("click", toggleSidebar);
+
+// ---- Drafts ---------------------------------------------------------------
+//
+// A published page is not changed by saving: its title and body go into a
+// draft, and the site keeps the published version until "Publish changes".
+// Slug and navigation are not drafted; they change at once.
+
+const hasDraft = (page) => page.draft_body != null;
+
+/** Whether saving keeps title and body as a draft rather than changing the page. */
+function savesDraft(page) {
+  // Servers from before drafts send no draft fields; they change the page.
+  if (!("draft_body" in page)) return false;
+  return page.status === "published" || hasDraft(page);
+}
+
+/** Title and body as last saved: the draft's, when there is one. */
+const savedContent = (page) => ({
+  title: page.draft_title ?? page.title,
+  body: page.draft_body ?? page.body,
+});
+
+function statusLabel(published, pending) {
+  if (!published) return "Not published";
+  return pending ? "Published · changes not yet published" : "Published";
+}
+
+/** Shows `page` as the saved state; `body` also puts it in the editor. */
+function show(page, { body = false } = {}) {
+  state.current = page;
+  const content = savedContent(page);
+  fields.title.value = content.title;
+  fields.slug.value = page.slug;
+  fields.inNav.checked = page.in_nav;
+  fields.navOrder.value = page.nav_order;
+
+  const published = page.status === "published";
+  const pending = hasDraft(page);
+  const drafts = savesDraft(page);
+  const status = $("#page-status");
+  status.textContent = statusLabel(published, pending);
+  status.className = `badge ${pending ? "pending" : page.status}`;
+  $("#save").textContent = drafts ? "Save draft" : "Save";
+  $("#save").title = drafts
+    ? "Keep the changes without publishing them (Ctrl+S)"
+    : "Save (Ctrl+S)";
+  // Before drafts, the one button published and unpublished.
+  const legacy = published && !("draft_body" in page);
+  $("#publish").textContent = !published ? "Publish" : legacy ? "Unpublish" : "Publish changes";
+  $("#unpublish").hidden = !published || legacy;
+  $("#discard-draft").hidden = !pending;
+
+  const view = $("#page-view");
+  view.href = page.url;
+  // Unpublished pages are not on the site; the preview is where they show.
+  view.textContent = pending ? "View published ↗" : "View ↗";
+  view.hidden = !published;
+  if (body && state.editor) state.editor.setValue(content.body);
+  updateDirty();
+}
+
+/** The page as it stands in the form and editor. */
+function draft() {
+  const current = state.current;
+  return {
+    title: fields.title.value.trim(),
+    slug: fields.slug.value.trim(),
+    body: state.editor ? state.editor.value() : current.body,
+    in_nav: fields.inNav.checked,
+    nav_order: Number.parseInt(fields.navOrder.value, 10) || 0,
+  };
+}
+
+/** The fields that differ from what was last saved. */
+function changes() {
+  if (!state.current) return {};
+  const saved = { ...state.current, ...savedContent(state.current) };
+  return Object.fromEntries(Object.entries(draft()).filter(([key, value]) => value !== saved[key]));
+}
+
+const isDirty = () => Object.keys(changes()).length > 0;
+
+function updateDirty() {
+  const label = $("#save-state");
+  if (state.saving) {
+    label.textContent = "Saving…";
+    label.className = "save-state";
+  } else if (isDirty()) {
+    label.textContent = "Unsaved changes";
+    label.className = "save-state dirty";
+  } else if (state.current && hasDraft(state.current)) {
+    label.textContent = `Draft saved ${ago(state.current.draft_updated_at)}`;
+    label.className = "save-state";
+  } else {
+    label.textContent = state.current ? `Saved ${ago(state.current.updated_at)}` : "";
+    label.className = "save-state";
+  }
+  // Nothing to publish on a published page without changes.
+  const current = state.current;
+  $("#publish").disabled =
+    !!current && savesDraft(current) && current.status === "published" && !hasDraft(current) && !isDirty();
+}
+
+for (const input of Object.values(fields)) {
+  input.addEventListener("input", () => {
+    updateDirty();
+    if (input === fields.title) refreshPreview();
+  });
+}
+
+/** Saves the draft; resolves to whether everything is saved now. */
+async function save() {
+  const update = changes();
+  if (!Object.keys(update).length) return true;
+  if (update.title === "") {
+    toast("A page needs a title.", { error: true });
+    return false;
+  }
+  state.saving = true;
+  updateDirty();
+  const before = state.current.slug;
+  const drafting = savesDraft(state.current);
+  const content = Object.fromEntries(
+    Object.entries(update).filter(([key]) => drafting && (key === "title" || key === "body")),
+  );
+  const direct = Object.fromEntries(Object.entries(update).filter(([key]) => !(key in content)));
+
+  let page = state.current;
+  let ok = true;
+  if (Object.keys(direct).length) {
+    page = (await attempt(() => api("PATCH", pagePath(before), direct))) ?? page;
+    ok = page !== state.current;
+  }
+  if (ok && Object.keys(content).length) {
+    const drafted = await attempt(() => api("PUT", `${pagePath(page.slug)}/draft`, content));
+    ok = !!drafted;
+    page = drafted ?? page;
+  }
+  state.saving = false;
+  // The editor and title keep what is in them: anything typed while saving,
+  // or not saved, stays a change.
+  const typed = fields.title.value;
+  if (page !== state.current) show(page);
+  fields.title.value = typed;
+  updateDirty();
+  if (page.slug !== before) history.replaceState(null, "", `#/pages/${page.slug}`);
+  if (!ok) return false;
+  if (!$("#history").hidden) loadRevisions();
+  loadPages();
+  toast(
+    Object.keys(content).length && page.status === "published"
+      ? "Draft saved. The site still shows the published version."
+      : "Saved",
+  );
+  return true;
+}
+
+$("#save").addEventListener("click", save);
+
+/** Publishes (a published page: its draft) or, before drafts, unpublishes. */
+$("#publish").addEventListener("click", async () => {
+  const current = state.current;
+  if (current.status === "published" && !("draft_body" in current)) return unpublish();
+  if (!(await save())) return;
+  const wasPublished = state.current.status === "published";
+  const page = await attempt(() => api("POST", `${pagePath(state.current.slug)}/publish`));
+  if (!page) return;
+  show(page);
+  if (!$("#history").hidden) loadRevisions();
+  loadPages();
+  toast(wasPublished ? "Changes published" : "Published");
+});
+
+async function unpublish() {
+  const page = state.current;
+  const sure = await ask({
+    title: `Unpublish “${page.title}”?`,
+    message: "It disappears from the site until it is published again.",
+    confirm: "Unpublish",
+    danger: true,
+  });
+  if (!sure) return;
+  const updated = await attempt(() => api("POST", `${pagePath(page.slug)}/unpublish`));
+  if (!updated) return;
+  show(updated);
+  loadPages();
+  toast("Unpublished");
+}
+
+$("#unpublish").addEventListener("click", unpublish);
+
+$("#discard-draft").addEventListener("click", async () => {
+  const page = state.current;
+  const sure = await ask({
+    title: "Discard the draft?",
+    message: "The editor goes back to the published version; the draft's changes are lost.",
+    confirm: "Discard",
+    danger: true,
+  });
+  if (!sure) return;
+  const updated = await attempt(() => api("DELETE", `${pagePath(page.slug)}/draft`));
+  if (!updated) return;
+  show(updated, { body: true });
+  refreshPreview(0);
+  loadPages();
+  toast("Draft discarded");
+});
+
+$("#delete-page").addEventListener("click", async () => {
+  const page = state.current;
+  const sure = await ask({
+    title: `Delete “${page.title}”?`,
+    message: "The page and its whole history are removed. This cannot be undone.",
+    confirm: "Delete",
+    danger: true,
+  });
+  if (!sure) return;
+  const done = await attempt(() => api("DELETE", pagePath(page.slug)));
+  if (done === undefined) return;
+  state.current = null;
+  showPageEditor(false);
+  history.replaceState(null, "", "#/pages");
+  await loadPages();
+  toast(`Deleted “${page.title}”`);
+});
+
+// Ctrl+S saves and Ctrl+\ toggles the page list (Cmd on a Mac), wherever
+// the focus is, including inside the editor's own frames.
+function onKey(event) {
+  if ((event.ctrlKey || event.metaKey) && event.key === "s") {
+    event.preventDefault();
+    if (state.current) save();
+  } else if ((event.ctrlKey || event.metaKey) && event.key === "\\") {
+    event.preventDefault();
+    toggleSidebar();
+  }
+}
+
+document.addEventListener("keydown", onKey);
+
+function hookFrame(frame) {
+  try {
+    const target = frame.contentDocument;
+    if (target && !target.wordmakerHooked) {
+      target.wordmakerHooked = true;
+      target.addEventListener("keydown", onKey);
+    }
+  } catch {
+    // A frame of another origin: nothing to hook.
+  }
+}
+
+// `load` does not bubble, but it can be caught on the way down.
+$("#editor").addEventListener("load", (event) => {
+  if (event.target instanceof HTMLIFrameElement) hookFrame(event.target);
+}, true);
+
+window.addEventListener("beforeunload", (event) => {
+  if (state.current && isDirty()) event.preventDefault();
+});
+
+// ---- The editor -----------------------------------------------------------
+
+let editorLoading;
+
+/** Loads the wasm and mounts the editor, once. */
+function ensureEditor() {
+  editorLoading ??= (async () => {
+    await initEditor();
+    // An empty value would open the editor's sample document instead.
+    const editor = mount("#editor", { value: "\n", richText: true });
+    editor.onChange(() => {
+      updateDirty();
+      refreshPreview();
+    });
+    state.editor = editor;
+    $("#editor-loading").hidden = true;
+    for (const frame of document.querySelectorAll("#editor iframe")) hookFrame(frame);
+  })().catch((error) => {
+    $("#editor-loading").textContent = `The editor failed to load: ${error.message ?? error}`;
+    throw error;
+  });
+  return editorLoading;
+}
+
+// ---- Layout and preview ---------------------------------------------------
+
+function setLayout(layout) {
+  state.layout = layout;
+  $("#panes").dataset.mode = layout;
+  for (const button of document.querySelectorAll(".segmented button")) {
+    button.setAttribute("aria-pressed", String(button.dataset.mode === layout));
+  }
+  try {
+    localStorage.setItem("wordmaker-admin-layout", layout);
+  } catch {
+    // Not remembered, then.
+  }
+  refreshPreview(0);
+}
+
+for (const button of document.querySelectorAll(".segmented button")) {
+  button.addEventListener("click", () => setLayout(button.dataset.mode));
+}
+
+const previewVisible = () =>
+  state.layout === "preview" ||
+  (state.layout === "split" && !window.matchMedia("(max-width: 760px)").matches);
+
+let previewTimer;
+let previewRequest = 0;
+
+/** Renders the draft (or the revision being looked at) after `delay` ms. */
+function refreshPreview(delay = 400) {
+  clearTimeout(previewTimer);
+  if (!state.current || !previewVisible()) return;
+  previewTimer = setTimeout(renderPreview, delay);
+}
+
+/** Set once the server turns out to predate `POST /preview`. */
+let previewFallback = false;
+/** Changes when the theme does, so the fallback's stylesheet is fetched anew. */
+let styleVersion = Date.now();
+
+async function previewHtml(title, slug, body) {
+  if (!previewFallback) {
+    try {
+      return await api("POST", "/preview", { title, slug, body });
+    } catch (error) {
+      if (error.status !== 404) throw error;
+      previewFallback = true;
+      toast(
+        "This server predates the full-page preview; showing the content without the site's header and footer. Update it to see the whole page.",
+      );
+    }
+  }
+  const rendered = await api("POST", "/render", { body });
+  return fallbackPage(title, rendered.html);
+}
+
+const escapeHtml = (text) =>
+  text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
+/** The content part of the site's page frame, around `html`. */
+function fallbackPage(title, html) {
+  const language = escapeHtml(state.settings?.site_language ?? "en");
+  return `<!doctype html>
+<html lang="${language}"><head><meta charset="utf-8">
+<link rel="stylesheet" href="/_wm/style.css?v=${styleVersion}"></head>
+<body><div class="wp-site-blocks">
+<main class="wp-block-group has-global-padding is-layout-constrained" style="margin-top:var(--wp--preset--spacing--60, 2.5rem)">
+<div class="wp-block-group alignfull has-global-padding is-layout-constrained" style="padding-top:var(--wp--preset--spacing--60, 2.5rem);padding-bottom:var(--wp--preset--spacing--60, 2.5rem)">
+<h1 class="wp-block-post-title">${escapeHtml(title)}</h1>
+<div class="entry-content alignfull wp-block-post-content has-global-padding is-layout-constrained wm-adoc">
+${html}
+</div></div></main></div></body></html>`;
+}
+
+async function renderPreview() {
+  const current = state.current;
+  if (!current) return;
+  const source = state.revision ?? { ...draft(), title: draft().title || current.title };
+  const request = ++previewRequest;
+  try {
+    const html = await previewHtml(source.title, current.slug, source.body);
+    // A later keystroke has already asked for a newer one.
+    if (request === previewRequest) showPreview(html);
+  } catch (error) {
+    if (request === previewRequest) {
+      showPreview(
+        `<!doctype html><body style="font:14px system-ui;color:#c62f2f;padding:1rem">
+         Preview failed: ${escapeHtml(error.message)}</body>`,
+      );
+    }
+  }
+}
+
+/** Swaps the preview, keeping the reader where they were in it. */
+function showPreview(html) {
+  const frame = $("#preview");
+  let scroll = 0;
+  try {
+    scroll = frame.contentWindow?.scrollY ?? 0;
+  } catch {
+    // Nothing to keep.
+  }
+  frame.addEventListener(
+    "load",
+    () => {
+      try {
+        frame.contentWindow.scrollTo(0, scroll);
+      } catch {
+        // Stays at the top.
+      }
+    },
+    { once: true },
+  );
+  frame.srcdoc = html;
+}
+
+window.matchMedia("(max-width: 760px)").addEventListener("change", () => refreshPreview(0));
+
+// ---- History --------------------------------------------------------------
+
+$("#toggle-history").addEventListener("click", () => {
+  const panel = $("#history");
+  panel.hidden = !panel.hidden;
+  $("#toggle-history").setAttribute("aria-pressed", String(!panel.hidden));
+  if (panel.hidden) closeRevision();
+  else loadRevisions();
+});
+
+async function loadRevisions() {
+  const slug = state.current.slug;
+  const revisions = await attempt(() => api("GET", `${pagePath(slug)}/revisions`));
+  if (!revisions || slug !== state.current?.slug) return;
+  $("#revision-list").replaceChildren(
+    ...revisions.map((revision, index) =>
+      h(
+        "li",
+        {},
+        h(
+          "button",
+          {
+            type: "button",
+            "aria-pressed": String(state.revision?.revision === revision.revision),
+            onclick: () => openRevision(revision.revision),
+          },
+          `Revision ${revision.revision}${index === 0 ? " (current)" : ""}`,
+          h("small", { title: new Date(revision.created_at).toLocaleString() }, `${ago(revision.created_at)} · ${revision.title}`),
+        ),
+      ),
+    ),
+  );
+}
+
+async function openRevision(number) {
+  const revision = await attempt(() => api("GET", `${pagePath(state.current.slug)}/revisions/${number}`));
+  if (!revision) return;
+  state.revision = revision;
+  $("#revision-label").textContent = `Revision ${revision.revision}, ${new Date(revision.created_at).toLocaleString()}`;
+  $("#revision-banner").hidden = false;
+  if (state.layout === "edit") setLayout("split");
+  else refreshPreview(0);
+  loadRevisions();
+}
+
+function closeRevision() {
+  if (!state.revision) return;
+  state.revision = null;
+  $("#revision-banner").hidden = true;
+  refreshPreview(0);
+  if (!$("#history").hidden) loadRevisions();
+}
+
+$("#close-revision").addEventListener("click", closeRevision);
+
+/** Puts the revision in the editor, to be saved (and published) like any edit. */
+$("#restore-revision").addEventListener("click", async () => {
+  const revision = state.revision;
+  if (isDirty()) {
+    const discard = await ask({
+      title: "Discard changes?",
+      message: "Restoring replaces the unsaved changes in the editor.",
+      confirm: "Restore anyway",
+      danger: true,
+    });
+    if (!discard) return;
+  }
+  fields.title.value = revision.title;
+  state.editor.setValue(revision.body);
+  closeRevision();
+  updateDirty();
+  toast(
+    savesDraft(state.current)
+      ? `Revision ${revision.revision} is in the editor. Save the draft, then publish the changes.`
+      : `Revision ${revision.revision} is in the editor. Save to keep it.`,
+  );
+});
+
+// ---- Media ----------------------------------------------------------------
+
+async function loadMedia() {
+  const media = await attempt(() => api("GET", "/media"));
+  if (!media) return;
+  const grid = $("#media-grid");
+  grid.replaceChildren(...media.map(mediaCard));
+  if (!media.length) grid.append(h("li", { class: "media-empty" }, "Nothing uploaded yet."));
+}
+
+/** What to write in a page to show or link the file. */
+function snippet(item) {
+  const name = item.original_name.replace(/\.[^.]+$/, "").replace(/[[\]]/g, "");
+  return item.content_type.startsWith("image/")
+    ? `image::${item.path}[${name}]`
+    : `link:${item.path}[${item.original_name.replace(/[[\]]/g, "")}]`;
+}
+
+function mediaCard(item) {
+  const image = item.content_type.startsWith("image/");
+  return h(
+    "li",
+    { class: "media-card" },
+    h(
+      "a",
+      { class: "media-thumb", href: item.path, target: "_blank", rel: "noopener" },
+      image
+        ? h("img", { src: item.path, alt: item.original_name, loading: "lazy" })
+        : item.original_name.split(".").pop(),
+    ),
+    h(
+      "div",
+      { class: "media-info" },
+      h("strong", { title: item.original_name }, item.original_name),
+      h("small", {}, `${size(item.size)} · ${ago(item.created_at)}`),
+    ),
+    h(
+      "div",
+      { class: "media-actions" },
+      h("button", { type: "button", onclick: () => copySnippet(item) }, "Copy AsciiDoc"),
+      h("button", { type: "button", class: "ghost danger", onclick: () => deleteMedia(item) }, "Delete"),
+    ),
+  );
+}
+
+async function copySnippet(item) {
+  const text = snippet(item);
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(`Copied ${text}`);
+  } catch {
+    await ask({
+      title: "Copy this into a page",
+      fields: [{ name: "snippet", label: "AsciiDoc", value: text, spellcheck: "false" }],
+      confirm: "Done",
+    });
+  }
+}
+
+async function deleteMedia(item) {
+  const sure = await ask({
+    title: `Delete ${item.original_name}?`,
+    message: "Pages that show or link it will point at nothing.",
+    confirm: "Delete",
+    danger: true,
+  });
+  if (!sure) return;
+  const done = await attempt(() => api("DELETE", `/media/${encodeURIComponent(item.filename)}`));
+  if (done === undefined) return;
+  toast(`Deleted ${item.original_name}`);
+  loadMedia();
+}
+
+async function upload(files) {
+  if (!files.length) return;
+  const form = new FormData();
+  for (const file of files) form.append("file", file, file.name);
+  toast(files.length === 1 ? `Uploading ${files[0].name}…` : `Uploading ${files.length} files…`);
+  const stored = await attempt(() => api("POST", "/media", form));
+  if (!stored) return;
+  toast(stored.length === 1 ? `Uploaded ${stored[0].original_name}` : `Uploaded ${stored.length} files`);
+  loadMedia();
+}
+
+$("#media-input").addEventListener("change", (event) => {
+  upload([...event.target.files]);
+  event.target.value = "";
+});
+
+const dropzone = $("#dropzone");
+for (const type of ["dragenter", "dragover"]) {
+  dropzone.addEventListener(type, (event) => {
+    event.preventDefault();
+    dropzone.classList.add("over");
+  });
+}
+dropzone.addEventListener("dragleave", () => dropzone.classList.remove("over"));
+dropzone.addEventListener("drop", (event) => {
+  event.preventDefault();
+  dropzone.classList.remove("over");
+  upload([...event.dataTransfer.files]);
+});
+
+// ---- Settings -------------------------------------------------------------
+
+let themes = [];
+
+async function loadSettings() {
+  const [settings, installed] = await Promise.all([
+    attempt(() => api("GET", "/settings")),
+    attempt(() => api("GET", "/themes")),
+    loadPages(),
+  ]);
+  if (settings) {
+    state.settings = settings;
+    const form = $("#settings-form");
+    form.site_title.value = settings.site_title;
+    form.site_tagline.value = settings.site_tagline ?? "";
+    form.site_language.value = settings.site_language;
+    form.footer_text.value = settings.footer_text ?? "";
+    $("#home-slug").replaceChildren(
+      h("option", { value: "" }, "List of published pages"),
+      ...state.pages.map((page) =>
+        h("option", { value: page.slug }, `${page.title}${page.status === "draft" ? " (not published)" : ""}`),
+      ),
+    );
+    form.home_slug.value = settings.home_slug ?? "";
+  }
+  if (installed) {
+    themes = installed;
+    const select = $("#theme-select");
+    select.replaceChildren(
+      h("option", { value: "" }, "Built-in look"),
+      ...themes.map((theme) =>
+        h("option", { value: theme.slug }, `${theme.name}${theme.version ? ` ${theme.version}` : ""}`),
+      ),
+    );
+    select.value = state.settings?.theme ?? "";
+    renderVariations();
+  }
+}
+
+function renderVariations() {
+  const slug = $("#theme-select").value;
+  const theme = themes.find((theme) => theme.slug === slug);
+  const active = slug === state.settings?.theme ? state.settings.theme_variations : [];
+  const box = $("#theme-variations");
+  box.replaceChildren();
+  $("#delete-theme").hidden = !theme;
+  if (!theme?.variations.length) return;
+  box.append(
+    h("legend", {}, "Style variations"),
+    ...theme.variations.map((variation) =>
+      h(
+        "label",
+        { class: "check" },
+        h("input", {
+          type: "checkbox",
+          name: "variation",
+          value: variation.id,
+          checked: active.includes(variation.id),
+        }),
+        variation.kind === "style" ? variation.title : `${variation.title} (${variation.kind})`,
+      ),
+    ),
+  );
+}
+
+$("#theme-select").addEventListener("change", renderVariations);
+
+$("#settings-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.target;
+  const update = {
+    site_title: form.site_title.value.trim(),
+    site_tagline: form.site_tagline.value.trim(),
+    footer_text: form.footer_text.value,
+    home_slug: form.home_slug.value,
+  };
+  const language = form.site_language.value.trim();
+  if (language) update.site_language = language;
+  const settings = await attempt(() => api("PUT", "/settings", update));
+  if (!settings) return;
+  state.settings = settings;
+  renderPageList();
+  refreshPreview(0);
+  toast("Settings saved");
+});
+
+$("#theme-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const theme = $("#theme-select").value || null;
+  const variations = [...document.querySelectorAll("#theme-variations input:checked")].map((input) => input.value);
+  const settings = await attempt(() => api("PUT", "/themes/active", { theme, variations }));
+  if (!settings) return;
+  state.settings = settings;
+  styleVersion = Date.now();
+  refreshPreview(0);
+  toast(theme ? "Theme applied" : "Back to the built-in look");
+});
+
+$("#delete-theme").addEventListener("click", async () => {
+  const theme = themes.find((theme) => theme.slug === $("#theme-select").value);
+  if (!theme) return;
+  const sure = await ask({
+    title: `Remove ${theme.name}?`,
+    message: "Its files are deleted. It can be installed again later.",
+    confirm: "Remove",
+    danger: true,
+  });
+  if (!sure) return;
+  const done = await attempt(() => api("DELETE", `/themes/${encodeURIComponent(theme.slug)}`));
+  if (done === undefined) return;
+  toast(`Removed ${theme.name}`);
+  loadSettings();
+});
+
+$("#install-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.target;
+  const button = form.querySelector("button[type=submit]");
+  const request = { wordpress_org: form.wordpress_org.value.trim() };
+  if (form.version.value.trim()) request.version = form.version.value.trim();
+  button.disabled = true;
+  button.textContent = "Installing…";
+  const theme = await attempt(() => api("POST", "/themes/install", request));
+  button.disabled = false;
+  button.textContent = "Install";
+  if (!theme) return;
+  form.reset();
+  toast(`Installed ${theme.name}`);
+  await loadSettings();
+  $("#theme-select").value = theme.slug;
+  renderVariations();
+});
+
+// ---- Start ----------------------------------------------------------------
+
+async function start() {
+  setLayout(state.layout);
+  applySidebar();
+  const config = await attempt(async () => (await fetch("/config.json")).json());
+  if (config) $("#site-link").href = config.site_url;
+  state.settings = await attempt(() => api("GET", "/settings"));
+  await loadPages();
+  // Fetch the wasm while the first page loads, not after.
+  ensureEditor().catch(() => {});
+  await route();
+}
+
+start();

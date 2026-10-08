@@ -43,6 +43,12 @@ pub struct Page {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub published_at: Option<DateTime<Utc>>,
+    /// Title of the pending draft: changes saved but not yet published.
+    pub draft_title: Option<String>,
+    /// `AsciiDoc` body of the pending draft. The site keeps showing `body`
+    /// until the page is published again.
+    pub draft_body: Option<String>,
+    pub draft_updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, sqlx::FromRow)]
@@ -55,6 +61,8 @@ pub struct PageSummary {
     pub nav_order: i64,
     pub updated_at: DateTime<Utc>,
     pub published_at: Option<DateTime<Utc>>,
+    /// Whether there are saved changes that are not published yet.
+    pub has_draft: bool,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, sqlx::FromRow)]
@@ -117,15 +125,30 @@ pub struct PageUpdate {
     pub nav_order: Option<i64>,
 }
 
-const PAGE_COLUMNS: &str =
-    "id, slug, title, body, status, in_nav, nav_order, created_at, updated_at, published_at";
+/// Changes to keep without publishing them.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct DraftUpdate {
+    /// New title; omitted, the draft's (or the page's) title stays.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// New `AsciiDoc` body, replacing the whole body; omitted, the draft's
+    /// (or the page's) body stays.
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+const PAGE_COLUMNS: &str = "id, slug, title, body, status, in_nav, nav_order, created_at, \
+                            updated_at, published_at, draft_title, draft_body, draft_updated_at";
+
+const SUMMARY_COLUMNS: &str = "id, slug, title, status, in_nav, nav_order, updated_at, \
+                               published_at, draft_body IS NOT NULL AS has_draft";
 
 pub async fn list(pool: &SqlitePool, status: Option<Status>) -> AppResult<Vec<PageSummary>> {
-    let pages = sqlx::query_as(
-        "SELECT id, slug, title, status, in_nav, nav_order, updated_at, published_at FROM pages
+    let pages = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {SUMMARY_COLUMNS} FROM pages
          WHERE ?1 IS NULL OR status = ?1
-         ORDER BY title COLLATE NOCASE",
-    )
+         ORDER BY title COLLATE NOCASE"
+    )))
     .bind(status)
     .fetch_all(pool)
     .await?;
@@ -134,11 +157,11 @@ pub async fn list(pool: &SqlitePool, status: Option<Status>) -> AppResult<Vec<Pa
 
 /// Published pages that belong in the site navigation, in order.
 pub async fn navigation(pool: &SqlitePool) -> AppResult<Vec<PageSummary>> {
-    let pages = sqlx::query_as(
-        "SELECT id, slug, title, status, in_nav, nav_order, updated_at, published_at FROM pages
+    let pages = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {SUMMARY_COLUMNS} FROM pages
          WHERE status = 'published' AND in_nav
-         ORDER BY nav_order, title COLLATE NOCASE",
-    )
+         ORDER BY nav_order, title COLLATE NOCASE"
+    )))
     .fetch_all(pool)
     .await?;
     Ok(pages)
@@ -246,9 +269,13 @@ pub async fn delete(pool: &SqlitePool, slug: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Publishing also makes a pending draft the live version of the page.
 pub async fn set_status(pool: &SqlitePool, slug: &str, status: Status) -> AppResult<Page> {
     let mut tx = pool.begin().await?;
     let now = Utc::now();
+    if status == Status::Published {
+        apply_draft(&mut tx, slug, now).await?;
+    }
     let result = sqlx::query(
         "UPDATE pages SET status = ?1, updated_at = ?2,
              published_at = CASE WHEN ?1 = 'published' THEN COALESCE(published_at, ?2)
@@ -266,6 +293,82 @@ pub async fn set_status(pool: &SqlitePool, slug: &str, status: Status) -> AppRes
     let page = fetch(&mut tx, slug).await?;
     tx.commit().await?;
     Ok(page)
+}
+
+/// Keeps changes to the title and body without touching what the site
+/// shows. Changes that leave the page as published remove the draft.
+pub async fn save_draft(pool: &SqlitePool, slug: &str, update: DraftUpdate) -> AppResult<Page> {
+    let mut tx = pool.begin().await?;
+    let page = fetch(&mut tx, slug).await?;
+    let title = match update.title.as_deref() {
+        Some(title) => validate_title(title)?.to_owned(),
+        None => page
+            .draft_title
+            .clone()
+            .unwrap_or_else(|| page.title.clone()),
+    };
+    let body = update
+        .body
+        .or_else(|| page.draft_body.clone())
+        .unwrap_or_else(|| page.body.clone());
+
+    if title == page.title && body == page.body {
+        clear_draft(&mut tx, page.id).await?;
+    } else {
+        sqlx::query(
+            "UPDATE pages SET draft_title = ?, draft_body = ?, draft_updated_at = ? WHERE id = ?",
+        )
+        .bind(&title)
+        .bind(&body)
+        .bind(Utc::now())
+        .bind(page.id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let page = fetch(&mut tx, slug).await?;
+    tx.commit().await?;
+    Ok(page)
+}
+
+/// Throws away the pending draft, if there is one.
+pub async fn discard_draft(pool: &SqlitePool, slug: &str) -> AppResult<Page> {
+    let mut tx = pool.begin().await?;
+    let page = fetch(&mut tx, slug).await?;
+    clear_draft(&mut tx, page.id).await?;
+    let page = fetch(&mut tx, slug).await?;
+    tx.commit().await?;
+    Ok(page)
+}
+
+/// Makes the pending draft the page's title and body, as a new revision.
+async fn apply_draft(conn: &mut SqliteConnection, slug: &str, now: DateTime<Utc>) -> AppResult<()> {
+    let page = fetch(conn, slug).await?;
+    let (Some(title), Some(body)) = (page.draft_title, page.draft_body) else {
+        return Ok(());
+    };
+    sqlx::query("UPDATE pages SET title = ?, body = ?, updated_at = ? WHERE id = ?")
+        .bind(&title)
+        .bind(&body)
+        .bind(now)
+        .bind(page.id)
+        .execute(&mut *conn)
+        .await?;
+    clear_draft(conn, page.id).await?;
+    if title != page.title || body != page.body {
+        record_revision(conn, page.id, &title, &body, now).await?;
+    }
+    Ok(())
+}
+
+async fn clear_draft(conn: &mut SqliteConnection, page_id: i64) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE pages SET draft_title = NULL, draft_body = NULL, draft_updated_at = NULL
+         WHERE id = ?",
+    )
+    .bind(page_id)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 pub async fn list_revisions(pool: &SqlitePool, slug: &str) -> AppResult<Vec<RevisionSummary>> {
@@ -462,6 +565,74 @@ mod tests {
         let page = restore_revision(&pool, "about", 1).await.unwrap();
         assert_eq!(page.body, "first");
         assert_eq!(list_revisions(&pool, "about").await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn drafts_wait_for_publishing() {
+        let pool = connect_memory().await;
+        create(&pool, new_page("Home", "live")).await.unwrap();
+        set_status(&pool, "home", Status::Published).await.unwrap();
+
+        let page = save_draft(
+            &pool,
+            "home",
+            DraftUpdate {
+                body: Some("next".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.body, "live", "the site keeps the published body");
+        assert_eq!(page.draft_body.as_deref(), Some("next"));
+        assert_eq!(page.draft_title.as_deref(), Some("Home"));
+        assert!(list(&pool, None).await.unwrap()[0].has_draft);
+        assert_eq!(list_revisions(&pool, "home").await.unwrap().len(), 1);
+
+        // A title alone keeps the drafted body.
+        let page = save_draft(
+            &pool,
+            "home",
+            DraftUpdate {
+                title: Some("Start".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.draft_body.as_deref(), Some("next"));
+
+        let page = set_status(&pool, "home", Status::Published).await.unwrap();
+        assert_eq!((page.title.as_str(), page.body.as_str()), ("Start", "next"));
+        assert_eq!(page.draft_body, None);
+        assert!(!list(&pool, None).await.unwrap()[0].has_draft);
+        assert_eq!(list_revisions(&pool, "home").await.unwrap().len(), 2);
+
+        // Drafting what is already published leaves no draft behind.
+        let page = save_draft(
+            &pool,
+            "home",
+            DraftUpdate {
+                body: Some("next".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.draft_body, None);
+
+        save_draft(
+            &pool,
+            "home",
+            DraftUpdate {
+                body: Some("scrapped".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let page = discard_draft(&pool, "home").await.unwrap();
+        assert_eq!((page.body.as_str(), page.draft_body), ("next", None));
     }
 
     #[tokio::test]

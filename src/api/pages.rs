@@ -10,6 +10,7 @@ use axum::{
     routing::{
         get,
         post,
+        put,
     },
 };
 use serde::Deserialize;
@@ -18,6 +19,7 @@ use crate::{
     app::AppState,
     domain::pages::{
         self,
+        DraftUpdate,
         NewPage,
         PageSummary,
         PageUpdate,
@@ -35,6 +37,7 @@ pub fn router() -> Router<AppState> {
         .route("/pages/{slug}", get(show).patch(update).delete(delete))
         .route("/pages/{slug}/publish", post(publish))
         .route("/pages/{slug}/unpublish", post(unpublish))
+        .route("/pages/{slug}/draft", put(save_draft).delete(discard_draft))
         .route("/pages/{slug}/revisions", get(list_revisions))
         .route("/pages/{slug}/revisions/{revision}", get(show_revision))
         .route(
@@ -98,6 +101,23 @@ async fn unpublish(
     Path(slug): Path<String>,
 ) -> AppResult<Json<PageView>> {
     let page = pages::set_status(&state.pool, &slug, Status::Draft).await?;
+    Ok(Json(page.into_view(&state.config)))
+}
+
+async fn save_draft(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    Json(update): Json<DraftUpdate>,
+) -> AppResult<Json<PageView>> {
+    let page = pages::save_draft(&state.pool, &slug, update).await?;
+    Ok(Json(page.into_view(&state.config)))
+}
+
+async fn discard_draft(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> AppResult<Json<PageView>> {
+    let page = pages::discard_draft(&state.pool, &slug).await?;
     Ok(Json(page.into_view(&state.config)))
 }
 

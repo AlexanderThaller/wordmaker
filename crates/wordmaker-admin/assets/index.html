@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WordMaker</title>
+    <link rel="stylesheet" href="/app.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#/pages">WordMaker</a>
+      <nav class="tabs" aria-label="Sections">
+        <a href="#/pages" data-view="pages">Pages</a>
+        <a href="#/media" data-view="media">Media</a>
+        <a href="#/settings" data-view="settings">Settings</a>
+      </nav>
+      <a class="site-link" id="site-link" target="_blank" rel="noopener">Open site ↗</a>
+    </header>
+
+    <main>
+      <!-- Pages: the list on the left, the page being edited on the right. -->
+      <section class="view pages-view" id="view-pages">
+        <aside class="sidebar" id="sidebar">
+          <div class="sidebar-head">
+            <input type="search" id="page-filter" placeholder="Filter pages" aria-label="Filter pages" />
+            <button type="button" class="primary" id="new-page">New</button>
+          </div>
+          <ul class="page-list" id="page-list"></ul>
+        </aside>
+
+        <div class="workspace">
+          <div class="empty" id="no-page">
+            <p>Pick a page on the left, or start a new one.</p>
+          </div>
+
+          <div class="page-editor" id="page-editor" hidden>
+            <div class="page-head">
+              <button type="button" class="ghost icon" id="toggle-sidebar" aria-pressed="true"
+                aria-controls="sidebar" title="Hide the page list (Ctrl+\)">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                  stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16" /></svg>
+              </button>
+              <input class="title-input" id="page-title" aria-label="Title" placeholder="Title" />
+              <div class="actions">
+                <span class="save-state" id="save-state" aria-live="polite"></span>
+                <button type="button" class="primary" id="save" title="Save (Ctrl+S)">Save</button>
+                <button type="button" id="publish">Publish</button>
+              </div>
+            </div>
+
+            <div class="page-meta">
+              <label class="field slug-field">
+                <span>/</span>
+                <input id="page-slug" aria-label="Slug" spellcheck="false" />
+              </label>
+              <label class="check">
+                <input type="checkbox" id="page-in-nav" /> In navigation
+              </label>
+              <label class="field order-field">
+                <span>Order</span>
+                <input type="number" id="page-nav-order" step="1" />
+              </label>
+              <span class="badge" id="page-status"></span>
+              <a class="quiet-link" id="page-view" target="_blank" rel="noopener">View ↗</a>
+              <span class="spacer"></span>
+              <div class="segmented" role="group" aria-label="Layout">
+                <button type="button" data-mode="edit">Edit</button>
+                <button type="button" data-mode="split">Split</button>
+                <button type="button" data-mode="preview">Preview</button>
+              </div>
+              <button type="button" class="ghost" id="discard-draft" hidden>Discard changes</button>
+              <button type="button" class="ghost" id="unpublish" hidden>Unpublish</button>
+              <button type="button" class="ghost" id="toggle-history" aria-pressed="false">History</button>
+              <button type="button" class="ghost danger" id="delete-page">Delete</button>
+            </div>
+
+            <div class="panes" id="panes" data-mode="split">
+              <div class="pane editor-pane">
+                <div id="editor"></div>
+                <p class="editor-loading" id="editor-loading">Loading editor…</p>
+              </div>
+              <div class="pane preview-pane">
+                <div class="revision-banner" id="revision-banner" hidden>
+                  <span id="revision-label"></span>
+                  <button type="button" class="primary" id="restore-revision">Restore</button>
+                  <button type="button" id="close-revision">Back to current</button>
+                </div>
+                <!--
+                  No scripts in the preview: same origin, so the theme's fonts
+                  load, but nothing in it can run.
+                -->
+                <iframe id="preview" title="Preview" sandbox="allow-same-origin"></iframe>
+              </div>
+              <aside class="history" id="history" hidden>
+                <h2>History</h2>
+                <ol class="revision-list" id="revision-list"></ol>
+              </aside>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Media: upload, then copy what to write in a page. -->
+      <section class="view media-view" id="view-media" hidden>
+        <div class="view-head">
+          <h1>Media</h1>
+          <label class="button primary">
+            Upload…
+            <input type="file" id="media-input" multiple hidden />
+          </label>
+        </div>
+        <div class="dropzone" id="dropzone">Drop files here to upload them.</div>
+        <ul class="media-grid" id="media-grid"></ul>
+      </section>
+
+      <!-- Settings: the site's own fields, then its theme. -->
+      <section class="view settings-view" id="view-settings" hidden>
+        <form class="card" id="settings-form">
+          <h1>Site</h1>
+          <label class="stacked">
+            <span>Title</span>
+            <input name="site_title" required />
+          </label>
+          <label class="stacked">
+            <span>Tagline</span>
+            <input name="site_tagline" />
+          </label>
+          <div class="row">
+            <label class="stacked">
+              <span>Language</span>
+              <input name="site_language" placeholder="en" />
+            </label>
+            <label class="stacked">
+              <span>Home page</span>
+              <select name="home_slug" id="home-slug"></select>
+            </label>
+          </div>
+          <label class="stacked">
+            <span>Footer text <small>AsciiDoc</small></span>
+            <textarea name="footer_text" rows="4" spellcheck="false"></textarea>
+          </label>
+          <div class="form-actions">
+            <button type="submit" class="primary">Save settings</button>
+          </div>
+        </form>
+
+        <form class="card" id="theme-form">
+          <h1>Theme</h1>
+          <label class="stacked">
+            <span>Active theme</span>
+            <select name="theme" id="theme-select"></select>
+          </label>
+          <fieldset class="variations" id="theme-variations"></fieldset>
+          <div class="form-actions">
+            <button type="button" class="ghost danger" id="delete-theme">Remove theme</button>
+            <span class="spacer"></span>
+            <button type="submit" class="primary">Apply theme</button>
+          </div>
+        </form>
+
+        <form class="card" id="install-form">
+          <h1>Install a theme</h1>
+          <p class="hint">A WordPress block theme from wordpress.org, by its slug, such as <code>twentytwentyfive</code>.</p>
+          <div class="row">
+            <label class="stacked grow">
+              <span>Slug</span>
+              <input name="wordpress_org" required spellcheck="false" />
+            </label>
+            <label class="stacked">
+              <span>Version <small>optional</small></span>
+              <input name="version" placeholder="latest" />
+            </label>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="primary">Install</button>
+          </div>
+        </form>
+      </section>
+    </main>
+
+    <dialog class="dialog" id="dialog">
+      <form method="dialog" id="dialog-form">
+        <h2 id="dialog-title"></h2>
+        <p id="dialog-message"></p>
+        <div id="dialog-fields"></div>
+        <div class="form-actions">
+          <button type="button" id="dialog-cancel">Cancel</button>
+          <button type="submit" class="primary" id="dialog-confirm">OK</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+  </body>
+</html>

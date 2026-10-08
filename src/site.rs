@@ -141,14 +141,7 @@ async fn render_page(
         Ok(_) | Err(AppError::NotFound(_)) => return Err(SiteError::NotFound),
         Err(err) => return Err(err.into()),
     };
-    let rendered = render::render_async(page.body).await?;
-    let html = {
-        let images = state.images.clone();
-        let media_dir = state.config.media_dir.clone();
-        tokio::task::spawn_blocking(move || images.rewrite(&rendered.html, &media_dir))
-            .await
-            .map_err(|err| AppError::Internal(format!("image rewrite failed: {err}")))?
-    };
+    let html = content_html(state, page.body).await?;
     let site_title = &frame.settings.site_title;
     let title = if is_home {
         site_title.clone()
@@ -156,6 +149,38 @@ async fn render_page(
         format!("{} – {site_title}", page.title)
     };
     Ok(layout(frame, &title, Some(&page.title), Some(&page.slug), &html).into_response())
+}
+
+/// A page that need not exist or be published yet, in the site's frame and
+/// theme: what `body` would look like under `title` if it were published.
+/// `slug` marks the navigation entry as current, as it would on the site.
+pub async fn preview(
+    state: &AppState,
+    title: &str,
+    slug: Option<&str>,
+    body: String,
+) -> Result<Html<String>, AppError> {
+    let frame = frame(state).await?;
+    let html = content_html(state, body).await?;
+    let site_title = &frame.settings.site_title;
+    Ok(layout(
+        &frame,
+        &format!("{title} – {site_title}"),
+        Some(title),
+        slug,
+        &html,
+    ))
+}
+
+/// A page body as the site serves it: rendered, with images pointed at
+/// their scaled copies.
+async fn content_html(state: &AppState, body: String) -> Result<String, AppError> {
+    let rendered = render::render_async(body).await?;
+    let images = state.images.clone();
+    let media_dir = state.config.media_dir.clone();
+    tokio::task::spawn_blocking(move || images.rewrite(&rendered.html, &media_dir))
+        .await
+        .map_err(|err| AppError::Internal(format!("image rewrite failed: {err}")))
 }
 
 /// The page, laid out like Twenty Twenty-Five's `page` template so a
