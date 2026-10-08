@@ -38,6 +38,8 @@ pub struct Report {
     pub devices: Vec<Count>,
     /// Paths that answered 404, e.g. broken links.
     pub not_found: Vec<Count>,
+    /// Bots by name, as far as their user agent tells.
+    pub bots: Vec<Count>,
     /// Types of the `GeoIP` databases in use, e.g. `DBIP-City-Lite`, which
     /// decide the attribution their licenses ask for.
     pub geo_databases: Vec<String>,
@@ -67,6 +69,15 @@ struct Totals {
 const PERIOD: &str = "site = ? AND timestamp >= toDateTime64(?, 3, 'UTC')";
 /// Page views that count: by people, of pages that exist.
 const HUMAN: &str = "NOT is_bot AND status = 200";
+/// A bot's name from its user agent: the first word with `bot`, `crawler`
+/// or the like in it (`GPTBot` in `…compatible; GPTBot/1.2…`), else what
+/// the user agent parser called it. Read at query time, so it also names
+/// bots recorded before this existed. `??` is a literal `?` to the client,
+/// which reads a single one as a query argument.
+const BOT_NAME: &str = "multiIf(user_agent = '', 'No user agent', (extract(user_agent, \
+                        '(??i)([a-z0-9_-]*(??:bot|crawler|spider|slurp)[a-z0-9_-]*\
+                        |headlesschrome|facebookexternalhit)') AS bot_name) != '', bot_name, \
+                        browser IN ('', 'UNKNOWN', 'misc crawler'), 'Other', browser)";
 
 pub async fn report(client: &clickhouse::Client, site: &str, days: u32) -> anyhow::Result<Report> {
     let to = Utc::now().date_naive();
@@ -108,17 +119,19 @@ pub async fn report(client: &clickhouse::Client, site: &str, days: u32) -> anyho
         "{HUMAN} AND referrer_host != '' AND referrer_host != {}",
         quote(&referrer_host)
     );
-    let (totals, daily, pages, referrers, countries, browsers, systems, devices, not_found) = tokio::try_join!(
-        totals,
-        daily,
-        top("path", HUMAN),
-        top("referrer_host", &external),
-        top("if(country = '', 'Unknown', country)", HUMAN),
-        top("browser", HUMAN),
-        top("os", HUMAN),
-        top("device", HUMAN),
-        top("path", "NOT is_bot AND status = 404"),
-    )?;
+    let (totals, daily, pages, referrers, countries, browsers, systems, devices, not_found, bots) =
+        tokio::try_join!(
+            totals,
+            daily,
+            top("path", HUMAN),
+            top("referrer_host", &external),
+            top("if(country = '', 'Unknown', country)", HUMAN),
+            top("browser", HUMAN),
+            top("os", HUMAN),
+            top("device", HUMAN),
+            top("path", "NOT is_bot AND status = 404"),
+            top(BOT_NAME, "is_bot"),
+        )?;
 
     Ok(Report {
         site: site.to_owned(),
@@ -136,6 +149,7 @@ pub async fn report(client: &clickhouse::Client, site: &str, days: u32) -> anyho
         systems,
         devices,
         not_found,
+        bots,
         geo_databases: Vec::new(),
     })
 }

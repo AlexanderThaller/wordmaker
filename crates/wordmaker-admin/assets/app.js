@@ -179,6 +179,8 @@ async function route() {
   const [, view = "pages", ...rest] = location.hash.split("/");
   const name = views.includes(view) ? view : "pages";
   for (const other of views) $(`#view-${other}`).hidden = other !== name;
+  // Leaving the dashboard stops its auto-refresh; coming back loads it anew.
+  scheduleRefresh();
   for (const link of document.querySelectorAll(".tabs a")) {
     if (link.dataset.view === name) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");
@@ -1126,26 +1128,89 @@ async function loadDashboard() {
   for (const button of document.querySelectorAll("#period button")) {
     button.setAttribute("aria-pressed", String(Number(button.dataset.days) === dashboardDays));
   }
+  clearTimeout(refreshTimer);
   const request = ++dashboardRequest;
   const message = $("#dashboard-message");
+  const status = $("#refresh-status");
+  $("#refresh-now").classList.add("spinning");
   try {
     const loaded = await api("GET", `/analytics?days=${dashboardDays}`);
     if (request !== dashboardRequest) return;
     report = loaded;
     message.hidden = true;
     $("#dashboard").hidden = false;
+    status.classList.remove("failed");
+    status.title = "";
+    status.textContent = `Updated ${clock.format(new Date())}`;
     renderDashboard();
   } catch (error) {
     if (request !== dashboardRequest) return;
-    report = null;
-    $("#dashboard").hidden = true;
-    message.hidden = false;
-    message.textContent =
-      error.status === 404
-        ? "Analytics is off. Set WORDMAKER_CLICKHOUSE_URL on the server to start recording page views."
-        : `Cannot load the numbers: ${error.message}`;
+    if (report?.days === dashboardDays && error.status !== 404) {
+      // A refresh that failed: keep showing the last numbers.
+      status.classList.add("failed");
+      status.textContent = `Update failed at ${clock.format(new Date())}`;
+      status.title = error.message;
+    } else {
+      report = null;
+      status.textContent = "";
+      $("#dashboard").hidden = true;
+      message.hidden = false;
+      message.textContent =
+        error.status === 404
+          ? "Analytics is off. Set WORDMAKER_CLICKHOUSE_URL on the server to start recording page views."
+          : `Cannot load the numbers: ${error.message}`;
+    }
+  } finally {
+    if (request === dashboardRequest) {
+      $("#refresh-now").classList.remove("spinning");
+      lastLoad = Date.now();
+      scheduleRefresh();
+    }
   }
 }
+
+// ---- Auto-refresh ---------------------------------------------------------
+//
+// Like Grafana: reload every so often, but only while someone can see the
+// dashboard, so a forgotten background tab does not keep querying ClickHouse.
+
+let refreshEvery = readRefresh();
+let refreshTimer;
+/** When the last load finished, in milliseconds. */
+let lastLoad = 0;
+
+const clock = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
+function readRefresh() {
+  try {
+    return Number(localStorage.getItem("wordmaker-admin-refresh")) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Plans the next load, at once when one is overdue; or stops planning. */
+function scheduleRefresh() {
+  clearTimeout(refreshTimer);
+  const watched = !$("#view-dashboard").hidden && document.visibilityState === "visible";
+  if (!refreshEvery || !watched || $("#refresh-now").classList.contains("spinning")) return;
+  const wait = Math.max(0, lastLoad + refreshEvery * 1000 - Date.now());
+  refreshTimer = setTimeout(loadDashboard, wait);
+}
+
+$("#refresh-every").value = String(refreshEvery);
+$("#refresh-every").addEventListener("change", (event) => {
+  refreshEvery = Number(event.target.value);
+  try {
+    localStorage.setItem("wordmaker-admin-refresh", String(refreshEvery));
+  } catch {
+    // Remembering the interval is only a convenience.
+  }
+  scheduleRefresh();
+});
+$("#refresh-now").addEventListener("click", loadDashboard);
+// Hidden tab: stop. Back in view: catch up at once if a refresh is due.
+document.addEventListener("visibilitychange", scheduleRefresh);
 
 for (const button of document.querySelectorAll("#period button")) {
   button.addEventListener("click", () => {
@@ -1168,7 +1233,7 @@ function renderDashboard() {
       perDay < 10 ? perDay.toFixed(1) : count.format(perDay),
       `on average over ${report.days} days`,
     ),
-    stat("Bot views", count.format(report.bot_views), "crawlers, not counted elsewhere"),
+    stat("Bot views", count.format(report.bot_views), "not counted elsewhere; see Bots below"),
   );
   $("#chart-range").textContent = `${dayLong.format(utcDay(report.from))} – ${dayLong.format(utcDay(report.to))} (UTC)`;
   drawDaily();
@@ -1201,6 +1266,10 @@ function renderDashboard() {
       link: pageLink,
       empty: "No broken links.",
       hint: "Pages visitors asked for that do not exist.",
+    }),
+    topList("Bots", report.bots, {
+      empty: "No bots yet.",
+      hint: "Crawlers, AI scrapers and other programs, named after their user agent.",
     }),
   );
   $("#dashboard-notes").replaceChildren(...notes());
