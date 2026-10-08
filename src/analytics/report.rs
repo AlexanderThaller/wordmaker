@@ -33,6 +33,8 @@ pub struct Report {
     pub pages: Vec<Count>,
     pub referrers: Vec<Count>,
     pub countries: Vec<Count>,
+    /// Every country with views, by ISO 3166 code, for the map.
+    pub country_codes: Vec<Count>,
     pub browsers: Vec<Count>,
     pub systems: Vec<Count>,
     pub devices: Vec<Count>,
@@ -104,34 +106,51 @@ pub async fn report(client: &clickhouse::Client, site: &str, days: u32) -> anyho
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))
         .unwrap_or_default();
-    let top = |column: &str, filter: &str| {
+    let ranked = |column: &str, filter: &str, limit: u32| {
         client
             .query(&format!(
                 "SELECT {column} AS name, count() AS views, uniq(visitor_id) AS visitors FROM \
                  page_views WHERE {PERIOD} AND {filter} GROUP BY name ORDER BY views DESC, name \
-                 LIMIT {TOP}"
+                 LIMIT {limit}"
             ))
             .bind(site)
             .bind(&since)
             .fetch_all::<Count>()
     };
+    let top = |column: &str, filter: &str| ranked(column, filter, TOP);
     let external = format!(
         "{HUMAN} AND referrer_host != '' AND referrer_host != {}",
         quote(&referrer_host)
     );
-    let (totals, daily, pages, referrers, countries, browsers, systems, devices, not_found, bots) =
-        tokio::try_join!(
-            totals,
-            daily,
-            top("path", HUMAN),
-            top("referrer_host", &external),
-            top("if(country = '', 'Unknown', country)", HUMAN),
-            top("browser", HUMAN),
-            top("os", HUMAN),
-            top("device", HUMAN),
-            top("path", "NOT is_bot AND status = 404"),
-            top(BOT_NAME, "is_bot"),
-        )?;
+    let (
+        totals,
+        daily,
+        pages,
+        referrers,
+        countries,
+        browsers,
+        systems,
+        devices,
+        not_found,
+        bots,
+        country_codes,
+    ) = tokio::try_join!(
+        totals,
+        daily,
+        top("path", HUMAN),
+        top("referrer_host", &external),
+        top("if(country = '', 'Unknown', country)", HUMAN),
+        top("browser", HUMAN),
+        top("os", HUMAN),
+        top("device", HUMAN),
+        top("path", "NOT is_bot AND status = 404"),
+        top(BOT_NAME, "is_bot"),
+        ranked(
+            "country_code",
+            &format!("{HUMAN} AND country_code != ''"),
+            300
+        ),
+    )?;
 
     Ok(Report {
         site: site.to_owned(),
@@ -150,6 +169,7 @@ pub async fn report(client: &clickhouse::Client, site: &str, days: u32) -> anyho
         devices,
         not_found,
         bots,
+        country_codes,
         geo_databases: Vec::new(),
     })
 }

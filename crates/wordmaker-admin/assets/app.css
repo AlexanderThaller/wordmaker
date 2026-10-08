@@ -1081,7 +1081,8 @@ button.icon:hover {
   line-height: 1.2;
 }
 
-.chart-panel figcaption {
+.chart-panel figcaption,
+.map-panel figcaption {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
@@ -1170,6 +1171,85 @@ button.icon:hover {
 .chart-table th:first-child,
 .chart-table td:first-child {
   text-align: left;
+}
+
+.map {
+  position: relative;
+}
+
+/* Wide panels would make the map taller than the screen; it stays centered. */
+.map svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 440px;
+}
+
+/* Thin surface-colored borders keep neighbours apart. */
+.map .country {
+  fill: var(--surface-2);
+  stroke: var(--surface);
+  stroke-width: 0.6;
+  outline: none;
+}
+
+.map .country.s1,
+.map-legend .s1 {
+  fill: color-mix(in oklab, var(--accent) 20%, var(--surface));
+  background: color-mix(in oklab, var(--accent) 20%, var(--surface));
+}
+
+.map .country.s2,
+.map-legend .s2 {
+  fill: color-mix(in oklab, var(--accent) 40%, var(--surface));
+  background: color-mix(in oklab, var(--accent) 40%, var(--surface));
+}
+
+.map .country.s3,
+.map-legend .s3 {
+  fill: color-mix(in oklab, var(--accent) 60%, var(--surface));
+  background: color-mix(in oklab, var(--accent) 60%, var(--surface));
+}
+
+.map .country.s4,
+.map-legend .s4 {
+  fill: color-mix(in oklab, var(--accent) 80%, var(--surface));
+  background: color-mix(in oklab, var(--accent) 80%, var(--surface));
+}
+
+.map .country.s5,
+.map-legend .s5 {
+  fill: var(--accent);
+  background: var(--accent);
+}
+
+.map .country[tabindex]:hover,
+.map .country:focus-visible {
+  stroke: var(--text);
+  stroke-width: 1;
+}
+
+.map-legend {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.map-legend span:first-child {
+  margin-right: 4px;
+}
+
+.map-legend span:last-child {
+  margin-left: 4px;
+}
+
+.map-legend .swatch {
+  width: 22px;
+  height: 10px;
+  border-radius: 2px;
 }
 
 .tops {
