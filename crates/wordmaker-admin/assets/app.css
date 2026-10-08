@@ -387,6 +387,19 @@ main {
   padding: 12px 16px 6px;
 }
 
+button.icon {
+  padding: 4px;
+  color: var(--muted);
+}
+
+button.icon:hover {
+  color: var(--text);
+}
+
+.pages-view.sidebar-hidden .sidebar {
+  display: none;
+}
+
 .title-input {
   flex: 1;
   min-width: 0;

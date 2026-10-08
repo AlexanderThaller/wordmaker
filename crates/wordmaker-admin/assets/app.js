@@ -305,7 +305,40 @@ async function openPage(slug) {
 function showPageEditor(visible) {
   $("#page-editor").hidden = !visible;
   $("#no-page").hidden = visible;
+  // Without a page open the list is all there is; never leave it hidden then.
+  applySidebar();
 }
+
+// ---- Sidebar --------------------------------------------------------------
+
+let sidebarHidden = false;
+try {
+  sidebarHidden = localStorage.getItem("wordmaker-admin-sidebar") === "hidden";
+} catch {
+  // Shown, then.
+}
+
+function applySidebar() {
+  const hidden = sidebarHidden && !$("#page-editor").hidden;
+  $("#view-pages").classList.toggle("sidebar-hidden", hidden);
+  const button = $("#toggle-sidebar");
+  button.setAttribute("aria-pressed", String(!hidden));
+  button.title = hidden ? "Show the page list (Ctrl+\\)" : "Hide the page list (Ctrl+\\)";
+}
+
+function toggleSidebar() {
+  sidebarHidden = !sidebarHidden;
+  try {
+    localStorage.setItem("wordmaker-admin-sidebar", sidebarHidden ? "hidden" : "shown");
+  } catch {
+    // Not remembered, then.
+  }
+  applySidebar();
+  // The panes changed width; the split preview may want a new layout.
+  refreshPreview(0);
+}
+
+$("#toggle-sidebar").addEventListener("click", toggleSidebar);
 
 /** Shows `page` as the saved state; `body` also puts it in the editor. */
 function show(page, { body = false } = {}) {
@@ -423,12 +456,15 @@ $("#delete-page").addEventListener("click", async () => {
   toast(`Deleted “${page.title}”`);
 });
 
-// Ctrl+S / Cmd+S saves, wherever the focus is, including inside the
-// editor's own frames.
+// Ctrl+S saves and Ctrl+\ toggles the page list (Cmd on a Mac), wherever
+// the focus is, including inside the editor's own frames.
 function onKey(event) {
   if ((event.ctrlKey || event.metaKey) && event.key === "s") {
     event.preventDefault();
     if (state.current) save();
+  } else if ((event.ctrlKey || event.metaKey) && event.key === "\\") {
+    event.preventDefault();
+    toggleSidebar();
   }
 }
 
@@ -912,6 +948,7 @@ $("#install-form").addEventListener("submit", async (event) => {
 
 async function start() {
   setLayout(state.layout);
+  applySidebar();
   const config = await attempt(async () => (await fetch("/config.json")).json());
   if (config) $("#site-link").href = config.site_url;
   state.settings = await attempt(() => api("GET", "/settings"));
