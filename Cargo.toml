@@ -37,6 +37,8 @@ axum = { version = "0.8.9", features = ["multipart", "macros"] }
 base64 = "0.23.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+lol_html = "3.0.1"
 mime_guess = "2.0.5"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2"] }
 rmcp = { version = "3.5.1", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "client", "transport-streamable-http-client-reqwest"] }
@@ -48,7 +50,7 @@ subtle = "2.6.1"
 thiserror = "2.0.21"
 tokio = { version = "1.53.2", features = ["full"] }
 tower = { version = "0.5.3", features = ["util"] }
-tower-http = { version = "0.7.1", features = ["trace", "limit", "fs"] }
+tower-http = { version = "0.7.1", features = ["trace", "limit", "fs", "compression-gzip", "compression-br", "set-header"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.27.0", features = ["v4"] }

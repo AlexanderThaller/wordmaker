@@ -20,12 +20,16 @@ use rmcp::transport::streamable_http_server::{
 };
 use sqlx::SqlitePool;
 use subtle::ConstantTimeEq;
-use tower_http::trace::TraceLayer;
+use tower_http::{
+    compression::CompressionLayer,
+    trace::TraceLayer,
+};
 
 use crate::{
     api,
     config::Config,
     error::AppError,
+    images::Images,
     mcp::WordMakerMcp,
     site,
     theme::ThemeCache,
@@ -37,6 +41,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub token: Arc<str>,
     pub themes: Arc<ThemeCache>,
+    pub images: Arc<Images>,
 }
 
 /// The whole application: public site, `/api/v1` and `/mcp`.
@@ -61,7 +66,7 @@ pub fn router(state: AppState, mcp_allowed_hosts: Vec<String>) -> Router {
 
     Router::new()
         .merge(protected)
-        .merge(site::router(&state))
+        .merge(site::router(&state).layer(CompressionLayer::new()))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -119,6 +124,7 @@ mod tests {
             config: Arc::new(config),
             token: "secret".into(),
             themes: Arc::default(),
+            images: Arc::default(),
         };
         router(state, vec!["localhost".into()])
     }

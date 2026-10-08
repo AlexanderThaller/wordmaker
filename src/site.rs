@@ -19,10 +19,16 @@ use axum::{
     },
     routing::get,
 };
-use tower::ServiceExt;
-use tower_http::services::{
-    ServeDir,
-    ServeFile,
+use tower::{
+    Layer,
+    ServiceExt,
+};
+use tower_http::{
+    services::{
+        ServeDir,
+        ServeFile,
+    },
+    set_header::SetResponseHeaderLayer,
 };
 
 use crate::{
@@ -53,8 +59,20 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/{slug}", get(show))
         .route("/_wm/style.css", get(stylesheet))
         .route("/_wm/theme/{theme}/{*path}", get(theme_asset))
-        .nest_service("/media", ServeDir::new(&state.config.media_dir))
+        .route("/_wm/img/{width}/{filename}", get(scaled_image))
+        .nest_service(
+            "/media",
+            // Stored names carry a random prefix and are never reused, so a
+            // file at a given URL never changes.
+            SetResponseHeaderLayer::if_not_present(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(IMMUTABLE),
+            )
+            .layer(ServeDir::new(&state.config.media_dir)),
+        )
 }
+
+const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
 /// Everything a page needs besides its own content.
 struct Frame {
@@ -124,20 +142,20 @@ async fn render_page(
         Err(err) => return Err(err.into()),
     };
     let rendered = render::render_async(page.body).await?;
+    let html = {
+        let images = state.images.clone();
+        let media_dir = state.config.media_dir.clone();
+        tokio::task::spawn_blocking(move || images.rewrite(&rendered.html, &media_dir))
+            .await
+            .map_err(|err| AppError::Internal(format!("image rewrite failed: {err}")))?
+    };
     let site_title = &frame.settings.site_title;
     let title = if is_home {
         site_title.clone()
     } else {
         format!("{} – {site_title}", page.title)
     };
-    Ok(layout(
-        frame,
-        &title,
-        Some(&page.title),
-        Some(&page.slug),
-        &rendered.html,
-    )
-    .into_response())
+    Ok(layout(frame, &title, Some(&page.title), Some(&page.slug), &html).into_response())
 }
 
 /// The page, laid out like Twenty Twenty-Five's `page` template so a
@@ -372,6 +390,29 @@ async fn theme_asset(
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=86400"),
             );
+            response.into_response()
+        }
+        Err(never) => match never {},
+    }
+}
+
+async fn scaled_image(
+    State(state): State<AppState>,
+    Path((width, filename)): Path<(u32, String)>,
+    request: Request,
+) -> Response {
+    let Some(file) = state
+        .images
+        .variant(&state.config.media_dir, width, &filename)
+        .await
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match ServeFile::new(file).oneshot(request).await {
+        Ok(mut response) => {
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static(IMMUTABLE));
             response.into_response()
         }
         Err(never) => match never {},

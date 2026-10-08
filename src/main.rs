@@ -5,6 +5,7 @@ mod config;
 mod db;
 mod domain;
 mod error;
+mod images;
 mod mcp;
 mod render;
 mod site;
@@ -129,6 +130,7 @@ async fn serve(config: Config, args: ServeArgs) -> anyhow::Result<()> {
         config: Arc::new(config),
         token: token.into(),
         themes: Arc::default(),
+        images: Arc::default(),
     };
     let router = app::router(state, allowed_hosts);
 

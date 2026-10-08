@@ -109,6 +109,7 @@ pub async fn delete(pool: &SqlitePool, media_dir: &Path, filename: &str) -> AppR
         return Err(AppError::NotFound(format!("media '{filename}'")));
     }
     // The name came out of the database, so it is one we sanitized ourselves.
+    crate::images::delete_variants(media_dir, filename).await;
     match tokio::fs::remove_file(media_dir.join(filename)).await {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
         _ => Ok(()),

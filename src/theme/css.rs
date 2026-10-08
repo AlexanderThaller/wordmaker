@@ -396,7 +396,7 @@ fn font_faces(css: &mut String, settings: &Value, asset_base: &str) {
             };
             let _ = write!(
                 css,
-                "@font-face {{ font-family: {name}; src: {src}; font-display: fallback;"
+                "@font-face {{ font-family: {name}; src: {src}; font-display: swap;"
             );
             for (key, property) in [
                 ("fontStyle", "font-style"),
