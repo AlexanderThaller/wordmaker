@@ -35,6 +35,23 @@ The site is now at http://127.0.0.1:3000.
 
 Every variable also has a command line flag, see `wordmaker --help`.
 
+== Admin interface
+
+`wordmaker-admin` is a web interface for a running server: write pages in a WYSIWYG AsciiDoc editor (https://www.npmjs.com/package/asciidoc-editor[asciidoc-editor]) with a live preview in the site's theme, publish them, browse their history and restore old revisions, upload media, and change the site settings and theme.
+
+[source,sh]
+----
+cargo build --release --workspace
+WORDMAKER_TOKEN=... ./target/release/wordmaker-admin
+----
+
+Then open http://127.0.0.1:3001.
+It talks to the server at `WORDMAKER_BASE_URL` through the REST API and holds the token itself, so the browser never sees it.
+That also means anyone who can reach the interface can change the site: it listens on `127.0.0.1:3001` (`WORDMAKER_ADMIN_BIND`) and only answers to loopback host names.
+To reach it under another name, behind something that checks who is asking, add the name to `WORDMAKER_ADMIN_ALLOWED_HOSTS`.
+
+The editor is vendored in `crates/wordmaker-admin/vendor`; `vendor/update-editor.sh [version]` replaces it with a release from npm.
+
 == Claude Desktop
 
 === Local (stdio)
@@ -113,6 +130,7 @@ All endpoints live under `/api/v1` and require `Authorization: Bearer $WORDMAKER
 |`GET /pages/{slug}/revisions/{n}` |One revision
 |`POST /pages/{slug}/revisions/{n}/restore` |Make a revision current again
 |`POST /render` |Render `{"body"}` to HTML without saving
+|`POST /preview` |The whole page, in the site's frame and theme, for `{"title", "slug"?, "body"}`, without saving
 |`GET /media`, `POST /media` (multipart), `DELETE /media/{filename}` |Uploaded files
 |`GET /settings`, `PUT /settings` |`site_title`, `site_tagline`, `footer_text`, `home_slug`
 |`GET /themes` |Installed themes and their style variations

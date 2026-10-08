@@ -158,6 +158,27 @@ async fn render_page(
     Ok(layout(frame, &title, Some(&page.title), Some(&page.slug), &html).into_response())
 }
 
+/// A page that need not exist or be published yet, in the site's frame and
+/// theme: what `body` would look like under `title` if it were published.
+/// `slug` marks the navigation entry as current, as it would on the site.
+pub async fn preview(
+    state: &AppState,
+    title: &str,
+    slug: Option<&str>,
+    body: String,
+) -> Result<Html<String>, AppError> {
+    let frame = frame(state).await?;
+    let rendered = render::render_async(body).await?;
+    let site_title = &frame.settings.site_title;
+    Ok(layout(
+        &frame,
+        &format!("{title} – {site_title}"),
+        Some(title),
+        slug,
+        &rendered.html,
+    ))
+}
+
 /// The page, laid out like Twenty Twenty-Five's `page` template so a
 /// `WordPress` theme's styles apply to it.
 fn layout(

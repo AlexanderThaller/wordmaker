@@ -6,6 +6,7 @@ use axum::{
     Json,
     Router,
     extract::State,
+    response::Html,
     routing::{
         get,
         post,
@@ -25,6 +26,7 @@ use crate::{
         self,
         Rendered,
     },
+    site,
 };
 
 pub fn router(state: &AppState) -> Router<AppState> {
@@ -33,6 +35,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(media::router(state))
         .merge(themes::router())
         .route("/render", post(render_preview))
+        .route("/preview", post(page_preview))
         .route("/settings", get(get_settings).put(put_settings))
 }
 
@@ -43,6 +46,27 @@ struct RenderRequest {
 
 async fn render_preview(Json(request): Json<RenderRequest>) -> AppResult<Json<Rendered>> {
     Ok(Json(render::render_async(request.body).await?))
+}
+
+#[derive(Deserialize)]
+struct PreviewRequest {
+    title: String,
+    slug: Option<String>,
+    body: String,
+}
+
+/// The whole page as the site would serve it, without saving anything.
+async fn page_preview(
+    State(state): State<AppState>,
+    Json(request): Json<PreviewRequest>,
+) -> AppResult<Html<String>> {
+    site::preview(
+        &state,
+        &request.title,
+        request.slug.as_deref(),
+        request.body,
+    )
+    .await
 }
 
 async fn get_settings(State(state): State<AppState>) -> AppResult<Json<Settings>> {
