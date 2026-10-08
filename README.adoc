@@ -28,7 +28,8 @@ The site is now at http://127.0.0.1:3000.
 |`WORDMAKER_BASE_URL` |`http://127.0.0.1:3000` |Public URL, used for links returned by the API
 |`WORDMAKER_MAX_UPLOAD` |`26214400` |Largest upload in bytes
 |`WORDMAKER_BIND` |`127.0.0.1:3000` |Listen address (`serve` only)
-|`WORDMAKER_TOKEN` |– |Bearer token for `/api` and `/mcp` (required by `serve` and `client`)
+|`WORDMAKER_TOKEN` |– |Bearer token for `/api` and `/mcp` (required by `serve`, `client` and `wordmaker-admin`)
+|`WORDMAKER_TOKEN_FILE` |– |File holding the token instead, e.g. a systemd credential (`$CREDENTIALS_DIRECTORY/token`) or Docker secret; surrounding whitespace is ignored
 |`WORDMAKER_MCP_URL` |`$WORDMAKER_BASE_URL/mcp` |MCP endpoint (`client` only)
 |`WORDMAKER_ALLOWED_HOSTS` |– |Extra comma-separated `Host` values accepted by `/mcp`
 |===
@@ -45,7 +46,7 @@ Slug and navigation settings are not drafted and change at once.
 [source,sh]
 ----
 cargo build --release --workspace
-WORDMAKER_TOKEN=... ./target/release/wordmaker-admin
+WORDMAKER_TOKEN_FILE=/path/to/token ./target/release/wordmaker-admin
 ----
 
 Then open http://127.0.0.1:3001.
@@ -112,7 +113,7 @@ When the server is not reached through `localhost`, set `WORDMAKER_BASE_URL` (or
 === Command line client
 
 Agents that can run shell commands but have no MCP support can use `wordmaker client`, which talks to the `/mcp` endpoint of a running server.
-It reads `WORDMAKER_TOKEN` and connects to `$WORDMAKER_BASE_URL/mcp` (override with `--url` or `WORDMAKER_MCP_URL`).
+It reads `WORDMAKER_TOKEN` (or `WORDMAKER_TOKEN_FILE`) and connects to `$WORDMAKER_BASE_URL/mcp` (override with `--url` or `WORDMAKER_MCP_URL`).
 
 [source,sh]
 ----

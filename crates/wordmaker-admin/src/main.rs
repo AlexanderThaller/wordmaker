@@ -1,5 +1,6 @@
 mod app;
 mod proxy;
+mod token;
 
 use std::net::SocketAddr;
 
@@ -34,9 +35,8 @@ struct Cli {
     )]
     base_url: String,
 
-    /// Bearer token of the `WordMaker` server's API.
-    #[arg(long, env = "WORDMAKER_TOKEN", hide_env_values = true)]
-    token: Option<String>,
+    #[command(flatten)]
+    token: token::TokenArgs,
 
     /// Extra `Host` values the interface answers to, besides loopback and the
     /// bind address.
@@ -59,10 +59,7 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let token = cli
-        .token
-        .filter(|t| !t.trim().is_empty())
-        .context("WORDMAKER_TOKEN must be set to the server's API token")?;
+    let token = cli.token.require(" to the server's API token")?;
 
     let mut allowed_hosts: Vec<String> = ["localhost", "127.0.0.1", "::1"]
         .into_iter()

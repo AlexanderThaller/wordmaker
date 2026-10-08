@@ -25,7 +25,10 @@ use rmcp::{
 };
 use serde_json::Value;
 
-use crate::config::Config;
+use crate::{
+    config::Config,
+    token::TokenArgs,
+};
 
 #[derive(clap::Args)]
 pub struct ClientArgs {
@@ -33,9 +36,8 @@ pub struct ClientArgs {
     #[arg(long, env = "WORDMAKER_MCP_URL")]
     url: Option<String>,
 
-    /// Bearer token of the server.
-    #[arg(long, env = "WORDMAKER_TOKEN", hide_env_values = true)]
-    token: Option<String>,
+    #[command(flatten)]
+    token: TokenArgs,
 
     #[command(subcommand)]
     command: ClientCommand,
@@ -96,7 +98,8 @@ pub async fn run(config: &Config, args: ClientArgs) -> anyhow::Result<()> {
         _ => None,
     };
 
-    let client = connect(config, args.url, args.token).await?;
+    let token = args.token.require(" to the server's token")?;
+    let client = connect(config, args.url, token).await?;
     let result = match args.command {
         ClientCommand::Info => {
             info(&client);
@@ -114,12 +117,9 @@ pub async fn run(config: &Config, args: ClientArgs) -> anyhow::Result<()> {
 async fn connect(
     config: &Config,
     url: Option<String>,
-    token: Option<String>,
+    token: String,
 ) -> anyhow::Result<RunningService<RoleClient, ()>> {
     let url = url.unwrap_or_else(|| format!("{}/mcp", config.base_url.trim_end_matches('/')));
-    let token = token
-        .filter(|t| !t.trim().is_empty())
-        .context("WORDMAKER_TOKEN must be set to the server's token")?;
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(url.clone()).auth_header(token.clone()),
     );
@@ -186,7 +186,9 @@ fn describe_failure(status: reqwest::StatusCode, body: &str) -> String {
         format!(": {detail}")
     };
     let hint = match status {
-        reqwest::StatusCode::UNAUTHORIZED => "; check WORDMAKER_TOKEN or --token",
+        reqwest::StatusCode::UNAUTHORIZED => {
+            "; check WORDMAKER_TOKEN, WORDMAKER_TOKEN_FILE or --token"
+        }
         reqwest::StatusCode::FORBIDDEN => {
             "; the server may not accept this host name, see WORDMAKER_ALLOWED_HOSTS"
         }
@@ -442,7 +444,8 @@ mod tests {
         );
         assert_eq!(
             msg,
-            "HTTP 401 Unauthorized: missing or invalid API token; check WORDMAKER_TOKEN or --token"
+            "HTTP 401 Unauthorized: missing or invalid API token; check WORDMAKER_TOKEN, \
+             WORDMAKER_TOKEN_FILE or --token"
         );
         let msg = describe_failure(reqwest::StatusCode::NOT_FOUND, "");
         assert_eq!(msg, "HTTP 404 Not Found; check WORDMAKER_MCP_URL or --url");
