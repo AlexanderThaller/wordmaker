@@ -7,6 +7,7 @@ mod domain;
 mod error;
 mod images;
 mod mcp;
+mod oauth;
 mod render;
 mod site;
 mod theme;
@@ -131,6 +132,7 @@ async fn serve(config: Config, args: ServeArgs) -> anyhow::Result<()> {
         token: token.into(),
         themes: Arc::default(),
         images: Arc::default(),
+        oauth_clients: Arc::default(),
     };
     let router = app::router(state, allowed_hosts);
 

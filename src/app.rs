@@ -6,12 +6,18 @@ use axum::{
         Request,
         State,
     },
-    http::header,
+    http::{
+        HeaderMap,
+        header,
+    },
     middleware::{
         self,
         Next,
     },
-    response::Response,
+    response::{
+        IntoResponse,
+        Response,
+    },
 };
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig,
@@ -31,6 +37,7 @@ use crate::{
     error::AppError,
     images::Images,
     mcp::WordMakerMcp,
+    oauth,
     site,
     theme::ThemeCache,
 };
@@ -42,6 +49,7 @@ pub struct AppState {
     pub token: Arc<str>,
     pub themes: Arc<ThemeCache>,
     pub images: Arc<Images>,
+    pub oauth_clients: Arc<oauth::ClientCache>,
 }
 
 /// The whole application: public site, `/api/v1` and `/mcp`.
@@ -59,13 +67,20 @@ pub fn router(state: AppState, mcp_allowed_hosts: Vec<String>) -> Router {
         )
     };
 
-    let protected = Router::new()
+    let api = Router::new()
         .nest("/api/v1", api::router(&state))
-        .nest_service("/mcp", mcp)
         .layer(middleware::from_fn_with_state(state.clone(), require_token));
+    let mcp = Router::new()
+        .nest_service("/mcp", mcp)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_mcp_auth,
+        ));
 
     Router::new()
-        .merge(protected)
+        .merge(api)
+        .merge(mcp)
+        .merge(oauth::router())
         .merge(site::router(&state).layer(CompressionLayer::new()))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -75,13 +90,8 @@ pub fn router(state: AppState, mcp_allowed_hosts: Vec<String>) -> Router {
 /// the `Authorization` header themselves.
 pub const TOKEN_HEADER: &str = "x-wordmaker-token";
 
-async fn require_token(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Result<Response, AppError> {
-    let headers = request.headers();
-    let presented = headers
+fn presented_token(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
@@ -90,12 +100,43 @@ async fn require_token(
                 .get(TOKEN_HEADER)
                 .and_then(|value| value.to_str().ok())
         })
-        .unwrap_or_default();
-    if presented.as_bytes().ct_eq(state.token.as_bytes()).into() {
-        Ok(next.run(request).await)
-    } else {
-        Err(AppError::Unauthorized)
+}
+
+fn is_admin_token(state: &AppState, presented: &str) -> bool {
+    presented.as_bytes().ct_eq(state.token.as_bytes()).into()
+}
+
+async fn require_token(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    match presented_token(request.headers()) {
+        Some(presented) if is_admin_token(&state, presented) => Ok(next.run(request).await),
+        _ => Err(AppError::Unauthorized),
     }
+}
+
+/// `/mcp` takes the admin token or an OAuth access token. Without either,
+/// the 401 tells clients where to find out how to sign in.
+async fn require_mcp_auth(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let presented = presented_token(request.headers()).map(str::to_owned);
+    if let Some(presented) = &presented
+        && (is_admin_token(&state, presented)
+            || oauth::access_token_valid(&state, presented).await?)
+    {
+        return Ok(next.run(request).await);
+    }
+    let mut response = AppError::Unauthorized.into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        oauth::challenge(&state.config, presented.is_some()),
+    );
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -134,6 +175,7 @@ mod tests {
             token: "secret".into(),
             themes: Arc::default(),
             images: Arc::default(),
+            oauth_clients: Arc::default(),
         };
         router(state, vec!["localhost".into()])
     }

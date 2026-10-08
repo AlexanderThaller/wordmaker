@@ -85,7 +85,21 @@ The stdio server needs no token, and does not need `wordmaker serve` to be runni
 === Remote (HTTP)
 
 `wordmaker serve` also speaks MCP (streamable HTTP) at `/mcp`, protected by the same bearer token as the API.
-Clients that cannot set the `Authorization` header, such as Claude's custom connectors, can send the token as `X-WordMaker-Token: $WORDMAKER_TOKEN` instead (no `Bearer` prefix).
+Clients that cannot set the `Authorization` header can send the token as `X-WordMaker-Token: $WORDMAKER_TOKEN` instead (no `Bearer` prefix).
+
+==== OAuth
+
+`/mcp` also supports OAuth as described by the MCP authorization spec, so clients such as Claude's custom connectors only need the URL, `https://example.com/mcp`.
+On first use the client opens a sign-in page on your site; enter `WORDMAKER_TOKEN` there and approve.
+The client then gets an access token (valid for an hour) and a refresh token (30 days, renewed on every use).
+
+* `WORDMAKER_BASE_URL` must be the public URL the client connects to, e.g. `https://example.com`; it is the OAuth issuer and part of every metadata URL.
+* Clients identify themselves with a client ID metadata document or through dynamic client registration.
+* OAuth tokens are only accepted on `/mcp`, not on `/api`.
+* Changing `WORDMAKER_TOKEN` signs out every OAuth client.
+
+Endpoints: `/.well-known/oauth-protected-resource[/mcp]`, `/.well-known/oauth-authorization-server`,
+`/oauth/authorize`, `/oauth/token`, `/oauth/register`, `/oauth/revoke`.
 When the server is not reached through `localhost`, set `WORDMAKER_BASE_URL` (or `WORDMAKER_ALLOWED_HOSTS`) to the public host name, otherwise MCP requests are rejected to prevent DNS rebinding.
 
 === Tools
