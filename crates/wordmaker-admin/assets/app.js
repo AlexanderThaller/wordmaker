@@ -1579,6 +1579,21 @@ new ResizeObserver(() => {
   if (!$("#view-dashboard").hidden) drawDaily();
 }).observe($("#daily-chart"));
 
+// ---- Signing out ----------------------------------------------------------
+
+$("#sign-out").addEventListener("click", async () => {
+  const signedOut = await attempt(async () => {
+    // Like API calls, signing out needs the guard header.
+    const response = await fetch("/auth/logout", {
+      method: "POST",
+      headers: { "x-wordmaker-admin": "1" },
+    });
+    if (!response.ok) throw new Error(`cannot sign out: ${response.status}`);
+    return true;
+  });
+  if (signedOut) location.assign("/auth/signed-out");
+});
+
 // ---- Start ----------------------------------------------------------------
 
 async function start() {
@@ -1588,6 +1603,10 @@ async function start() {
   if (config) {
     $("#site-link").href = config.site_url;
     state.siteUrl = config.site_url;
+    if (config.user) {
+      $("#account-user").textContent = config.user;
+      $("#account").hidden = false;
+    }
   }
   state.settings = await attempt(() => api("GET", "/settings"));
   await loadPages();

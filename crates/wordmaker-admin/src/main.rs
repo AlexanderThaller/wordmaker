@@ -1,4 +1,5 @@
 mod app;
+mod auth;
 mod proxy;
 mod token;
 
@@ -21,9 +22,9 @@ use crate::{
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
-    /// Address to listen on. Anyone who can reach it can change the site, so
-    /// keep it on loopback unless something in front of it checks who is
-    /// asking.
+    /// Address to listen on. Without sign-in (`--oidc-issuer`) anyone who can
+    /// reach it can change the site, so keep it on loopback unless something
+    /// in front of it checks who is asking.
     #[arg(long, env = "WORDMAKER_ADMIN_BIND", default_value = "127.0.0.1:3001")]
     bind: SocketAddr,
 
@@ -46,6 +47,9 @@ struct Cli {
         value_delimiter = ','
     )]
     allowed_hosts: Vec<String>,
+
+    #[command(flatten)]
+    oidc: auth::OidcArgs,
 }
 
 #[tokio::main]
@@ -70,9 +74,29 @@ async fn main() -> anyhow::Result<()> {
     }
     allowed_hosts.extend(cli.allowed_hosts);
 
+    let auth = if let Some(oidc) = cli.oidc.resolve()? {
+        if let Some(host) = oidc.public_url().host_str() {
+            allowed_hosts.push(host.trim_matches(['[', ']']).to_owned());
+        }
+        if oidc.public_url().scheme() != "https" && !cli.bind.ip().is_loopback() {
+            tracing::warn!(
+                "the public URL is not https, so session cookies cross the network in the clear"
+            );
+        }
+        Some(auth::Auth::new(oidc).await?)
+    } else {
+        if !cli.bind.ip().is_loopback() {
+            tracing::warn!(
+                "listening beyond loopback without sign-in; set WORDMAKER_ADMIN_OIDC_ISSUER"
+            );
+        }
+        None
+    };
+
     let admin = Admin {
         upstream: Upstream::new(&cli.base_url, token)?,
         allowed_hosts: allowed_hosts.into(),
+        auth,
     };
     let router = app::router(admin);
 

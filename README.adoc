@@ -130,6 +130,24 @@ It talks to the server at `WORDMAKER_BASE_URL` through the REST API and holds th
 That also means anyone who can reach the interface can change the site: it listens on `127.0.0.1:3001` (`WORDMAKER_ADMIN_BIND`) and only answers to loopback host names.
 To reach it under another name, behind something that checks who is asking, add the name to `WORDMAKER_ADMIN_ALLOWED_HOSTS`.
 
+Or let it check itself: with `WORDMAKER_ADMIN_OIDC_ISSUER` set, people sign in through an OpenID Connect provider (Keycloak, Authentik, Google, GitLab, …) before they see anything.
+
+[source,sh]
+----
+WORDMAKER_ADMIN_BIND=0.0.0.0:3001 \
+WORDMAKER_ADMIN_PUBLIC_URL=https://admin.example \
+WORDMAKER_ADMIN_OIDC_ISSUER=https://keycloak.example/realms/main \
+WORDMAKER_ADMIN_OIDC_CLIENT_ID=wordmaker-admin \
+WORDMAKER_ADMIN_OIDC_CLIENT_SECRET_FILE=/path/to/client-secret \
+WORDMAKER_ADMIN_ALLOWED_USERS=alice@example.com,@team.example \
+WORDMAKER_TOKEN_FILE=/path/to/token ./target/release/wordmaker-admin
+----
+
+Register `<public URL>/auth/callback` as the redirect URI with the provider; the public URL's host is answered to as well.
+Only verified email addresses on `WORDMAKER_ADMIN_ALLOWED_USERS` get in, either exactly or by `@domain`.
+The client secret is optional for providers that register public clients, since the sign-in uses PKCE.
+Sessions last 12 hours and are kept in memory, so a restart signs everyone out.
+
 The editor is vendored in `crates/wordmaker-admin/vendor`; `vendor/update-editor.sh [version]` replaces it with a release from npm.
 The dashboard's world map is generated from https://www.naturalearthdata.com/[Natural Earth] (public domain) by `vendor/update-world.sh`.
 

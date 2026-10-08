@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::path::{
+    Path,
+    PathBuf,
+};
 
 use anyhow::Context;
 
@@ -27,10 +30,7 @@ impl TokenArgs {
     pub fn resolve(&self) -> anyhow::Result<Option<String>> {
         let token = match (&self.token, &self.token_file) {
             (Some(token), _) => token.trim().to_owned(),
-            (None, Some(path)) => std::fs::read_to_string(path)
-                .with_context(|| format!("cannot read the token file {}", path.display()))?
-                .trim()
-                .to_owned(),
+            (None, Some(path)) => read_secret_file(path, "token")?,
             (None, None) => return Ok(None),
         };
         Ok(Some(token).filter(|token| !token.is_empty()))
@@ -42,6 +42,15 @@ impl TokenArgs {
             format!("set WORDMAKER_TOKEN or WORDMAKER_TOKEN_FILE (--token, --token-file){hint}")
         })
     }
+}
+
+/// A secret kept in a file, without the whitespace around it; `what` names
+/// it in the error.
+pub fn read_secret_file(path: &Path, what: &str) -> anyhow::Result<String> {
+    Ok(std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read the {what} file {}", path.display()))?
+        .trim()
+        .to_owned())
 }
 
 #[cfg(test)]

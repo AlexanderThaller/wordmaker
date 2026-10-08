@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
+    Extension,
     Json,
     Router,
     extract::{
@@ -28,9 +29,16 @@ use axum::{
 use serde_json::json;
 use tower_http::trace::TraceLayer;
 
-use crate::proxy::{
-    self,
-    Upstream,
+use crate::{
+    auth::{
+        self,
+        Auth,
+        User,
+    },
+    proxy::{
+        self,
+        Upstream,
+    },
 };
 
 /// Header the page sends with every API call. A form or image on another
@@ -45,6 +53,9 @@ pub struct Admin {
     /// `Host` names this interface answers to; anything else may be a DNS
     /// rebinding attempt.
     pub allowed_hosts: Arc<[String]>,
+    /// Sign-in through an OIDC provider; without it, whoever
+    /// reaches the interface may use it.
+    pub auth: Option<Auth>,
 }
 
 /// One file of the page itself, built into the binary.
@@ -99,6 +110,11 @@ pub fn router(admin: Admin) -> Router {
         // theme's styles and fonts and the uploaded images.
         .route("/_wm/{*path}", get(public))
         .route("/media/{*path}", get(public))
+        .route_layer(middleware::from_fn_with_state(
+            admin.clone(),
+            auth::require_session,
+        ))
+        .merge(auth::router())
         .layer(middleware::map_response(security_headers))
         .layer(middleware::from_fn_with_state(admin.clone(), check_host))
         .layer(TraceLayer::new_for_http())
@@ -119,10 +135,14 @@ fn serve_asset(asset: &'static Asset) -> Response {
 }
 
 /// What the page needs to know about the server it edits.
-async fn config(State(admin): State<Admin>) -> Json<serde_json::Value> {
+async fn config(
+    State(admin): State<Admin>,
+    user: Option<Extension<User>>,
+) -> Json<serde_json::Value> {
     Json(json!({
         "site_url": admin.upstream.base_url(),
         "version": env!("CARGO_PKG_VERSION"),
+        "user": user.map(|Extension(User(email))| email),
     }))
 }
 
@@ -233,6 +253,7 @@ mod tests {
         router(Admin {
             upstream: Upstream::new(base_url, "secret".into()).unwrap(),
             allowed_hosts: vec!["localhost".to_owned(), "::1".to_owned()].into(),
+            auth: None,
         })
     }
 
