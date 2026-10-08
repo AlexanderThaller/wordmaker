@@ -32,13 +32,67 @@ The site is now at http://127.0.0.1:3000.
 |`WORDMAKER_TOKEN_FILE` |– |File holding the token instead, e.g. a systemd credential (`$CREDENTIALS_DIRECTORY/token`) or Docker secret; surrounding whitespace is ignored
 |`WORDMAKER_MCP_URL` |`$WORDMAKER_BASE_URL/mcp` |MCP endpoint (`client` only)
 |`WORDMAKER_ALLOWED_HOSTS` |– |Extra comma-separated `Host` values accepted by `/mcp`
+|`WORDMAKER_CLICKHOUSE_URL` |– |ClickHouse HTTP endpoint for page-view analytics, e.g. `http://127.0.0.1:8123`; analytics is off without it
+|`WORDMAKER_CLICKHOUSE_DATABASE` |`wordmaker` |ClickHouse database; must exist, the `page_views` table is created on start
+|`WORDMAKER_CLICKHOUSE_USER` |`default` |ClickHouse user
+|`WORDMAKER_CLICKHOUSE_PASSWORD` |– |ClickHouse password
+|`WORDMAKER_CLICKHOUSE_PASSWORD_FILE` |– |File holding the ClickHouse password instead
+|`WORDMAKER_GEOIP_CITY_DB` |– |MaxMind GeoLite2-City `.mmdb` for country, region and city
+|`WORDMAKER_GEOIP_ASN_DB` |– |MaxMind GeoLite2-ASN `.mmdb` for the visitor's network
+|`WORDMAKER_PROXY_HOPS` |`1` |Reverse proxies appending to `X-Forwarded-For`; `0` uses the connection's address
+|`WORDMAKER_GEOIP_DIR` |`geoip` |Where `wordmaker geoip` saves the DB-IP databases
 |===
 
 Every variable also has a command line flag, see `wordmaker --help`.
 
+=== Analytics
+
+With `WORDMAKER_CLICKHOUSE_URL` set, `serve` records every `GET` of `/` and of a page (including 404s) in the ClickHouse table `page_views`.
+Assets, media, the API and MCP are not recorded.
+Any number of instances can share one database: the `site` column holds each instance's `WORDMAKER_BASE_URL`.
+
+[source,sql]
+----
+CREATE DATABASE wordmaker;
+----
+
+Each row has the path and slug, status and render time, referrer and its host, `utm_source`/`utm_medium`/`utm_campaign`, the user agent with browser, OS, device type and a bot flag, the preferred language, and, with the GeoIP databases, country, region, city and network (ASN).
+`wordmaker geoip` downloads the free https://db-ip.com/db/lite.php[DB-IP Lite] city and ASN databases (no account needed) into `WORDMAKER_GEOIP_DIR` and prints the settings that point at them; DB-IP publishes a new edition every month.
+MaxMind's GeoLite2 files work as well, kept current with https://github.com/maxmind/geoipupdate[geoipupdate].
+A running `serve` checks the files every minute and loads new versions by itself; if a new file cannot be opened, it keeps using the old one.
+The DB-IP Lite data is licensed under https://creativecommons.org/licenses/by/4.0/[CC BY 4.0]; credit it as "IP Geolocation by DB-IP" wherever you show results based on it.
+
+[source,sh]
+----
+wordmaker geoip --dir /var/lib/wordmaker/geoip   # e.g. monthly from a systemd timer or cron
+----
+
+No IP address is stored.
+The address is used for the GeoIP lookup and for `visitor_id`, a hash of address and user agent with a random salt that only lives in memory and changes every UTC day.
+It counts unique visitors per day, but cannot be traced back to an address or followed across days.
+
+Analytics never slows the site down: requests only queue a page view, without waiting.
+When ClickHouse is unreachable, page views are buffered (up to 50,000) and written once it is back.
+On shutdown (Ctrl-C or SIGTERM) the buffer is written before the process exits.
+
+[source,sql]
+----
+-- Views and unique visitors per site and day, without bots
+SELECT site, toDate(timestamp) AS day, count() AS views, uniq(visitor_id) AS visitors
+FROM page_views WHERE NOT is_bot AND status = 200
+GROUP BY site, day ORDER BY day DESC, site;
+
+-- Top pages and countries this month
+SELECT site, path, country, count() AS views
+FROM page_views WHERE NOT is_bot AND timestamp >= toStartOfMonth(now())
+GROUP BY site, path, country ORDER BY views DESC LIMIT 20;
+----
+
+`cargo test` also writes page views to a real ClickHouse it starts in Docker (with https://crates.io/crates/testcontainers[testcontainers]); without Docker that test is skipped.
+
 == Admin interface
 
-`wordmaker-admin` is a web interface for a running server: write pages in a WYSIWYG AsciiDoc editor (https://www.npmjs.com/package/asciidoc-editor[asciidoc-editor]) with a live preview in the site's theme, publish them, browse their history and restore old revisions, upload media, and change the site settings and theme.
+`wordmaker-admin` is a web interface for a running server: write pages in a WYSIWYG AsciiDoc editor (https://www.npmjs.com/package/asciidoc-editor[asciidoc-editor]) with a live preview in the site's theme, publish them, browse their history and restore old revisions, upload media, change the site settings and theme, and see the page-view dashboard when analytics is on.
 
 Changes to a published page are saved as a draft: the site keeps showing the published version until you press _Publish changes_, and _Discard changes_ throws the draft away.
 Slug and navigation settings are not drafted and change at once.
@@ -159,6 +213,7 @@ All endpoints live under `/api/v1` and require `Authorization: Bearer $WORDMAKER
 |`POST /themes/upload?slug=` |Install from a zip sent as the request body
 |`PUT /themes/active` |Activate `{"theme", "variations": [...]}`; `{"theme": null}` for the built-in look
 |`DELETE /themes/{slug}` |Remove a theme that is not active
+|`GET /analytics?days=30` |Page-view report for the last 1–366 days: totals, views per day, top pages, referrers, countries, browsers, systems, devices and 404s; 404 when analytics is off
 |===
 
 [source,sh]

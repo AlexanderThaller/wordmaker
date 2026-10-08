@@ -1,4 +1,4 @@
-// The admin interface: one page, three views, all talking to the WordMaker
+// The admin interface: one page, four views, all talking to the WordMaker
 // REST API through this server, which adds the token on the way.
 
 import initEditor, { mount } from "/vendor/asciidoc_editor.js";
@@ -159,6 +159,8 @@ const state = {
   revision: null,
   layout: readLayout(),
   saving: false,
+  /** The public site, for links to its pages. */
+  siteUrl: null,
 };
 
 function readLayout() {
@@ -171,7 +173,7 @@ function readLayout() {
 
 // ---- Routing --------------------------------------------------------------
 
-const views = ["pages", "media", "settings"];
+const views = ["pages", "media", "settings", "dashboard"];
 
 async function route() {
   const [, view = "pages", ...rest] = location.hash.split("/");
@@ -184,6 +186,7 @@ async function route() {
 
   if (name === "media") return loadMedia();
   if (name === "settings") return loadSettings();
+  if (name === "dashboard") return loadDashboard();
 
   const slug = rest.length ? decodeURIComponent(rest.join("/")) : null;
   if (!slug) {
@@ -207,7 +210,34 @@ async function route() {
   await openPage(slug);
 }
 
-window.addEventListener("hashchange", route);
+window.addEventListener("hashchange", () => {
+  openMenu(false);
+  route();
+});
+
+// ---- The phone menu -------------------------------------------------------
+
+function openMenu(open) {
+  $(".topbar").classList.toggle("menu-open", open);
+  $("#menu-toggle").setAttribute("aria-expanded", String(open));
+}
+
+$("#menu-toggle").addEventListener("click", () => {
+  openMenu($("#menu-toggle").getAttribute("aria-expanded") !== "true");
+});
+// Picking the current section again changes no hash, so close on any pick.
+$("#menu").addEventListener("click", (event) => {
+  if (event.target.closest("a")) openMenu(false);
+});
+document.addEventListener("click", (event) => {
+  if (!event.target.closest(".topbar")) openMenu(false);
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && $(".topbar").classList.contains("menu-open")) {
+    openMenu(false);
+    $("#menu-toggle").focus();
+  }
+});
 
 // ---- Page list ------------------------------------------------------------
 
@@ -1062,13 +1092,334 @@ $("#install-form").addEventListener("submit", async (event) => {
   renderVariations();
 });
 
+// ---- Dashboard ------------------------------------------------------------
+//
+// Page views recorded in ClickHouse, as summed up by GET /analytics. Bots are
+// left out of every number except their own tile.
+
+let dashboardDays = readDays();
+let dashboardRequest = 0;
+/** The report on screen, kept to redraw the chart when the view resizes. */
+let report = null;
+
+function readDays() {
+  try {
+    return Number(localStorage.getItem("wordmaker-admin-days")) || 30;
+  } catch {
+    return 30;
+  }
+}
+
+const count = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
+const exact = new Intl.NumberFormat();
+const dayLabel = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
+const dayLong = new Intl.DateTimeFormat(undefined, {
+  weekday: "short",
+  month: "short",
+  day: "numeric",
+  year: "numeric",
+  timeZone: "UTC",
+});
+const utcDay = (iso) => new Date(`${iso}T00:00:00Z`);
+
+async function loadDashboard() {
+  for (const button of document.querySelectorAll("#period button")) {
+    button.setAttribute("aria-pressed", String(Number(button.dataset.days) === dashboardDays));
+  }
+  const request = ++dashboardRequest;
+  const message = $("#dashboard-message");
+  try {
+    const loaded = await api("GET", `/analytics?days=${dashboardDays}`);
+    if (request !== dashboardRequest) return;
+    report = loaded;
+    message.hidden = true;
+    $("#dashboard").hidden = false;
+    renderDashboard();
+  } catch (error) {
+    if (request !== dashboardRequest) return;
+    report = null;
+    $("#dashboard").hidden = true;
+    message.hidden = false;
+    message.textContent =
+      error.status === 404
+        ? "Analytics is off. Set WORDMAKER_CLICKHOUSE_URL on the server to start recording page views."
+        : `Cannot load the numbers: ${error.message}`;
+  }
+}
+
+for (const button of document.querySelectorAll("#period button")) {
+  button.addEventListener("click", () => {
+    dashboardDays = Number(button.dataset.days);
+    try {
+      localStorage.setItem("wordmaker-admin-days", String(dashboardDays));
+    } catch {
+      // Remembering the period is only a convenience.
+    }
+    loadDashboard();
+  });
+}
+
+function renderDashboard() {
+  const perDay = report.visitor_days / report.days;
+  $("#stats").replaceChildren(
+    stat("Page views", count.format(report.views), exact.format(report.views)),
+    stat(
+      "Visitors per day",
+      perDay < 10 ? perDay.toFixed(1) : count.format(perDay),
+      `on average over ${report.days} days`,
+    ),
+    stat("Bot views", count.format(report.bot_views), "crawlers, not counted elsewhere"),
+  );
+  $("#chart-range").textContent = `${dayLong.format(utcDay(report.from))} – ${dayLong.format(utcDay(report.to))} (UTC)`;
+  drawDaily();
+  $("#daily-table").replaceChildren(
+    h("thead", {}, h("tr", {}, h("th", {}, "Day"), h("th", {}, "Page views"), h("th", {}, "Visitors"))),
+    h(
+      "tbody",
+      {},
+      report.daily.map((day) =>
+        h(
+          "tr",
+          {},
+          h("td", {}, dayLong.format(utcDay(day.date))),
+          h("td", {}, exact.format(day.views)),
+          h("td", {}, exact.format(day.visitors)),
+        ),
+      ),
+    ),
+  );
+
+  const pageLink = (name) => (state.siteUrl ? new URL(name, state.siteUrl).href : null);
+  $("#tops").replaceChildren(
+    topList("Pages", report.pages, { link: pageLink }),
+    topList("Referrers", report.referrers, { link: (name) => `https://${name}`, empty: "No visits from other sites yet." }),
+    topList("Countries", report.countries),
+    topList("Browsers", report.browsers, { label: known }),
+    topList("Operating systems", report.systems, { label: known }),
+    topList("Devices", report.devices, { label: deviceName }),
+    topList("Not found", report.not_found, {
+      link: pageLink,
+      empty: "No broken links.",
+      hint: "Pages visitors asked for that do not exist.",
+    }),
+  );
+  $("#dashboard-notes").replaceChildren(...notes());
+}
+
+function stat(label, value, detail) {
+  return h(
+    "div",
+    { class: "stat" },
+    h("span", { class: "stat-label" }, label),
+    h("strong", { class: "stat-value" }, value),
+    h("small", {}, detail),
+  );
+}
+
+const known = (name) => (name === "UNKNOWN" ? "Unknown" : name);
+
+const DEVICES = {
+  pc: "Desktop",
+  smartphone: "Phone",
+  mobilephone: "Feature phone",
+  appliance: "Console or TV",
+  misc: "Other",
+};
+const deviceName = (name) => DEVICES[name] ?? known(name);
+
+/** A ranked list with a bar per entry, scaled to the first. */
+function topList(title, rows, { label = (name) => name, link, empty = "Nothing yet.", hint } = {}) {
+  const most = Math.max(1, ...rows.map((row) => row.views));
+  return h(
+    "section",
+    { class: "panel top" },
+    h("h2", {}, title),
+    hint ? h("p", { class: "hint" }, hint) : null,
+    rows.length
+      ? h(
+          "ol",
+          { class: "top-list" },
+          rows.map((row) => {
+            const href = link?.(row.name);
+            const name = label(row.name);
+            return h(
+              "li",
+              { style: `--share: ${row.views / most}` },
+              href
+                ? h("a", { class: "top-name", href, target: "_blank", rel: "noopener", title: name }, name)
+                : h("span", { class: "top-name", title: name }, name),
+              h("span", { class: "top-value", title: `${exact.format(row.visitors)} visitors` }, exact.format(row.views)),
+            );
+          }),
+        )
+      : h("p", { class: "hint" }, empty),
+  );
+}
+
+/** How to read the numbers, and the credit the GeoIP data's license asks for. */
+function notes() {
+  const items = [
+    "Visitors are counted per day: someone who comes back on another day counts again. No IP addresses are stored.",
+  ];
+  const types = report.geo_databases.join(" ");
+  const credit = [];
+  if (/DBIP/i.test(types)) {
+    credit.push(h("a", { href: "https://db-ip.com", target: "_blank", rel: "noopener" }, "IP Geolocation by DB-IP"));
+  } else if (/GeoLite2|GeoIP2/i.test(types)) {
+    credit.push(
+      "This product includes GeoLite2 data created by MaxMind, available from ",
+      h("a", { href: "https://www.maxmind.com", target: "_blank", rel: "noopener" }, "https://www.maxmind.com"),
+      ".",
+    );
+  } else {
+    credit.push("No GeoIP database is loaded, so countries are unknown.");
+  }
+  return [h("span", {}, items), " ", h("span", {}, credit)];
+}
+
+// ---- The daily chart ------------------------------------------------------
+
+const SVG = "http://www.w3.org/2000/svg";
+
+function svg(tag, attributes = {}, ...children) {
+  const element = document.createElementNS(SVG, tag);
+  for (const [name, value] of Object.entries(attributes)) {
+    if (name.startsWith("on")) element.addEventListener(name.slice(2), value);
+    else element.setAttribute(name, value);
+  }
+  element.append(...children);
+  return element;
+}
+
+/** 0 and evenly spaced round numbers covering `max`, at most five steps. */
+function ticks(max) {
+  let step = 10 ** Math.floor(Math.log10(Math.max(max, 1) / 4));
+  for (const factor of [1, 2, 5, 10]) {
+    if (max / (step * factor) <= 4) {
+      step *= factor;
+      break;
+    }
+  }
+  step = Math.max(1, step);
+  const values = [];
+  for (let value = 0; value < max + step; value += step) values.push(value);
+  return values;
+}
+
+function drawDaily() {
+  const box = $("#daily-chart");
+  box.querySelector("svg")?.remove();
+  if (!report || !box.clientWidth) return;
+  const daily = report.daily;
+  const width = box.clientWidth;
+  const height = 220;
+  const pad = { top: 12, right: 4, bottom: 24, left: 40 };
+  const plotWidth = width - pad.left - pad.right;
+  const plotHeight = height - pad.top - pad.bottom;
+  const scale = ticks(Math.max(...daily.map((day) => day.views)));
+  const top = scale.at(-1);
+  const y = (value) => pad.top + plotHeight - (value / top) * plotHeight;
+  const slot = plotWidth / daily.length;
+  const barWidth = Math.max(1, Math.min(24, slot - 2));
+  const base = y(0);
+
+  const chart = svg("svg", {
+    width,
+    height,
+    viewBox: `0 0 ${width} ${height}`,
+    role: "img",
+    "aria-label": `Page views per day, ${report.days} days; the table below has the numbers`,
+  });
+  for (const value of scale) {
+    chart.append(
+      svg("line", { class: "grid", x1: pad.left, x2: width - pad.right, y1: y(value), y2: y(value) }),
+      svg("text", { class: "axis", x: pad.left - 6, y: y(value), "text-anchor": "end", "dominant-baseline": "middle" }, count.format(value)),
+    );
+  }
+  // A label every few days, so they never crowd: at most about one per 70px.
+  const every = Math.max(1, Math.ceil(daily.length / Math.max(1, Math.floor(plotWidth / 70))));
+  daily.forEach((day, i) => {
+    const center = pad.left + slot * (i + 0.5);
+    const x = center - barWidth / 2;
+    const barTop = y(day.views);
+    const radius = Math.min(4, barWidth / 2, base - barTop);
+    if (day.views > 0) {
+      chart.append(
+        svg("path", {
+          class: "bar",
+          d: `M${x},${base}V${barTop + radius}Q${x},${barTop} ${x + radius},${barTop}H${x + barWidth - radius}Q${x + barWidth},${barTop} ${x + barWidth},${barTop + radius}V${base}Z`,
+        }),
+      );
+    }
+    if ((daily.length - 1 - i) % every === 0) {
+      // The last label ends at the plot's edge instead of running past it.
+      const last = i === daily.length - 1;
+      chart.append(
+        svg(
+          "text",
+          {
+            class: "axis",
+            x: last ? Math.min(center + 16, width - pad.right) : center,
+            y: height - 6,
+            "text-anchor": last ? "end" : "middle",
+          },
+          dayLabel.format(utcDay(day.date)),
+        ),
+      );
+    }
+    // The whole column answers to the pointer, not just the bar.
+    chart.append(
+      svg("rect", {
+        class: "hit",
+        x: pad.left + slot * i,
+        y: pad.top,
+        width: slot,
+        height: plotHeight,
+        tabindex: 0,
+        "aria-label": `${dayLong.format(utcDay(day.date))}: ${exact.format(day.views)} page views`,
+        onpointerenter: () => showTip(day, center, barTop),
+        onfocus: () => showTip(day, center, barTop),
+        onpointerleave: hideTip,
+        onblur: hideTip,
+      }),
+    );
+  });
+  chart.append(svg("line", { class: "baseline", x1: pad.left, x2: width - pad.right, y1: base, y2: base }));
+  box.prepend(chart);
+}
+
+function showTip(day, x, barTop) {
+  const tip = $("#chart-tooltip");
+  tip.replaceChildren(
+    h("strong", {}, dayLong.format(utcDay(day.date))),
+    h("span", {}, `${exact.format(day.views)} page views`),
+    h("span", {}, `${exact.format(day.visitors)} visitors`),
+  );
+  tip.hidden = false;
+  const box = $("#daily-chart").clientWidth;
+  const left = Math.min(Math.max(x - tip.offsetWidth / 2, 0), box - tip.offsetWidth);
+  tip.style.left = `${left}px`;
+  tip.style.top = `${Math.max(0, barTop - tip.offsetHeight - 8)}px`;
+}
+
+function hideTip() {
+  $("#chart-tooltip").hidden = true;
+}
+
+new ResizeObserver(() => {
+  if (!$("#view-dashboard").hidden) drawDaily();
+}).observe($("#daily-chart"));
+
 // ---- Start ----------------------------------------------------------------
 
 async function start() {
   setLayout(state.layout);
   applySidebar();
   const config = await attempt(async () => (await fetch("/config.json")).json());
-  if (config) $("#site-link").href = config.site_url;
+  if (config) {
+    $("#site-link").href = config.site_url;
+    state.siteUrl = config.site_url;
+  }
   state.settings = await attempt(() => api("GET", "/settings"));
   await loadPages();
   // Fetch the wasm while the first page loads, not after.

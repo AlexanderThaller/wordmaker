@@ -1,19 +1,29 @@
 use std::{
     fmt::Write,
+    net::SocketAddr,
     sync::Arc,
+    time::Instant,
 };
 
 use axum::{
     Router,
     extract::{
+        ConnectInfo,
+        MatchedPath,
         Path,
         Request,
         State,
     },
     http::{
+        HeaderMap,
         HeaderValue,
+        Method,
         StatusCode,
         header,
+    },
+    middleware::{
+        self,
+        Next,
     },
     response::{
         Html,
@@ -35,6 +45,7 @@ use tower_http::{
 };
 
 use crate::{
+    analytics::Hit,
     app::AppState,
     domain::{
         pages::{
@@ -74,6 +85,67 @@ pub fn router(state: &AppState) -> Router<AppState> {
             )
             .layer(ServeDir::new(&state.config.media_dir)),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_page_view,
+        ))
+}
+
+/// Routes whose `GET`s count as page views.
+const PAGE_ROUTES: &[&str] = &["/", "/{slug}"];
+
+/// Hands page views to analytics after the response is ready; never waits.
+async fn record_page_view(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let Some(analytics) = state.analytics.as_ref().filter(|_| {
+        request.method() == Method::GET
+            && request
+                .extensions()
+                .get::<MatchedPath>()
+                .is_some_and(|path| PAGE_ROUTES.contains(&path.as_str()))
+    }) else {
+        return next.run(request).await;
+    };
+
+    let start = Instant::now();
+    let time = chrono::Utc::now();
+    let uri = request.uri().clone();
+    let headers = request.headers().clone();
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(peer)| *peer);
+    let response = next.run(request).await;
+
+    let header = |name| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    analytics.record(Hit {
+        time,
+        ip: analytics.client_ip(forwarded_for(&headers).as_deref(), peer),
+        slug: uri.path().trim_start_matches('/').to_owned(),
+        path: uri.path().to_owned(),
+        query: uri.query().map(str::to_owned),
+        status: response.status().as_u16(),
+        duration: start.elapsed(),
+        user_agent: header(header::USER_AGENT),
+        referrer: header(header::REFERER),
+        accept_language: header(header::ACCEPT_LANGUAGE),
+    });
+    response
+}
+
+/// All `X-Forwarded-For` headers as one list, in order.
+fn forwarded_for(headers: &HeaderMap) -> Option<String> {
+    let values: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    (!values.is_empty()).then(|| values.join(","))
 }
 
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";

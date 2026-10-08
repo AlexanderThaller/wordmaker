@@ -1,3 +1,4 @@
+mod analytics;
 mod api;
 mod app;
 mod client;
@@ -16,6 +17,7 @@ mod token;
 use std::{
     net::SocketAddr,
     sync::Arc,
+    time::Duration,
 };
 
 use clap::{
@@ -53,6 +55,9 @@ enum Command {
     Client(client::ClientArgs),
     /// Print a new random API token.
     Token,
+    /// Download or update the free DB-IP Lite `GeoIP` databases (city and
+    /// ASN) for analytics.
+    Geoip(analytics::download::GeoipArgs),
 }
 
 #[derive(clap::Args, Default)]
@@ -72,6 +77,9 @@ struct ServeArgs {
         value_delimiter = ','
     )]
     allowed_hosts: Vec<String>,
+
+    #[command(flatten)]
+    analytics: analytics::AnalyticsArgs,
 }
 
 #[tokio::main]
@@ -96,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve(args) => serve(cli.config, args).await,
         Command::Mcp => mcp_stdio(cli.config).await,
         Command::Client(args) => client::run(&cli.config, args).await,
+        Command::Geoip(args) => analytics::download::run(&args).await,
         Command::Token => {
             let token = format!(
                 "{}{}",
@@ -123,6 +132,7 @@ async fn serve(config: Config, args: ServeArgs) -> anyhow::Result<()> {
         .collect();
     allowed_hosts.extend(base_url_hosts(&config.base_url));
     allowed_hosts.extend(args.allowed_hosts);
+    let (analytics, sink) = args.analytics.start(&config.base_url)?.unzip();
 
     let state = AppState {
         pool,
@@ -131,17 +141,49 @@ async fn serve(config: Config, args: ServeArgs) -> anyhow::Result<()> {
         themes: Arc::default(),
         images: Arc::default(),
         oauth_clients: Arc::default(),
+        analytics,
     };
     let router = app::router(state, allowed_hosts);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("listening on http://{bind}");
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
+
+    // The router held the last analytics handles; the sink now writes what
+    // it has buffered and stops.
+    if let Some(sink) = sink
+        && tokio::time::timeout(Duration::from_secs(15), sink)
+            .await
+            .is_err()
+    {
+        tracing::warn!("analytics: gave up writing buffered page views");
+    }
     Ok(())
+}
+
+/// Ctrl-C, or SIGTERM from systemd or Docker.
+async fn shutdown_signal() {
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                tracing::warn!("cannot listen for SIGTERM: {err}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        () = terminate => {}
+    }
+    tracing::info!("shutting down");
 }
 
 async fn mcp_stdio(config: Config) -> anyhow::Result<()> {

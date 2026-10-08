@@ -24,6 +24,12 @@ pub enum AppError {
     Io(#[from] std::io::Error),
     #[error("internal error: {0}")]
     Internal(String),
+    /// A feature that is not set up on this server.
+    #[error("{0}")]
+    Off(String),
+    /// A service this request depends on did not answer.
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 pub type AppResult<T> = Result<T, AppError>;
@@ -42,10 +48,11 @@ impl From<sqlx::Error> for AppError {
 impl AppError {
     pub fn status(&self) -> StatusCode {
         match self {
-            Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::NotFound(_) | Self::Off(_) => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Database(_) | Self::Io(_) | Self::Internal(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }

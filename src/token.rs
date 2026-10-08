@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::path::{
+    Path,
+    PathBuf,
+};
 
 use anyhow::Context;
 
@@ -25,15 +28,7 @@ pub struct TokenArgs {
 impl TokenArgs {
     /// The token, if one was given; an empty one counts as none.
     pub fn resolve(&self) -> anyhow::Result<Option<String>> {
-        let token = match (&self.token, &self.token_file) {
-            (Some(token), _) => token.trim().to_owned(),
-            (None, Some(path)) => std::fs::read_to_string(path)
-                .with_context(|| format!("cannot read the token file {}", path.display()))?
-                .trim()
-                .to_owned(),
-            (None, None) => return Ok(None),
-        };
-        Ok(Some(token).filter(|token| !token.is_empty()))
+        read_secret(self.token.as_deref(), self.token_file.as_deref(), "token")
     }
 
     /// The token, or an error saying how to give one.
@@ -42,6 +37,24 @@ impl TokenArgs {
             format!("set WORDMAKER_TOKEN or WORDMAKER_TOKEN_FILE (--token, --token-file){hint}")
         })
     }
+}
+
+/// A secret given directly or as a file holding it, trimmed; an empty one
+/// counts as none. `what` names it in errors.
+pub fn read_secret(
+    value: Option<&str>,
+    file: Option<&Path>,
+    what: &str,
+) -> anyhow::Result<Option<String>> {
+    let secret = match (value, file) {
+        (Some(value), _) => value.trim().to_owned(),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read the {what} file {}", path.display()))?
+            .trim()
+            .to_owned(),
+        (None, None) => return Ok(None),
+    };
+    Ok(Some(secret).filter(|secret| !secret.is_empty()))
 }
 
 #[cfg(test)]

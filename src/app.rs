@@ -32,6 +32,7 @@ use tower_http::{
 };
 
 use crate::{
+    analytics::Analytics,
     api,
     config::Config,
     error::AppError,
@@ -50,6 +51,8 @@ pub struct AppState {
     pub themes: Arc<ThemeCache>,
     pub images: Arc<Images>,
     pub oauth_clients: Arc<oauth::ClientCache>,
+    /// Records page views; `None` when analytics is off.
+    pub analytics: Option<Analytics>,
 }
 
 /// The whole application: public site, `/api/v1` and `/mcp`.
@@ -159,6 +162,10 @@ mod tests {
     use super::*;
 
     async fn app() -> Router {
+        app_with(None).await
+    }
+
+    async fn app_with(analytics: Option<Analytics>) -> Router {
         let config = Config {
             database_url: String::new(),
             media_dir: std::env::temp_dir().join("wordmaker-app-test"),
@@ -176,6 +183,7 @@ mod tests {
             themes: Arc::default(),
             images: Arc::default(),
             oauth_clients: Arc::default(),
+            analytics,
         };
         router(state, vec!["localhost".into()])
     }
@@ -205,6 +213,108 @@ mod tests {
         let status = response.status();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    async fn get_page(app: &Router, uri: &str) -> StatusCode {
+        let request = Request::get(uri)
+            .header("x-forwarded-for", "198.51.100.9, 203.0.113.7")
+            .header("user-agent", "Mozilla/5.0 (compatible; Googlebot/2.1)")
+            .header("referer", "https://search.example/")
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn records_page_views_only() {
+        let (analytics, mut hits) = Analytics::channel(1);
+        let app = app_with(Some(analytics)).await;
+        send(
+            &app,
+            Method::POST,
+            "/api/v1/pages",
+            Some(json!({ "title": "Hello", "body": "Hi." })),
+        )
+        .await;
+        send(&app, Method::POST, "/api/v1/pages/hello/publish", None).await;
+
+        assert_eq!(get_page(&app, "/").await, StatusCode::OK);
+        assert_eq!(get_page(&app, "/hello?utm_source=x").await, StatusCode::OK);
+        assert_eq!(get_page(&app, "/missing").await, StatusCode::NOT_FOUND);
+        assert_eq!(get_page(&app, "/_wm/style.css").await, StatusCode::OK);
+        assert_eq!(
+            get_page(&app, "/api/v1/pages").await,
+            StatusCode::UNAUTHORIZED
+        );
+        send(&app, Method::GET, "/api/v1/pages", None).await;
+
+        let mut recorded = Vec::new();
+        while let Ok(hit) = hits.try_recv() {
+            recorded.push(hit);
+        }
+        let seen: Vec<_> = recorded
+            .iter()
+            .map(|hit| (hit.slug.as_str(), hit.status))
+            .collect();
+        assert_eq!(seen, [("", 200), ("hello", 200), ("missing", 404)]);
+        let hello = &recorded[1];
+        assert_eq!(hello.query.as_deref(), Some("utm_source=x"));
+        assert_eq!(hello.ip, Some("203.0.113.7".parse().unwrap()));
+        assert_eq!(hello.referrer, "https://search.example/");
+        assert!(hello.user_agent.contains("Googlebot"));
+    }
+
+    #[tokio::test]
+    async fn pages_load_while_clickhouse_is_down() {
+        #[derive(clap::Parser)]
+        struct Args {
+            #[command(flatten)]
+            analytics: crate::analytics::AnalyticsArgs,
+        }
+        let args = <Args as clap::Parser>::parse_from([
+            "wordmaker",
+            "--clickhouse-url",
+            "http://127.0.0.1:1",
+        ]);
+        let (analytics, sink) = args
+            .analytics
+            .start("http://localhost:3000")
+            .unwrap()
+            .unwrap();
+        let app = app_with(Some(analytics)).await;
+
+        let pages = async {
+            for _ in 0..50 {
+                assert_eq!(get_page(&app, "/").await, StatusCode::OK);
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), pages)
+            .await
+            .expect("page views do not wait for ClickHouse");
+        sink.abort();
+    }
+
+    #[tokio::test]
+    async fn analytics_report_needs_analytics() {
+        let (status, body) = send(&app().await, Method::GET, "/api/v1/analytics", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("WORDMAKER_CLICKHOUSE_URL"), "{body}");
+
+        let (analytics, _hits) = Analytics::channel(1);
+        let app = app_with(Some(analytics)).await;
+        let (status, _) = send(&app, Method::GET, "/api/v1/analytics?days=0", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = send(&app, Method::GET, "/api/v1/analytics?days=400", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let response = app
+            .oneshot(
+                Request::get("/api/v1/analytics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
