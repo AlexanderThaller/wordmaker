@@ -39,6 +39,9 @@ Every variable also has a command line flag, see `wordmaker --help`.
 
 `wordmaker-admin` is a web interface for a running server: write pages in a WYSIWYG AsciiDoc editor (https://www.npmjs.com/package/asciidoc-editor[asciidoc-editor]) with a live preview in the site's theme, publish them, browse their history and restore old revisions, upload media, and change the site settings and theme.
 
+Changes to a published page are saved as a draft: the site keeps showing the published version until you press _Publish changes_, and _Discard changes_ throws the draft away.
+Slug and navigation settings are not drafted and change at once.
+
 [source,sh]
 ----
 cargo build --release --workspace
@@ -86,7 +89,7 @@ When the server is not reached through `localhost`, set `WORDMAKER_BASE_URL` (or
 
 === Tools
 
-`list_pages`, `get_page`, `create_page`, `update_page`, `delete_page`, `publish_page`, `unpublish_page`,
+`list_pages`, `get_page`, `create_page`, `update_page`, `delete_page`, `publish_page`, `unpublish_page`, `save_draft`, `discard_draft`,
 `list_revisions`, `get_revision`, `restore_revision`, `preview_adoc`,
 `upload_media`, `list_media`, `delete_media`, `get_settings`, `set_settings`,
 `list_themes`, `install_theme`, `activate_theme`, `delete_theme`.
@@ -125,7 +128,9 @@ All endpoints live under `/api/v1` and require `Authorization: Bearer $WORDMAKER
 |`GET /pages/{slug}` |Page with AsciiDoc body
 |`PATCH /pages/{slug}` |Change `title`, `slug`, `body`, `in_nav` and/or `nav_order`
 |`DELETE /pages/{slug}` |Delete page and its history
-|`POST /pages/{slug}/publish`, `/unpublish` |Change visibility
+|`POST /pages/{slug}/publish`, `/unpublish` |Change visibility; publishing makes a pending draft live
+|`PUT /pages/{slug}/draft` |Keep changes to `title` and/or `body` without publishing them
+|`DELETE /pages/{slug}/draft` |Throw the pending draft away
 |`GET /pages/{slug}/revisions` |Revision list, newest first
 |`GET /pages/{slug}/revisions/{n}` |One revision
 |`POST /pages/{slug}/revisions/{n}/restore` |Make a revision current again
@@ -152,6 +157,8 @@ curl -H "Authorization: Bearer $WORDMAKER_TOKEN" -H 'content-type: application/j
 * The page title is rendered as the heading, so start the body with `==` sections rather than a `= Title` line.
 * Reference uploaded images by their path: `image::/media/1a2b3c4d-logo.png[Logo]`.
 * Link to other pages with `link:/about[About]`.
+* Changing a published page with `PATCH` changes the site at once.
+To prepare changes first, save them as a draft (`PUT /pages/{slug}/draft`): the site keeps showing the published version until the page is published again, which makes the draft live as a new revision.
 * Only published pages are visible on the site. `/` shows the page chosen as `home_slug`, or a list of all published pages.
 * Published pages appear in the header navigation, ordered by `nav_order` then title; set `in_nav` to false to leave one out.
 

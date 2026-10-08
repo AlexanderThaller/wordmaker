@@ -238,11 +238,18 @@ function renderPageList() {
           h(
             "span",
             { class: "page-title" },
-            h("span", { class: `dot ${page.status}`, title: page.status }),
+            h("span", {
+              class: `dot ${page.status}${page.has_draft ? " pending" : ""}`,
+              title: statusLabel(page.status === "published", page.has_draft),
+            }),
             page.title,
             page.slug === home ? h("span", { class: "home" }, "· home") : null,
           ),
-          h("span", { class: "page-sub" }, `/${page.slug} · ${ago(page.updated_at)}`),
+          h(
+            "span",
+            { class: "page-sub" },
+            `/${page.slug} · ${page.has_draft ? "changes pending" : ago(page.updated_at)}`,
+          ),
         ),
       ),
     ),
@@ -297,7 +304,7 @@ async function openPage(slug) {
   renderPageList();
   if (!$("#history").hidden) loadRevisions();
   await ensureEditor();
-  state.editor.setValue(page.body);
+  state.editor.setValue(savedContent(page).body);
   updateDirty();
   refreshPreview(0);
 }
@@ -340,22 +347,63 @@ function toggleSidebar() {
 
 $("#toggle-sidebar").addEventListener("click", toggleSidebar);
 
+// ---- Drafts ---------------------------------------------------------------
+//
+// A published page is not changed by saving: its title and body go into a
+// draft, and the site keeps the published version until "Publish changes".
+// Slug and navigation are not drafted; they change at once.
+
+const hasDraft = (page) => page.draft_body != null;
+
+/** Whether saving keeps title and body as a draft rather than changing the page. */
+function savesDraft(page) {
+  // Servers from before drafts send no draft fields; they change the page.
+  if (!("draft_body" in page)) return false;
+  return page.status === "published" || hasDraft(page);
+}
+
+/** Title and body as last saved: the draft's, when there is one. */
+const savedContent = (page) => ({
+  title: page.draft_title ?? page.title,
+  body: page.draft_body ?? page.body,
+});
+
+function statusLabel(published, pending) {
+  if (!published) return "Not published";
+  return pending ? "Published · changes not yet published" : "Published";
+}
+
 /** Shows `page` as the saved state; `body` also puts it in the editor. */
 function show(page, { body = false } = {}) {
   state.current = page;
-  fields.title.value = page.title;
+  const content = savedContent(page);
+  fields.title.value = content.title;
   fields.slug.value = page.slug;
   fields.inNav.checked = page.in_nav;
   fields.navOrder.value = page.nav_order;
+
+  const published = page.status === "published";
+  const pending = hasDraft(page);
+  const drafts = savesDraft(page);
   const status = $("#page-status");
-  status.textContent = page.status === "published" ? "Published" : "Draft";
-  status.className = `badge ${page.status}`;
-  $("#publish").textContent = page.status === "published" ? "Unpublish" : "Publish";
+  status.textContent = statusLabel(published, pending);
+  status.className = `badge ${pending ? "pending" : page.status}`;
+  $("#save").textContent = drafts ? "Save draft" : "Save";
+  $("#save").title = drafts
+    ? "Keep the changes without publishing them (Ctrl+S)"
+    : "Save (Ctrl+S)";
+  // Before drafts, the one button published and unpublished.
+  const legacy = published && !("draft_body" in page);
+  $("#publish").textContent = !published ? "Publish" : legacy ? "Unpublish" : "Publish changes";
+  $("#unpublish").hidden = !published || legacy;
+  $("#discard-draft").hidden = !pending;
+
   const view = $("#page-view");
   view.href = page.url;
-  // Drafts are not on the site; the preview is where they can be seen.
-  view.hidden = page.status !== "published";
-  if (body && state.editor) state.editor.setValue(page.body);
+  // Unpublished pages are not on the site; the preview is where they show.
+  view.textContent = pending ? "View published ↗" : "View ↗";
+  view.hidden = !published;
+  if (body && state.editor) state.editor.setValue(content.body);
   updateDirty();
 }
 
@@ -374,7 +422,8 @@ function draft() {
 /** The fields that differ from what was last saved. */
 function changes() {
   if (!state.current) return {};
-  return Object.fromEntries(Object.entries(draft()).filter(([key, value]) => value !== state.current[key]));
+  const saved = { ...state.current, ...savedContent(state.current) };
+  return Object.fromEntries(Object.entries(draft()).filter(([key, value]) => value !== saved[key]));
 }
 
 const isDirty = () => Object.keys(changes()).length > 0;
@@ -387,10 +436,17 @@ function updateDirty() {
   } else if (isDirty()) {
     label.textContent = "Unsaved changes";
     label.className = "save-state dirty";
+  } else if (state.current && hasDraft(state.current)) {
+    label.textContent = `Draft saved ${ago(state.current.draft_updated_at)}`;
+    label.className = "save-state";
   } else {
     label.textContent = state.current ? `Saved ${ago(state.current.updated_at)}` : "";
     label.className = "save-state";
   }
+  // Nothing to publish on a published page without changes.
+  const current = state.current;
+  $("#publish").disabled =
+    !!current && savesDraft(current) && current.status === "published" && !hasDraft(current) && !isDirty();
 }
 
 for (const input of Object.values(fields)) {
@@ -411,31 +467,91 @@ async function save() {
   state.saving = true;
   updateDirty();
   const before = state.current.slug;
-  const page = await attempt(() => api("PATCH", pagePath(before), update));
-  state.saving = false;
-  if (!page) {
-    updateDirty();
-    return false;
+  const drafting = savesDraft(state.current);
+  const content = Object.fromEntries(
+    Object.entries(update).filter(([key]) => drafting && (key === "title" || key === "body")),
+  );
+  const direct = Object.fromEntries(Object.entries(update).filter(([key]) => !(key in content)));
+
+  let page = state.current;
+  let ok = true;
+  if (Object.keys(direct).length) {
+    page = (await attempt(() => api("PATCH", pagePath(before), direct))) ?? page;
+    ok = page !== state.current;
   }
-  // The editor keeps what is in it: anything typed while saving stays a change.
-  show(page);
+  if (ok && Object.keys(content).length) {
+    const drafted = await attempt(() => api("PUT", `${pagePath(page.slug)}/draft`, content));
+    ok = !!drafted;
+    page = drafted ?? page;
+  }
+  state.saving = false;
+  // The editor and title keep what is in them: anything typed while saving,
+  // or not saved, stays a change.
+  const typed = fields.title.value;
+  if (page !== state.current) show(page);
+  fields.title.value = typed;
+  updateDirty();
   if (page.slug !== before) history.replaceState(null, "", `#/pages/${page.slug}`);
+  if (!ok) return false;
   if (!$("#history").hidden) loadRevisions();
   loadPages();
-  toast("Saved");
+  toast(
+    Object.keys(content).length && page.status === "published"
+      ? "Draft saved. The site still shows the published version."
+      : "Saved",
+  );
   return true;
 }
 
 $("#save").addEventListener("click", save);
 
+/** Publishes (a published page: its draft) or, before drafts, unpublishes. */
 $("#publish").addEventListener("click", async () => {
+  const current = state.current;
+  if (current.status === "published" && !("draft_body" in current)) return unpublish();
   if (!(await save())) return;
-  const action = state.current.status === "published" ? "unpublish" : "publish";
-  const page = await attempt(() => api("POST", `${pagePath(state.current.slug)}/${action}`));
+  const wasPublished = state.current.status === "published";
+  const page = await attempt(() => api("POST", `${pagePath(state.current.slug)}/publish`));
   if (!page) return;
   show(page);
+  if (!$("#history").hidden) loadRevisions();
   loadPages();
-  toast(action === "publish" ? "Published" : "Unpublished: now a draft");
+  toast(wasPublished ? "Changes published" : "Published");
+});
+
+async function unpublish() {
+  const page = state.current;
+  const sure = await ask({
+    title: `Unpublish “${page.title}”?`,
+    message: "It disappears from the site until it is published again.",
+    confirm: "Unpublish",
+    danger: true,
+  });
+  if (!sure) return;
+  const updated = await attempt(() => api("POST", `${pagePath(page.slug)}/unpublish`));
+  if (!updated) return;
+  show(updated);
+  loadPages();
+  toast("Unpublished");
+}
+
+$("#unpublish").addEventListener("click", unpublish);
+
+$("#discard-draft").addEventListener("click", async () => {
+  const page = state.current;
+  const sure = await ask({
+    title: "Discard the draft?",
+    message: "The editor goes back to the published version; the draft's changes are lost.",
+    confirm: "Discard",
+    danger: true,
+  });
+  if (!sure) return;
+  const updated = await attempt(() => api("DELETE", `${pagePath(page.slug)}/draft`));
+  if (!updated) return;
+  show(updated, { body: true });
+  refreshPreview(0);
+  loadPages();
+  toast("Draft discarded");
 });
 
 $("#delete-page").addEventListener("click", async () => {
@@ -687,6 +803,7 @@ function closeRevision() {
 
 $("#close-revision").addEventListener("click", closeRevision);
 
+/** Puts the revision in the editor, to be saved (and published) like any edit. */
 $("#restore-revision").addEventListener("click", async () => {
   const revision = state.revision;
   if (isDirty()) {
@@ -698,14 +815,15 @@ $("#restore-revision").addEventListener("click", async () => {
     });
     if (!discard) return;
   }
-  const page = await attempt(() =>
-    api("POST", `${pagePath(state.current.slug)}/revisions/${revision.revision}/restore`),
-  );
-  if (!page) return;
-  show(page, { body: true });
+  fields.title.value = revision.title;
+  state.editor.setValue(revision.body);
   closeRevision();
-  loadPages();
-  toast(`Restored revision ${revision.revision}`);
+  updateDirty();
+  toast(
+    savesDraft(state.current)
+      ? `Revision ${revision.revision} is in the editor. Save the draft, then publish the changes.`
+      : `Revision ${revision.revision} is in the editor. Save to keep it.`,
+  );
 });
 
 // ---- Media ----------------------------------------------------------------
@@ -831,7 +949,7 @@ async function loadSettings() {
     $("#home-slug").replaceChildren(
       h("option", { value: "" }, "List of published pages"),
       ...state.pages.map((page) =>
-        h("option", { value: page.slug }, `${page.title}${page.status === "draft" ? " (draft)" : ""}`),
+        h("option", { value: page.slug }, `${page.title}${page.status === "draft" ? " (not published)" : ""}`),
       ),
     );
     form.home_slug.value = settings.home_slug ?? "";

@@ -304,6 +304,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drafts_stay_off_the_site_until_published() {
+        let app = app().await;
+        send(
+            &app,
+            Method::POST,
+            "/api/v1/pages",
+            Some(json!({ "title": "News", "body": "Old news.", "publish": true })),
+        )
+        .await;
+        let (status, body) = send(
+            &app,
+            Method::PUT,
+            "/api/v1/pages/news/draft",
+            Some(json!({ "body": "Fresh news." })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let page: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(page["draft_body"], "Fresh news.");
+
+        let (_, html) = send(&app, Method::GET, "/news", None).await;
+        assert!(html.contains("Old news."), "{html}");
+        let (_, list) = send(&app, Method::GET, "/api/v1/pages", None).await;
+        assert!(list.contains("\"has_draft\":true"), "{list}");
+
+        send(&app, Method::POST, "/api/v1/pages/news/publish", None).await;
+        let (_, html) = send(&app, Method::GET, "/news", None).await;
+        assert!(html.contains("Fresh news."), "{html}");
+
+        send(
+            &app,
+            Method::PUT,
+            "/api/v1/pages/news/draft",
+            Some(json!({ "body": "Scrapped." })),
+        )
+        .await;
+        let (status, body) = send(&app, Method::DELETE, "/api/v1/pages/news/draft", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let page: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(page["draft_body"], Value::Null);
+    }
+
+    #[tokio::test]
     async fn preview_renders_unsaved_pages_in_the_site_frame() {
         let app = app().await;
         send(

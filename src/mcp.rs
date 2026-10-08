@@ -29,6 +29,7 @@ use crate::{
         media,
         pages::{
             self,
+            DraftUpdate,
             NewPage,
             PageUpdate,
             Status,
@@ -52,6 +53,10 @@ WordMaker is a small CMS. Each page has a title, a URL slug and a body written i
 
 - Pages are created as drafts and only appear on the public site once published (pass `publish: \
      true` to create_page, or call publish_page).
+- update_page changes a page right away, live if it is published. To prepare changes to a \
+     published page without showing them yet, use save_draft; publish_page then makes the draft \
+     live, and discard_draft drops it. get_page shows a pending draft as `draft_title` and \
+     `draft_body`.
 - Write the body in AsciiDoc. The title is rendered as the page heading, so do not start the body \
      with a `= Title` line; use `==` for top-level sections.
 - Use preview_adoc to check how AsciiDoc renders before saving.
@@ -118,6 +123,19 @@ pub struct UpdatePageArgs {
     /// Position in the navigation; lower comes first.
     #[serde(default)]
     pub nav_order: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SaveDraftArgs {
+    /// Slug of the page.
+    pub slug: String,
+    /// New title; omitted, the draft's (or the page's) title stays.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// New `AsciiDoc` body, replacing the whole body; omitted, the draft's (or
+    /// the page's) body stays.
+    #[serde(default)]
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -261,7 +279,44 @@ impl WordMakerMcp {
         )
     }
 
-    #[tool(description = "Publish a page so it appears on the public site.")]
+    #[tool(
+        description = "Save changes to a page's title and/or body as a draft, without changing \
+                       what the public site shows. publish_page makes the draft live."
+    )]
+    async fn save_draft(
+        &self,
+        Parameters(args): Parameters<SaveDraftArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        respond(
+            pages::save_draft(
+                &self.pool,
+                &args.slug,
+                DraftUpdate {
+                    title: args.title,
+                    body: args.body,
+                },
+            )
+            .await
+            .map(|p| p.into_view(&self.config)),
+        )
+    }
+
+    #[tool(description = "Throw away a page's unpublished draft.")]
+    async fn discard_draft(
+        &self,
+        Parameters(args): Parameters<SlugArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        respond(
+            pages::discard_draft(&self.pool, &args.slug)
+                .await
+                .map(|p| p.into_view(&self.config)),
+        )
+    }
+
+    #[tool(
+        description = "Publish a page so it appears on the public site. A pending draft becomes \
+                       the live version."
+    )]
     async fn publish_page(
         &self,
         Parameters(args): Parameters<SlugArgs>,

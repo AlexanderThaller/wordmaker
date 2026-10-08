@@ -190,6 +190,11 @@ textarea {
 }
 
 .badge.draft {
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.badge.pending {
   background: var(--warn-soft);
   color: var(--warn);
 }
@@ -339,6 +344,12 @@ main {
 
 .page-list .dot.published {
   background: var(--ok);
+}
+
+/* Published, with changes waiting to be. */
+.page-list .dot.pending {
+  background: var(--ok);
+  box-shadow: 0 0 0 2px var(--warn);
 }
 
 .page-list .page-sub {
