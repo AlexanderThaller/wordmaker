@@ -573,9 +573,19 @@
           "showAttribution": true
         },
         "basemap": {
-          "type": "default",
-          "name": "Basemap",
-          "config": {}
+          "type": "geojson",
+          "name": "Countries",
+          "config": {
+            "src": "public/maps/countries.geojson",
+            "rules": [],
+            "style": {
+              "color": {
+                "fixed": "#8e8e8e"
+              },
+              "opacity": 0.15,
+              "lineWidth": 1
+            }
+          }
         },
         "layers": [
           {
