@@ -286,7 +286,7 @@ mod tests {
             html.contains("<h1 class=\"wp-block-post-title\">Hello World</h1>"),
             "{html}"
         );
-        assert!(html.contains("href=\"/_wm/style.css?v="), "{html}");
+        assert!(html.contains("<style>"), "stylesheet inlined: {html}");
 
         let (_, index) = send(&app, Method::GET, "/", None).await;
         assert!(index.contains("href=\"/hello-world\""), "{index}");
@@ -439,7 +439,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{html}");
         assert!(html.contains("<strong>saved</strong>"), "{html}");
         assert!(html.contains("About &lt;us&gt;</h1>"), "{html}");
-        assert!(html.contains("href=\"/_wm/style.css?v="), "{html}");
+        assert!(html.contains("<style>"), "stylesheet inlined: {html}");
         assert!(html.contains("current-menu-item"), "{html}");
 
         // Nothing was stored.
@@ -511,6 +511,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn theme_fonts_are_cached_for_good() {
+        let app = app().await;
+        let (status, body) = send_bytes(&app, "/api/v1/themes/upload", theme_zip()).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        send(
+            &app,
+            Method::PUT,
+            "/api/v1/themes/active",
+            Some(json!({ "theme": "mytheme" })),
+        )
+        .await;
+        let (_, css) = send(&app, Method::GET, "/_wm/style.css", None).await;
+
+        // Linked with the install's stamp, which changes on reinstall.
+        let font_url = css
+            .split("url('")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .unwrap();
+        assert!(
+            font_url.starts_with("/_wm/theme/mytheme@") && font_url.ends_with("/body.woff2"),
+            "{font_url}"
+        );
+        let response = app
+            .clone()
+            .oneshot(Request::get(font_url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()[header::CACHE_CONTROL]
+                .to_str()
+                .unwrap()
+                .contains("immutable")
+        );
+        let font = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(font, "font-bytes");
+    }
+
+    async fn send_bytes(app: &Router, uri: &str, body: Vec<u8>) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(uri)
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/zip")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
     async fn install_and_activate_theme() {
         let app = app().await;
         let response = app
@@ -558,17 +615,16 @@ mod tests {
         let (status, css) = send(&app, Method::GET, "/_wm/style.css", None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
-            css.contains("--wp--preset--color--base: #000000;"),
+            css.contains("--wp--preset--color--base:#000000"),
             "variation applied"
         );
-        assert!(css.contains("url('/_wm/theme/mytheme/assets/fonts/body.woff2')"));
         assert!(css.contains(":root :where(.is-style-section-1)"));
         assert!(
-            css.contains("text-underline-offset: .1em"),
+            css.contains("text-underline-offset:.1em"),
             "style.css included"
         );
         assert!(
-            css.contains("color-scheme: dark"),
+            css.contains("color-scheme:dark"),
             "dark background detected"
         );
 
