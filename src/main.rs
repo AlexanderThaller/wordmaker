@@ -11,13 +11,13 @@ mod oauth;
 mod render;
 mod site;
 mod theme;
+mod token;
 
 use std::{
     net::SocketAddr,
     sync::Arc,
 };
 
-use anyhow::Context;
 use clap::{
     Parser,
     Subcommand,
@@ -61,9 +61,8 @@ struct ServeArgs {
     #[arg(long, env = "WORDMAKER_BIND", default_value = "127.0.0.1:3000")]
     bind: Option<SocketAddr>,
 
-    /// Bearer token required by `/api` and `/mcp`.
-    #[arg(long, env = "WORDMAKER_TOKEN", hide_env_values = true)]
-    token: Option<String>,
+    #[command(flatten)]
+    token: token::TokenArgs,
 
     /// Extra `Host` values accepted by `/mcp`, besides loopback and the base
     /// URL's host.
@@ -112,8 +111,7 @@ async fn main() -> anyhow::Result<()> {
 async fn serve(config: Config, args: ServeArgs) -> anyhow::Result<()> {
     let token = args
         .token
-        .filter(|t| !t.trim().is_empty())
-        .context("WORDMAKER_TOKEN must be set; generate one with `wordmaker token`")?;
+        .require("; generate one with `wordmaker token`")?;
     let bind = args
         .bind
         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 3000)));
