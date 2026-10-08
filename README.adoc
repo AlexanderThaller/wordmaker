@@ -65,6 +65,7 @@ The stdio server needs no token, and does not need `wordmaker serve` to be runni
 === Remote (HTTP)
 
 `wordmaker serve` also speaks MCP (streamable HTTP) at `/mcp`, protected by the same bearer token as the API.
+Clients that cannot set the `Authorization` header, such as Claude's custom connectors, can send the token as `X-WordMaker-Token: $WORDMAKER_TOKEN` instead (no `Bearer` prefix).
 When the server is not reached through `localhost`, set `WORDMAKER_BASE_URL` (or `WORDMAKER_ALLOWED_HOSTS`) to the public host name, otherwise MCP requests are rejected to prevent DNS rebinding.
 
 === Tools
@@ -97,7 +98,7 @@ The result goes to stdout; a failed tool call prints the error to stderr and exi
 
 == REST API
 
-All endpoints live under `/api/v1` and require `Authorization: Bearer $WORDMAKER_TOKEN`.
+All endpoints live under `/api/v1` and require `Authorization: Bearer $WORDMAKER_TOKEN` (or `X-WordMaker-Token: $WORDMAKER_TOKEN`).
 
 [cols="1,2"]
 |===

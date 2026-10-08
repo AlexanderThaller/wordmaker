@@ -71,16 +71,25 @@ pub fn router(state: AppState, mcp_allowed_hosts: Vec<String>) -> Router {
         .with_state(state)
 }
 
+/// Alternative to `Authorization: Bearer`, for MCP clients that cannot set
+/// the `Authorization` header themselves.
+pub const TOKEN_HEADER: &str = "x-wordmaker-token";
+
 async fn require_token(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    let presented = request
-        .headers()
+    let headers = request.headers();
+    let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
+        .or_else(|| {
+            headers
+                .get(TOKEN_HEADER)
+                .and_then(|value| value.to_str().ok())
+        })
         .unwrap_or_default();
     if presented.as_bytes().ct_eq(state.token.as_bytes()).into() {
         Ok(next.run(request).await)
@@ -176,6 +185,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn token_header_is_accepted() {
+        let app = app().await;
+        for (token, expected) in [
+            ("secret", StatusCode::OK),
+            ("wrong", StatusCode::UNAUTHORIZED),
+            ("Bearer secret", StatusCode::UNAUTHORIZED),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get("/api/v1/pages")
+                        .header(TOKEN_HEADER, token)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{token}");
+        }
     }
 
     #[tokio::test]
