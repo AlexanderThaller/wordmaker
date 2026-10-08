@@ -1273,6 +1273,7 @@ function renderDashboard() {
     }),
   );
   $("#dashboard-notes").replaceChildren(...notes());
+  drawMap();
 }
 
 function stat(label, value, detail) {
@@ -1344,6 +1345,105 @@ function notes() {
     credit.push("No GeoIP database is loaded, so countries are unknown.");
   }
   return [h("span", {}, items), " ", h("span", {}, credit)];
+}
+
+// ---- The world map --------------------------------------------------------
+//
+// Countries shaded by page views in one hue, light to dark, on a log scale:
+// one country usually dwarfs the rest. The shapes (vendor/world.js) are only
+// fetched once the dashboard has numbers to show.
+
+const SHADES = 5;
+const regionName = new Intl.DisplayNames(undefined, { type: "region" });
+let world;
+
+/** The country's name in the reader's language, or its code if unknown. */
+function countryName(code) {
+  try {
+    return regionName.of(code) ?? code;
+  } catch {
+    return code;
+  }
+}
+
+async function drawMap() {
+  const rows = report.country_codes;
+  $("#map-panel").hidden = !rows.length;
+  if (!rows.length) return;
+  world ??= await import("/vendor/world.js");
+
+  const box = $("#world-map");
+  let map = box.querySelector("svg");
+  if (!map) {
+    map = svg("svg", {
+      viewBox: `0 0 ${world.width} ${world.height}`,
+      role: "img",
+      "aria-label": "Page views by country; the table below has the numbers",
+    });
+    for (const [code, d] of Object.entries(world.countries)) {
+      map.append(svg("path", { class: "country", d, "data-code": code }));
+    }
+    box.prepend(map);
+  }
+
+  const byCode = new Map(rows.map((row) => [row.name, row]));
+  const most = Math.max(...rows.map((row) => row.views));
+  const shade = (views) =>
+    Math.max(1, Math.ceil((SHADES * Math.log1p(views)) / Math.log1p(most)));
+  for (const path of map.querySelectorAll(".country")) {
+    const row = byCode.get(path.dataset.code);
+    path.setAttribute("class", row ? `country s${shade(row.views)}` : "country");
+    const label = `${countryName(path.dataset.code)}: ${exact.format(row?.views ?? 0)} page views`;
+    path.setAttribute("aria-label", label);
+    if (row) path.setAttribute("tabindex", "0");
+    else path.removeAttribute("tabindex");
+    path.onpointerenter = path.onfocus = (event) => showMapTip(path, row, event);
+    path.onpointermove = (event) => showMapTip(path, row, event);
+    path.onpointerleave = path.onblur = () => ($("#map-tooltip").hidden = true);
+  }
+
+  // Lower bound of each shade, back from the log scale.
+  const bound = (step) => Math.max(1, Math.ceil(Math.expm1(((step - 1) / SHADES) * Math.log1p(most))));
+  $("#map-legend").replaceChildren(
+    h("span", {}, exact.format(1)),
+    ...Array.from({ length: SHADES }, (_, i) =>
+      h("span", { class: `swatch s${i + 1}`, title: `from ${exact.format(bound(i + 1))}` }),
+    ),
+    h("span", {}, exact.format(most)),
+  );
+  $("#country-table").replaceChildren(
+    h("thead", {}, h("tr", {}, h("th", {}, "Country"), h("th", {}, "Page views"), h("th", {}, "Visitors"))),
+    h(
+      "tbody",
+      {},
+      rows.map((row) =>
+        h(
+          "tr",
+          {},
+          h("td", {}, countryName(row.name)),
+          h("td", {}, exact.format(row.views)),
+          h("td", {}, exact.format(row.visitors)),
+        ),
+      ),
+    ),
+  );
+}
+
+function showMapTip(path, row, event) {
+  const tip = $("#map-tooltip");
+  tip.replaceChildren(
+    h("strong", {}, countryName(path.dataset.code)),
+    h("span", {}, row ? `${exact.format(row.views)} page views` : "No page views"),
+    row ? h("span", {}, `${exact.format(row.visitors)} visitors`) : null,
+  );
+  tip.hidden = false;
+  const box = $("#world-map").getBoundingClientRect();
+  // At the pointer, or above the country's middle when reached by keyboard.
+  const shape = path.getBoundingClientRect();
+  const x = (event.clientX || shape.left + shape.width / 2) - box.left;
+  const y = (event.clientY || shape.top + shape.height / 2) - box.top;
+  tip.style.left = `${Math.min(Math.max(x - tip.offsetWidth / 2, 0), box.width - tip.offsetWidth)}px`;
+  tip.style.top = `${Math.max(0, y - tip.offsetHeight - 12)}px`;
 }
 
 // ---- The daily chart ------------------------------------------------------

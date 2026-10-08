@@ -557,15 +557,33 @@ mod tests {
                 .chain(bots),
         )
         .await;
+        // GeoIP needs a database; a located view goes straight in instead.
+        db.query(
+            "INSERT INTO page_views (timestamp, site, path, status, country_code) \
+             VALUES (now64(3), 'https://site.example', '/hello', 200, 'DE')",
+        )
+        .execute()
+        .await
+        .unwrap();
 
         let report = super::super::report::report(&db, "https://site.example", 7)
             .await
             .unwrap();
-        assert_eq!(report.views, 2, "the one from 2025 is out of range");
+        assert_eq!(report.views, 3, "the one from 2025 is out of range");
         assert_eq!(report.bot_views, 7);
-        assert_eq!(report.visitor_days, 1);
+        assert_eq!(report.visitor_days, 2);
         assert_eq!(report.daily.len(), 7);
-        assert_eq!(report.daily.last().unwrap().views, 2);
+        assert_eq!(report.daily.last().unwrap().views, 3);
+        let codes: Vec<_> = report
+            .country_codes
+            .iter()
+            .map(|country| (country.name.as_str(), country.views))
+            .collect();
+        assert_eq!(
+            codes,
+            [("DE", 1)],
+            "views without a country stay off the map"
+        );
         assert_eq!(report.pages[0].name, "/hello");
         assert_eq!(report.referrers[0].name, "search.example");
         assert_eq!(report.countries[0].name, "Unknown");

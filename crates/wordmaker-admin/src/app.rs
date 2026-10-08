@@ -80,6 +80,11 @@ const ASSETS: &[Asset] = &[
         content_type: "application/wasm",
         body: include_bytes!("../vendor/asciidoc-editor/asciidoc_editor_bg.wasm"),
     },
+    Asset {
+        path: "/vendor/world.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: include_bytes!("../vendor/world/world.js"),
+    },
 ];
 
 pub fn router(admin: Admin) -> Router {
