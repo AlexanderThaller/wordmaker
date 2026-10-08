@@ -92,6 +92,26 @@ GROUP BY site, path, country ORDER BY views DESC LIMIT 20;
 
 `cargo test` also writes page views to a real ClickHouse it starts in Docker (with https://crates.io/crates/testcontainers[testcontainers]); without Docker that test is skipped.
 
+=== Grafana
+
+`grafana/wordmaker.json` is a Grafana dashboard for all instances writing to one database: the totals, page views over time per site, a table of the sites, a map and the same top lists as the admin dashboard.
+The _Site_ selector shows all instances or the ones you pick; clicking a site in the _Sites_ table shows only that one.
+
+It needs Grafana 11 or newer with the https://grafana.com/grafana/plugins/grafana-clickhouse-datasource/[ClickHouse data source] plugin.
+Add a ClickHouse data source for the server (HTTP, port 8123), then import the file under _Dashboards → New → Import_ and pick the data source.
+If the database is not called `wordmaker`, change the _Database_ field at the top.
+To provision it instead, point a dashboard provider at the `grafana` directory:
+
+[source,yaml]
+----
+apiVersion: 1
+providers:
+  - name: wordmaker
+    type: file
+    options:
+      path: /path/to/wordmaker/grafana
+----
+
 == Admin interface
 
 `wordmaker-admin` is a web interface for a running server: write pages in a WYSIWYG AsciiDoc editor (https://www.npmjs.com/package/asciidoc-editor[asciidoc-editor]) with a live preview in the site's theme, publish them, browse their history and restore old revisions, upload media, change the site settings and theme, and see the page-view dashboard when analytics is on; it can refresh itself every 10 seconds to 15 minutes while it is in view.
