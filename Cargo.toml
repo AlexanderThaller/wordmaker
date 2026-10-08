@@ -9,7 +9,9 @@ members = [".", "crates/wordmaker-admin"]
 [workspace.lints.rust]
 missing_debug_implementations = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
-unsafe_code = "forbid"
+# `deny`, not `forbid`: memory-mapping the GeoIP databases needs one
+# documented exception (src/analytics/geo.rs).
+unsafe_code = "deny"
 unused_lifetimes = "warn"
 
 [workspace.lints.clippy]
@@ -47,7 +49,7 @@ clickhouse = { version = "0.15.2", default-features = false, features = ["chrono
 flate2 = "1.1.10"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 lol_html = "3.0.1"
-maxminddb = "0.32.0"
+maxminddb = { version = "0.32.0", features = ["mmap"] }
 mime_guess = "2.0.5"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2"] }
 rmcp = { version = "3.5.1", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "client", "transport-streamable-http-client-reqwest"] }
