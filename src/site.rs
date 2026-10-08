@@ -1,4 +1,7 @@
-use std::fmt::Write;
+use std::{
+    fmt::Write,
+    sync::Arc,
+};
 
 use axum::{
     Router,
@@ -46,6 +49,7 @@ use crate::{
     },
     error::AppError,
     render,
+    theme::Stylesheet,
 };
 
 /// Theme files that may be served; everything else in a theme stays private.
@@ -78,7 +82,7 @@ const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 struct Frame {
     settings: Settings,
     nav: Vec<PageSummary>,
-    stylesheet_version: String,
+    stylesheet: Arc<Stylesheet>,
     footer_html: Option<String>,
 }
 
@@ -96,7 +100,7 @@ async fn frame(state: &AppState) -> Result<Frame, AppError> {
     Ok(Frame {
         settings,
         nav,
-        stylesheet_version: sheet.version.clone(),
+        stylesheet: sheet,
         footer_html,
     })
 }
@@ -141,7 +145,7 @@ async fn render_page(
         Ok(_) | Err(AppError::NotFound(_)) => return Err(SiteError::NotFound),
         Err(err) => return Err(err.into()),
     };
-    let html = content_html(state, page.body).await?;
+    let html = content_html(state, frame, page.body).await?;
     let site_title = &frame.settings.site_title;
     let title = if is_home {
         site_title.clone()
@@ -161,7 +165,7 @@ pub async fn preview(
     body: String,
 ) -> Result<Html<String>, AppError> {
     let frame = frame(state).await?;
-    let html = content_html(state, body).await?;
+    let html = content_html(state, &frame, body).await?;
     let site_title = &frame.settings.site_title;
     Ok(layout(
         &frame,
@@ -174,11 +178,12 @@ pub async fn preview(
 
 /// A page body as the site serves it: rendered, with images pointed at
 /// their scaled copies.
-async fn content_html(state: &AppState, body: String) -> Result<String, AppError> {
+async fn content_html(state: &AppState, frame: &Frame, body: String) -> Result<String, AppError> {
     let rendered = render::render_async(body).await?;
     let images = state.images.clone();
     let media_dir = state.config.media_dir.clone();
-    tokio::task::spawn_blocking(move || images.rewrite(&rendered.html, &media_dir))
+    let layout = frame.stylesheet.layout;
+    tokio::task::spawn_blocking(move || images.rewrite(&rendered.html, &media_dir, layout))
         .await
         .map_err(|err| AppError::Internal(format!("image rewrite failed: {err}")))
 }
@@ -208,11 +213,13 @@ fn layout(
             escape(tagline)
         );
     }
+    // Inline rather than linked: a stylesheet request blocks the first
+    // paint, and this one is small once compressed. It changes with the
+    // page, so a theme switch shows at once.
     let _ = write!(
         html,
-        "<link rel=\"stylesheet\" href=\"/_wm/style.css?v={}\">\n</head>\n<body>\n<div \
-         class=\"wp-site-blocks\">\n",
-        frame.stylesheet_version
+        "<style>{}</style>\n</head>\n<body>\n<div class=\"wp-site-blocks\">\n",
+        frame.stylesheet.css.replace("</style", "<\\/style")
     );
 
     write_header(&mut html, frame, current);
@@ -370,24 +377,38 @@ const CLOSE_ICON: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 
                           5.53 4.47 4.47 5.53 10.94 12l-6.47 6.47 1.06 1.06L12 13.06l6.47 6.47 \
                           1.06-1.06L13.06 12Z\"></path></svg>";
 
-async fn stylesheet(State(state): State<AppState>) -> Result<Response, SiteError> {
+/// The stylesheet on its own, for whatever wants it besides the pages,
+/// which carry it inline. Revalidated each time; the `ETag` makes that cheap.
+async fn stylesheet(
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Response, SiteError> {
     let settings = settings::get(&state.pool).await?;
     let sheet = state
         .themes
         .stylesheet(&state.config.themes_dir, &settings)
         .await;
+    let etag = format!("\"{}\"", sheet.version);
+    let cache = [
+        (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+        (
+            header::ETAG,
+            HeaderValue::from_str(&etag).map_err(|err| AppError::Internal(err.to_string()))?,
+        ),
+    ];
+    let unchanged = request
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .is_some_and(|value| value.as_bytes() == etag.as_bytes());
+    if unchanged {
+        return Ok((StatusCode::NOT_MODIFIED, cache).into_response());
+    }
     Ok((
-        [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/css; charset=utf-8"),
-            ),
-            // The URL carries the version, so it can be cached for a long time.
-            (
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=31536000"),
-            ),
-        ],
+        cache,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/css; charset=utf-8"),
+        )],
         sheet.css.clone(),
     )
         .into_response())
@@ -405,15 +426,25 @@ async fn theme_asset(
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| THEME_ASSET_EXTENSIONS.contains(&ext.to_lowercase().as_str()));
-    if crate::theme::validate_slug(&theme).is_err() || !safe_path || !allowed {
+    // `{slug}@{stamp}`, as the stylesheet links them, names one install of
+    // the theme, which never changes; a bare slug is whatever is there now.
+    let (theme, stamped) = match theme.split_once('@') {
+        Some((slug, _)) => (slug, true),
+        None => (theme.as_str(), false),
+    };
+    if crate::theme::validate_slug(theme).is_err() || !safe_path || !allowed {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let file = state.config.themes_dir.join(&theme).join(&path);
+    let file = state.config.themes_dir.join(theme).join(&path);
     match ServeFile::new(file).oneshot(request).await {
         Ok(mut response) => {
             response.headers_mut().insert(
                 header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=86400"),
+                HeaderValue::from_static(if stamped {
+                    IMMUTABLE
+                } else {
+                    "public, max-age=86400"
+                }),
             );
             response.into_response()
         }

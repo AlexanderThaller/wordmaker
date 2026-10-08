@@ -875,6 +875,56 @@ body .is-layout-grid { display: grid; }
 .has-text-align-right { text-align: right; }
 ";
 
+/// Drops comments and the whitespace CSS does not need. Only whitespace
+/// next to `{`, `}`, `;` and `,`, or after `:`, goes: elsewhere it can
+/// matter (`.a :where(…)` is not `.a:where(…)`, `and (` is not `and(`).
+/// Strings are kept as they are.
+pub fn minify(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut chars = css.chars().peekable();
+    let mut space = false;
+    while let Some(c) = chars.next() {
+        if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut previous = '\0';
+            for c in chars.by_ref() {
+                if previous == '*' && c == '/' {
+                    break;
+                }
+                previous = c;
+            }
+            space = true;
+            continue;
+        }
+        if c.is_whitespace() {
+            space = true;
+            continue;
+        }
+        let tight_before = matches!(out.chars().last(), None | Some('{' | '}' | ';' | ',' | ':'));
+        if space && !tight_before && !matches!(c, '{' | '}' | ';' | ',') {
+            out.push(' ');
+        }
+        space = false;
+        if c == '}' && out.ends_with(';') {
+            out.pop();
+        }
+        out.push(c);
+        if c == '"' || c == '\'' {
+            while let Some(inner) = chars.next() {
+                out.push(inner);
+                if inner == '\\' {
+                    if let Some(escaped) = chars.next() {
+                        out.push(escaped);
+                    }
+                } else if inner == c {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1026,5 +1076,17 @@ mod tests {
         let mut base = json!({ "a": { "b": 1, "c": [1, 2] }, "d": 1 });
         merge(&mut base, &json!({ "a": { "c": [3] }, "e": 2 }));
         assert_eq!(base, json!({ "a": { "b": 1, "c": [3] }, "d": 1, "e": 2 }));
+    }
+
+    #[test]
+    fn minify_keeps_meaning() {
+        let css = "/* header */\n.a :where(.b) , .c > .d {\n  color : red ;\n  content: \"x  ;  \
+                   }\\\"/* not a comment */\";\n}\n@media (min-width: 600px) and (max-width: \
+                   900px) {\n  .e { margin: calc(1px + 2px) 0 }\n}\n";
+        assert_eq!(
+            minify(css),
+            ".a :where(.b),.c > .d{color :red;content:\"x  ;  }\\\"/* not a comment */\"}@media \
+             (min-width:600px) and (max-width:900px){.e{margin:calc(1px + 2px) 0}}"
+        );
     }
 }

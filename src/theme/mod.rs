@@ -21,7 +21,10 @@ use std::{
         Mutex,
         PoisonError,
     },
-    time::SystemTime,
+    time::{
+        SystemTime,
+        UNIX_EPOCH,
+    },
 };
 
 use schemars::JsonSchema;
@@ -38,6 +41,7 @@ use crate::{
         AppError,
         AppResult,
     },
+    images::Layout,
 };
 
 const DEFAULT_THEME: &str = include_str!("default.json");
@@ -410,6 +414,8 @@ pub struct Stylesheet {
     pub css: String,
     /// Changes whenever `css` does; used to bust caches.
     pub version: String,
+    /// How wide the theme lays content out.
+    pub layout: Layout,
 }
 
 #[derive(Clone, PartialEq)]
@@ -458,24 +464,32 @@ impl ThemeCache {
 
         let dir = themes_dir.to_owned();
         let build_key = key.clone();
-        let css = blocking(move || build(&dir, build_key.theme.as_deref(), &build_key.variations))
-            .await
-            .unwrap_or_else(|err| {
-                tracing::error!(error = %err, "failed to compile theme, using the built-in one");
-                build(Path::new(""), None, &[]).expect("built-in theme compiles")
-            });
+        let (css, layout) = blocking(move || {
+            build(&dir, build_key.theme.as_deref(), &build_key.variations)
+        })
+        .await
+        .unwrap_or_else(|err| {
+            tracing::error!(error = %err, "failed to compile theme, using the built-in one");
+            build(Path::new(""), None, &[]).expect("built-in theme compiles")
+        });
+        let css = css::minify(&css);
         let mut hasher = DefaultHasher::new();
         css.hash(&mut hasher);
         let sheet = Arc::new(Stylesheet {
             css,
             version: format!("{:016x}", hasher.finish()),
+            layout,
         });
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some((key, sheet.clone()));
         sheet
     }
 }
 
-fn build(themes_dir: &Path, theme: Option<&str>, variations: &[String]) -> AppResult<String> {
+fn build(
+    themes_dir: &Path,
+    theme: Option<&str>,
+    variations: &[String],
+) -> AppResult<(String, Layout)> {
     let Some(slug) = theme else {
         let json: Value =
             serde_json::from_str(DEFAULT_THEME).expect("built-in theme is valid JSON");
@@ -485,7 +499,7 @@ fn build(themes_dir: &Path, theme: Option<&str>, variations: &[String]) -> AppRe
             asset_base: "",
             style_css: None,
         });
-        return Ok(site_css::assemble(&json, &compiled, true));
+        return Ok((site_css::assemble(&json, &compiled, true), layout(&json)));
     };
 
     let dir = themes_dir.join(slug);
@@ -510,10 +524,53 @@ fn build(themes_dir: &Path, theme: Option<&str>, variations: &[String]) -> AppRe
     let compiled = css::compile(&css::Input {
         theme: &json,
         block_styles: &block_styles,
-        asset_base: &format!("/_wm/theme/{slug}"),
+        asset_base: &asset_base(&dir, slug),
         style_css: style_css.as_deref(),
     });
-    Ok(site_css::assemble(&json, &compiled, false))
+    Ok((site_css::assemble(&json, &compiled, false), layout(&json)))
+}
+
+/// Where the stylesheet finds the theme's fonts and images:
+/// `/_wm/theme/{slug}@{stamp}`. The stamp changes when the theme is
+/// installed again, so the files can be cached for good.
+fn asset_base(dir: &Path, slug: &str) -> String {
+    let stamp = std::fs::metadata(dir.join("theme.json"))
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_secs());
+    format!("/_wm/theme/{slug}@{stamp:x}")
+}
+
+/// The content and wide sizes from `settings.layout`, where they are given
+/// in `px` or `rem`.
+fn layout(theme: &Value) -> Layout {
+    let size = |key: &str| {
+        let value = theme
+            .pointer(&format!("/settings/layout/{key}"))?
+            .as_str()?
+            .trim();
+        let pixels = if let Some(px) = value.strip_suffix("px") {
+            px.trim().parse::<f64>().ok()?
+        } else {
+            value.strip_suffix("rem")?.trim().parse::<f64>().ok()? * 16.0
+        };
+        if !(1.0..10_000.0).contains(&pixels) {
+            return None;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "checked to lie between 1 and 10000 just above"
+        )]
+        let pixels = pixels.round() as u32;
+        Some(pixels)
+    };
+    let fallback = Layout::default();
+    Layout {
+        content: size("contentSize").unwrap_or(fallback.content),
+        wide: size("wideSize").unwrap_or(fallback.wide),
+    }
 }
 
 fn variation_path(theme_dir: &Path, id: &str) -> AppResult<PathBuf> {
