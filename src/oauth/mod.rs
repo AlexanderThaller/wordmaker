@@ -895,6 +895,7 @@ mod tests {
             themes: Arc::default(),
             images: Arc::default(),
             oauth_clients: Arc::default(),
+            analytics: None,
         };
         crate::app::router(state, vec!["site.example".into()])
     }

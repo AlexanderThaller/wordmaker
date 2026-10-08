@@ -1,3 +1,4 @@
+mod analytics;
 mod media;
 mod pages;
 mod themes;
@@ -34,6 +35,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(pages::router())
         .merge(media::router(state))
         .merge(themes::router())
+        .merge(analytics::router())
         .route("/render", post(render_preview))
         .route("/preview", post(page_preview))
         .route("/settings", get(get_settings).put(put_settings))
