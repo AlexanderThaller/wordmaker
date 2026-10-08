@@ -141,14 +141,7 @@ async fn render_page(
         Ok(_) | Err(AppError::NotFound(_)) => return Err(SiteError::NotFound),
         Err(err) => return Err(err.into()),
     };
-    let rendered = render::render_async(page.body).await?;
-    let html = {
-        let images = state.images.clone();
-        let media_dir = state.config.media_dir.clone();
-        tokio::task::spawn_blocking(move || images.rewrite(&rendered.html, &media_dir))
-            .await
-            .map_err(|err| AppError::Internal(format!("image rewrite failed: {err}")))?
-    };
+    let html = content_html(state, page.body).await?;
     let site_title = &frame.settings.site_title;
     let title = if is_home {
         site_title.clone()
@@ -168,15 +161,26 @@ pub async fn preview(
     body: String,
 ) -> Result<Html<String>, AppError> {
     let frame = frame(state).await?;
-    let rendered = render::render_async(body).await?;
+    let html = content_html(state, body).await?;
     let site_title = &frame.settings.site_title;
     Ok(layout(
         &frame,
         &format!("{title} – {site_title}"),
         Some(title),
         slug,
-        &rendered.html,
+        &html,
     ))
+}
+
+/// A page body as the site serves it: rendered, with images pointed at
+/// their scaled copies.
+async fn content_html(state: &AppState, body: String) -> Result<String, AppError> {
+    let rendered = render::render_async(body).await?;
+    let images = state.images.clone();
+    let media_dir = state.config.media_dir.clone();
+    tokio::task::spawn_blocking(move || images.rewrite(&rendered.html, &media_dir))
+        .await
+        .map_err(|err| AppError::Internal(format!("image rewrite failed: {err}")))
 }
 
 /// The page, laid out like Twenty Twenty-Five's `page` template so a
