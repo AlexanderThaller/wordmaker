@@ -221,6 +221,170 @@ fn style_header(css: &str, name: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Files
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ThemeDetails {
+    #[serde(flatten)]
+    pub info: ThemeInfo,
+    /// Every file in the theme folder, sorted by path.
+    pub files: Vec<ThemeFileEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ThemeFileEntry {
+    /// Path inside the theme folder, e.g. `style.css` or
+    /// `styles/01-night.json`.
+    pub path: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ThemeFile {
+    pub path: String,
+    pub content: String,
+}
+
+/// A theme's info and the files it is made of.
+pub async fn details(themes_dir: &Path, slug: &str) -> AppResult<ThemeDetails> {
+    validate_slug(slug)?;
+    let dir = themes_dir.to_owned();
+    let slug = slug.to_owned();
+    blocking(move || {
+        let info = read_info(&dir, &slug)?;
+        let root = dir.join(&slug);
+        let mut files = Vec::new();
+        collect_files(&root, &root, &mut files)?;
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(ThemeDetails { info, files })
+    })
+    .await
+}
+
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<ThemeFileEntry>) -> AppResult<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            collect_files(root, &path, out)?;
+        } else if kind.is_file() {
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            out.push(ThemeFileEntry {
+                path: relative
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                size: entry.metadata()?.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// One text file of a theme, such as `theme.json` or `style.css`.
+pub async fn read_file(themes_dir: &Path, slug: &str, path: &str) -> AppResult<ThemeFile> {
+    validate_slug(slug)?;
+    let dir = existing_theme_dir(themes_dir, slug)?;
+    let file = theme_file_path(&dir, path)?;
+    let path = path.to_owned();
+    blocking(move || {
+        let bytes = match std::fs::read(&file) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AppError::NotFound(format!("theme file '{path}'")));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let content = String::from_utf8(bytes)
+            .map_err(|_| AppError::BadRequest(format!("'{path}' is not a text file")))?;
+        Ok(ThemeFile { path, content })
+    })
+    .await
+}
+
+/// Create or replace a text file in an installed theme. JSON files must
+/// parse, and `theme.json` must stay an object. The site picks the change up
+/// right away.
+pub async fn write_file(
+    themes_dir: &Path,
+    slug: &str,
+    path: &str,
+    content: String,
+) -> AppResult<ThemeFileEntry> {
+    validate_slug(slug)?;
+    let dir = existing_theme_dir(themes_dir, slug)?;
+    let file = theme_file_path(&dir, path)?;
+    let extension = file
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_lowercase);
+    if extension.as_deref() == Some("php") {
+        return Err(AppError::BadRequest(
+            "PHP files are not used by WordMaker".into(),
+        ));
+    }
+    if extension.as_deref() == Some("json") {
+        let json: Value = serde_json::from_str(&content)
+            .map_err(|err| AppError::BadRequest(format!("{path} is not valid JSON: {err}")))?;
+        if path == "theme.json" && !json.is_object() {
+            return Err(AppError::BadRequest("theme.json must be an object".into()));
+        }
+    }
+    let path = path.to_owned();
+    blocking(move || {
+        if file.is_dir() {
+            return Err(AppError::BadRequest(format!("'{path}' is a folder")));
+        }
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let staging = dir.join(format!(".write-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&staging, content.as_bytes())?;
+        if let Err(err) = std::fs::rename(&staging, &file) {
+            let _ = std::fs::remove_file(&staging);
+            return Err(err.into());
+        }
+        // The stylesheet cache and the asset stamp follow theme.json's
+        // modification time, so touch it whichever file changed.
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("theme.json"))?
+            .set_modified(SystemTime::now())?;
+        Ok(ThemeFileEntry {
+            path,
+            size: content.len() as u64,
+        })
+    })
+    .await
+}
+
+fn existing_theme_dir(themes_dir: &Path, slug: &str) -> AppResult<PathBuf> {
+    let dir = themes_dir.join(slug);
+    if !dir.join("theme.json").is_file() {
+        return Err(AppError::NotFound(format!("theme '{slug}'")));
+    }
+    Ok(dir)
+}
+
+fn theme_file_path(theme_dir: &Path, path: &str) -> AppResult<PathBuf> {
+    let relative = Path::new(path);
+    let safe = !path.is_empty()
+        && relative.components().all(|c| match c {
+            Component::Normal(part) => !part.to_string_lossy().starts_with('.'),
+            _ => false,
+        });
+    if !safe {
+        return Err(AppError::BadRequest(format!(
+            "invalid theme file path '{path}'"
+        )));
+    }
+    Ok(theme_dir.join(relative))
+}
+
+// ---------------------------------------------------------------------------
 // Installing
 // ---------------------------------------------------------------------------
 

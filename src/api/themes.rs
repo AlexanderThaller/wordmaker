@@ -10,7 +10,6 @@ use axum::{
     },
     http::StatusCode,
     routing::{
-        delete,
         get,
         post,
         put,
@@ -27,6 +26,9 @@ use crate::{
     },
     theme::{
         self,
+        ThemeDetails,
+        ThemeFile,
+        ThemeFileEntry,
         ThemeInfo,
     },
 };
@@ -40,7 +42,11 @@ pub fn router() -> Router<AppState> {
         )
         .route("/themes/install", post(install))
         .route("/themes/active", put(activate))
-        .route("/themes/{slug}", delete(remove))
+        .route("/themes/{slug}", get(details).delete(remove))
+        .route(
+            "/themes/{slug}/files/{*path}",
+            get(read_file).put(write_file),
+        )
 }
 
 async fn list(State(state): State<AppState>) -> AppResult<Json<Vec<ThemeInfo>>> {
@@ -124,4 +130,35 @@ async fn activate(
 async fn remove(State(state): State<AppState>, Path(slug): Path<String>) -> AppResult<StatusCode> {
     theme::delete(&state.pool, &state.config.themes_dir, &slug).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn details(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> AppResult<Json<ThemeDetails>> {
+    Ok(Json(theme::details(&state.config.themes_dir, &slug).await?))
+}
+
+async fn read_file(
+    State(state): State<AppState>,
+    Path((slug, path)): Path<(String, String)>,
+) -> AppResult<Json<ThemeFile>> {
+    Ok(Json(
+        theme::read_file(&state.config.themes_dir, &slug, &path).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct WriteFileRequest {
+    content: String,
+}
+
+async fn write_file(
+    State(state): State<AppState>,
+    Path((slug, path)): Path<(String, String)>,
+    Json(request): Json<WriteFileRequest>,
+) -> AppResult<Json<ThemeFileEntry>> {
+    Ok(Json(
+        theme::write_file(&state.config.themes_dir, &slug, &path, request.content).await?,
+    ))
 }

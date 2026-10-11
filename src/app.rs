@@ -824,4 +824,91 @@ mod tests {
         let (status, _) = send(&app, Method::DELETE, "/api/v1/themes/mytheme", None).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
     }
+
+    #[tokio::test]
+    async fn edit_theme_files() {
+        let app = app().await;
+        send_bytes(&app, "/api/v1/themes/upload", theme_zip()).await;
+        send(
+            &app,
+            Method::PUT,
+            "/api/v1/themes/active",
+            Some(json!({ "theme": "mytheme" })),
+        )
+        .await;
+
+        let (status, body) = send(&app, Method::GET, "/api/v1/themes/mytheme", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let details: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(details["name"], "My Theme");
+        let paths: Vec<&str> = details["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "assets/fonts/body.woff2",
+                "style.css",
+                "styles/01-night.json",
+                "styles/sections/section-1.json",
+                "theme.json"
+            ]
+        );
+
+        let (status, body) = send(
+            &app,
+            Method::GET,
+            "/api/v1/themes/mytheme/files/style.css",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let file: Value = serde_json::from_str(&body).unwrap();
+        let style = file["content"].as_str().unwrap();
+        assert!(style.contains("Theme Name: My Theme"), "{style}");
+
+        // The live stylesheet follows a change to style.css alone.
+        let (_, css) = send(&app, Method::GET, "/_wm/style.css", None).await;
+        assert!(!css.contains("letter-spacing:.2em"));
+        let (status, body) = send(
+            &app,
+            Method::PUT,
+            "/api/v1/themes/mytheme/files/style.css",
+            Some(json!({ "content": format!("{style}h1 {{ letter-spacing: .2em; }}\n") })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, css) = send(&app, Method::GET, "/_wm/style.css", None).await;
+        assert!(css.contains("letter-spacing:.2em"), "{css}");
+
+        for (path, content) in [
+            ("theme.json", "[]"),
+            ("styles/broken.json", "{"),
+            ("functions.php", "<?php"),
+            (".hidden", "x"),
+            ("styles", "x"),
+        ] {
+            let (status, body) = send(
+                &app,
+                Method::PUT,
+                &format!("/api/v1/themes/mytheme/files/{path}"),
+                Some(json!({ "content": content })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        }
+        let (status, _) = send(
+            &app,
+            Method::GET,
+            "/api/v1/themes/mytheme/files/missing.css",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send(&app, Method::GET, "/api/v1/themes/nope", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
 }

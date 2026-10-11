@@ -203,7 +203,7 @@ When the server is not reached through `localhost`, set `WORDMAKER_BASE_URL` (or
 `list_pages`, `get_page`, `create_page`, `update_page`, `delete_page`, `publish_page`, `unpublish_page`, `save_draft`, `discard_draft`,
 `list_revisions`, `get_revision`, `restore_revision`, `preview_adoc`,
 `upload_media`, `list_media`, `delete_media`, `get_settings`, `set_settings`,
-`list_themes`, `install_theme`, `activate_theme`, `delete_theme`.
+`list_themes`, `get_theme`, `read_theme_file`, `write_theme_file`, `install_theme`, `activate_theme`, `delete_theme`.
 
 === Command line client
 
@@ -253,6 +253,8 @@ All endpoints live under `/api/v1` and require `Authorization: Bearer $WORDMAKER
 |`POST /themes/install` |Install from `{"wordpress_org": "twentytwentyfive", "version"?}` or `{"url"}`
 |`POST /themes/upload?slug=` |Install from a zip sent as the request body
 |`PUT /themes/active` |Activate `{"theme", "variations": [...]}`; `{"theme": null}` for the built-in look
+|`GET /themes/{slug}` |One theme with the list of its files
+|`GET /themes/{slug}/files/{path}`, `PUT /themes/{slug}/files/{path}` |Read or replace a text file of a theme, as `{"content"}`; the site uses a change right away
 |`DELETE /themes/{slug}` |Remove a theme that is not active
 |`GET /analytics?days=30` |Page-view report for the last 1–366 days: totals, views per day, top pages, referrers, countries, browsers, systems, devices, 404s, bots by name and views per country code; 404 when analytics is off
 |===

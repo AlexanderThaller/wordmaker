@@ -72,7 +72,10 @@ Themes: the site can use WordPress block themes (themes with a theme.json, such 
      twentytwentyfive). install_theme fetches one from wordpress.org or a URL; list_themes shows \
      installed themes and their style variations; activate_theme switches theme and variations (a \
      full `style` variation, or combine one `colors` and one `typography` variation). Only the \
-     theme's design (colors, fonts, spacing, element and block styles) is used, not its templates.
+     theme's design (colors, fonts, spacing, element and block styles) is used, not its \
+     templates. To change an installed theme, get_theme lists its files, read_theme_file shows \
+     one and write_theme_file replaces it (usually `style.css` for plain CSS, or `theme.json`); \
+     the site uses the change right away.
 
 Theme styling in AsciiDoc, via roles:
 - Palette colors: `[.has-accent-3-color]#text#`, or `[.has-accent-5-background-color]` on a block.
@@ -169,6 +172,25 @@ pub struct ActivateThemeArgs {
 pub struct ThemeArgs {
     /// Installed theme slug.
     pub slug: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ThemeFileArgs {
+    /// Installed theme slug.
+    pub slug: String,
+    /// Path inside the theme folder, as listed by `get_theme`, e.g.
+    /// `style.css`.
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WriteThemeFileArgs {
+    /// Installed theme slug.
+    pub slug: String,
+    /// Path inside the theme folder, e.g. `style.css` or `theme.json`.
+    pub path: String,
+    /// New content of the file, replacing it entirely.
+    pub content: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -475,6 +497,41 @@ impl WordMakerMcp {
                 &self.config.themes_dir,
                 args.theme.as_deref(),
                 args.variations,
+            )
+            .await,
+        )
+    }
+
+    #[tool(description = "Get an installed theme's info and the list of files it is made of.")]
+    async fn get_theme(
+        &self,
+        Parameters(args): Parameters<ThemeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        respond(theme::details(&self.config.themes_dir, &args.slug).await)
+    }
+
+    #[tool(description = "Get the content of one text file of an installed theme.")]
+    async fn read_theme_file(
+        &self,
+        Parameters(args): Parameters<ThemeFileArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        respond(theme::read_file(&self.config.themes_dir, &args.slug, &args.path).await)
+    }
+
+    #[tool(
+        description = "Create or replace a text file of an installed theme. JSON files must be \
+                       valid. If the theme is active, the site uses the change right away."
+    )]
+    async fn write_theme_file(
+        &self,
+        Parameters(args): Parameters<WriteThemeFileArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        respond(
+            theme::write_file(
+                &self.config.themes_dir,
+                &args.slug,
+                &args.path,
+                args.content,
             )
             .await,
         )
