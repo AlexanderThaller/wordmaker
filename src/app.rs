@@ -487,6 +487,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sitemap_lists_published_pages() {
+        let app = app().await;
+        for (title, publish) in [("Welcome", true), ("About", true), ("Secret", false)] {
+            send(
+                &app,
+                Method::POST,
+                "/api/v1/pages",
+                Some(json!({ "title": title, "body": "Text.", "publish": publish })),
+            )
+            .await;
+        }
+        send(
+            &app,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(json!({ "home_slug": "welcome" })),
+        )
+        .await;
+
+        let (status, xml) = send(&app, Method::GET, "/sitemap.xml", None).await;
+        assert_eq!(status, StatusCode::OK, "{xml}");
+        assert!(xml.contains("<loc>http://localhost:3000/</loc>"), "{xml}");
+        assert!(
+            xml.contains("<loc>http://localhost:3000/about</loc>"),
+            "{xml}"
+        );
+        assert!(!xml.contains("/welcome<"), "home is listed as /: {xml}");
+        assert!(!xml.contains("/secret<"), "drafts stay out: {xml}");
+
+        let (status, robots) = send(&app, Method::GET, "/robots.txt", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            robots.contains("Sitemap: http://localhost:3000/sitemap.xml"),
+            "{robots}"
+        );
+
+        // The home page names `/` as canonical under either URL.
+        let home = "<link rel=\"canonical\" href=\"http://localhost:3000/\">";
+        for uri in ["/", "/welcome"] {
+            let (_, html) = send(&app, Method::GET, uri, None).await;
+            assert!(html.contains(home), "{uri}: {html}");
+        }
+        let (_, html) = send(&app, Method::GET, "/about", None).await;
+        assert!(
+            html.contains("<link rel=\"canonical\" href=\"http://localhost:3000/about\">"),
+            "{html}"
+        );
+    }
+
+    #[tokio::test]
     async fn drafts_stay_off_the_site_until_published() {
         let app = app().await;
         send(

@@ -72,6 +72,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .route("/", get(home))
         .route("/{slug}", get(show))
+        .route("/sitemap.xml", get(sitemap))
+        .route("/robots.txt", get(robots))
         .route("/_wm/style.css", get(stylesheet))
         .route("/_wm/theme/{theme}/{*path}", get(theme_asset))
         .route("/_wm/img/{width}/{filename}", get(scaled_image))
@@ -195,7 +197,8 @@ async fn home(State(state): State<AppState>) -> Result<Response, SiteError> {
     }
     body.push_str("</ul>\n");
     let title = frame.settings.site_title.clone();
-    Ok(layout(&frame, &title, None, None, &body).into_response())
+    let canonical = state.config.page_url("");
+    Ok(layout(&frame, &title, None, None, Some(&canonical), &body).into_response())
 }
 
 async fn show(
@@ -224,7 +227,82 @@ async fn render_page(
     } else {
         format!("{} – {site_title}", page.title)
     };
-    Ok(layout(frame, &title, Some(&page.title), Some(&page.slug), &html).into_response())
+    // The home page is also reachable under its slug; both name `/`.
+    let canonical = state.config.page_url(
+        if is_home || frame.settings.home_slug.as_deref() == Some(slug) {
+            ""
+        } else {
+            slug
+        },
+    );
+    Ok(layout(
+        frame,
+        &title,
+        Some(&page.title),
+        Some(&page.slug),
+        Some(&canonical),
+        &html,
+    )
+    .into_response())
+}
+
+/// Every published page, for search engines. The home page is listed as
+/// `/`; the page it shows is not listed again under its own slug.
+async fn sitemap(State(state): State<AppState>) -> Result<Response, SiteError> {
+    let settings = settings::get(&state.pool).await?;
+    let published = pages::list(&state.pool, Some(Status::Published)).await?;
+    let home_slug = settings.home_slug.as_deref();
+    let home_updated = match home_slug {
+        Some(slug) => published
+            .iter()
+            .find(|page| page.slug == slug)
+            .map(|page| page.updated_at),
+        None => published.iter().map(|page| page.updated_at).max(),
+    };
+
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset \
+         xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
+    );
+    let mut push = |url: &str, updated: Option<chrono::DateTime<chrono::Utc>>| {
+        let _ = write!(xml, "<url><loc>{}</loc>", escape(url));
+        if let Some(updated) = updated {
+            let _ = write!(xml, "<lastmod>{}</lastmod>", updated.format("%Y-%m-%d"));
+        }
+        xml.push_str("</url>\n");
+    };
+    push(&state.config.page_url(""), home_updated);
+    for page in published
+        .iter()
+        .filter(|page| Some(page.slug.as_str()) != home_slug)
+    {
+        push(&state.config.page_url(&page.slug), Some(page.updated_at));
+    }
+    xml.push_str("</urlset>\n");
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/xml; charset=utf-8"),
+        )],
+        xml,
+    )
+        .into_response())
+}
+
+/// Lets crawlers in everywhere but the authenticated endpoints, and points
+/// them at the sitemap.
+async fn robots(State(state): State<AppState>) -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        )],
+        format!(
+            "User-agent: *\nDisallow: /api/\nDisallow: /mcp\nDisallow: /oauth/\n\nSitemap: {}\n",
+            state.config.page_url("sitemap.xml")
+        ),
+    )
+        .into_response()
 }
 
 /// A page that need not exist or be published yet, in the site's frame and
@@ -244,6 +322,7 @@ pub async fn preview(
         &format!("{title} – {site_title}"),
         Some(title),
         slug,
+        None,
         &html,
     ))
 }
@@ -267,6 +346,7 @@ fn layout(
     title: &str,
     heading: Option<&str>,
     current: Option<&str>,
+    canonical: Option<&str>,
     content: &str,
 ) -> Html<String> {
     let language = &frame.settings.site_language;
@@ -278,6 +358,13 @@ fn layout(
         escape(language),
         escape(title)
     );
+    if let Some(canonical) = canonical {
+        let _ = writeln!(
+            html,
+            "<link rel=\"canonical\" href=\"{}\">",
+            escape(canonical)
+        );
+    }
     if let Some(tagline) = &frame.settings.site_tagline {
         let _ = writeln!(
             html,
