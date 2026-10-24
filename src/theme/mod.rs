@@ -695,8 +695,15 @@ fn build(
     let dir = themes_dir.join(slug);
     let mut json = read_json(&dir.join("theme.json"))?;
     for id in variations {
-        let path = variation_path(&dir, id)?;
-        let variation = read_json(&path)?;
+        // A variation that has gone away, say with a reinstall, is left
+        // out rather than costing the site the whole theme.
+        let variation = match variation_path(&dir, id).and_then(|path| read_json(&path)) {
+            Ok(variation) => variation,
+            Err(err) => {
+                tracing::warn!(theme = slug, variation = %id, error = %err, "skipping style variation");
+                continue;
+            }
+        };
         for key in ["settings", "styles"] {
             if let Some(part) = variation.get(key) {
                 let target = json
@@ -884,5 +891,40 @@ mod tests {
             sheets.push(build.await.unwrap());
         }
         assert!(sheets.iter().all(|s| Arc::ptr_eq(s, &sheets[0])));
+    }
+
+    fn temp_themes() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "wordmaker-theme-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    fn write_theme(themes_dir: &Path, slug: &str, theme_json: &str) {
+        let dir = themes_dir.join(slug);
+        std::fs::create_dir_all(dir.join("styles")).unwrap();
+        std::fs::write(dir.join("theme.json"), theme_json).unwrap();
+    }
+
+    #[test]
+    fn missing_variation_is_skipped() {
+        let themes = temp_themes();
+        write_theme(
+            &themes,
+            "t",
+            r##"{"settings":{"color":{"palette":[{"slug":"accent","color":"#123456"}]}}}"##,
+        );
+        std::fs::write(
+            themes.join("t/styles/night.json"),
+            r##"{"styles":{"color":{"text":"#abcdef"}}}"##,
+        )
+        .unwrap();
+        let (css, _) = build(&themes, Some("t"), &["gone".into(), "night".into()]).unwrap();
+        assert!(
+            css.contains("--wp--preset--color--accent: #123456"),
+            "{css}"
+        );
+        assert!(css.contains("color: #abcdef"), "{css}");
+        std::fs::remove_dir_all(&themes).unwrap();
     }
 }
