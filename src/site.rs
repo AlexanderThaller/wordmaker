@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt::Write,
     net::SocketAddr,
     sync::Arc,
@@ -32,6 +33,10 @@ use axum::{
     },
     routing::get,
 };
+use sha2::{
+    Digest,
+    Sha256,
+};
 use tower::{
     Layer,
     ServiceExt,
@@ -50,6 +55,7 @@ use crate::{
     domain::{
         pages::{
             self,
+            Page,
             PageSummary,
             Status,
         },
@@ -204,18 +210,27 @@ struct Frame {
     settings: Settings,
     nav: Vec<PageSummary>,
     stylesheet: Arc<Stylesheet>,
-    footer_html: Option<String>,
+    footer_html: Option<Arc<str>>,
 }
 
-async fn frame(state: &AppState) -> Result<Frame, AppError> {
-    let settings = settings::get(&state.pool).await?;
+async fn frame(state: &AppState, settings: Settings) -> Result<Frame, AppError> {
     let nav = pages::navigation(&state.pool).await?;
     let sheet = state
         .themes
         .stylesheet(&state.config.themes_dir, &settings)
         .await;
     let footer_html = match &settings.footer_text {
-        Some(text) => Some(render::render_async(text.clone()).await?.html),
+        Some(text) => {
+            let key = render_key(&[b"footer", text.as_bytes()]);
+            Some(
+                state
+                    .renders
+                    .get_or_render(key, async {
+                        Ok(render::render_async(text.clone()).await?.html)
+                    })
+                    .await?,
+            )
+        }
         None => None,
     };
     Ok(Frame {
@@ -226,14 +241,25 @@ async fn frame(state: &AppState) -> Result<Frame, AppError> {
     })
 }
 
+/// The page at `slug`, if it is published.
+async fn published_page(state: &AppState, slug: &str) -> Result<Option<Page>, AppError> {
+    match pages::get(&state.pool, slug).await {
+        Ok(page) if page.status == Status::Published => Ok(Some(page)),
+        Ok(_) | Err(AppError::NotFound(_)) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 async fn home(State(state): State<AppState>) -> Result<Response, SiteError> {
-    let frame = frame(&state).await?;
-    if let Some(home) = frame.settings.home_slug.clone() {
-        match render_page(&state, &frame, &home, true).await {
-            // Not published (yet): `/` lists the pages that are.
-            Err(SiteError::NotFound) => {}
-            shown => return shown,
-        }
+    let settings = settings::get(&state.pool).await?;
+    // Not published (yet): `/` lists the pages that are.
+    let home = match &settings.home_slug {
+        Some(slug) => published_page(&state, slug).await?,
+        None => None,
+    };
+    let frame = frame(&state, settings).await?;
+    if let Some(home) = home {
+        return render_page(&state, &frame, home, true).await;
     }
 
     let published = pages::list(&state.pool, Some(Status::Published)).await?;
@@ -256,22 +282,31 @@ async fn show(
     State(state): State<AppState>,
     Path(slug): Path<String>,
 ) -> Result<Response, SiteError> {
-    let frame = frame(&state).await?;
-    render_page(&state, &frame, &slug, false).await
+    // Looked up first, so that a miss costs one query and no frame.
+    let page = published_page(&state, &slug)
+        .await?
+        .ok_or(SiteError::NotFound)?;
+    let frame = frame(&state, settings::get(&state.pool).await?).await?;
+    render_page(&state, &frame, page, false).await
 }
 
 async fn render_page(
     state: &AppState,
     frame: &Frame,
-    slug: &str,
+    page: Page,
     is_home: bool,
 ) -> Result<Response, SiteError> {
-    let page = match pages::get(&state.pool, slug).await {
-        Ok(page) if page.status == Status::Published => page,
-        Ok(_) | Err(AppError::NotFound(_)) => return Err(SiteError::NotFound),
-        Err(err) => return Err(err.into()),
-    };
-    let html = content_html(state, frame, page.body).await?;
+    let layout_widths = frame.stylesheet.layout;
+    let key = render_key(&[
+        b"page",
+        &layout_widths.content.to_le_bytes(),
+        &layout_widths.wide.to_le_bytes(),
+        page.body.as_bytes(),
+    ]);
+    let html = state
+        .renders
+        .get_or_render(key, content_html(state, frame, page.body))
+        .await?;
     let site_title = &frame.settings.site_title;
     let title = if is_home {
         site_title.clone()
@@ -280,10 +315,10 @@ async fn render_page(
     };
     // The home page is also reachable under its slug; both name `/`.
     let canonical = state.config.page_url(
-        if is_home || frame.settings.home_slug.as_deref() == Some(slug) {
+        if is_home || frame.settings.home_slug.as_deref() == Some(page.slug.as_str()) {
             ""
         } else {
-            slug
+            &page.slug
         },
     );
     Ok(layout(
@@ -295,6 +330,98 @@ async fn render_page(
         &html,
     )
     .into_response())
+}
+
+/// Most rendered bodies and footers kept, and their total size: enough for
+/// every page of a sizeable site, while edits leave old versions behind.
+const RENDER_CACHE_ENTRIES: usize = 512;
+const RENDER_CACHE_BYTES: usize = 64 << 20;
+
+/// Rendered page bodies and footer texts, keyed by a hash of everything
+/// they are made from, so an edit, a new footer or a theme with other
+/// widths simply misses rather than needing to be invalidated. The least
+/// recently used entries make room for new ones.
+#[derive(Debug, Default)]
+pub struct RenderCache {
+    entries: std::sync::Mutex<RenderEntries>,
+}
+
+#[derive(Debug, Default)]
+struct RenderEntries {
+    map: HashMap<[u8; 32], (Arc<str>, u64)>,
+    bytes: usize,
+    clock: u64,
+}
+
+/// A cache key over `parts`, each length-prefixed so that no two different
+/// lists hash the same input.
+fn render_key(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
+impl RenderCache {
+    fn entries(&self) -> std::sync::MutexGuard<'_, RenderEntries> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The HTML stored under `key`, rendering it with `render` first when
+    /// there is none. Rendered without holding the lock; two requests that
+    /// miss together both render.
+    async fn get_or_render(
+        &self,
+        key: [u8; 32],
+        render: impl Future<Output = Result<String, AppError>>,
+    ) -> Result<Arc<str>, AppError> {
+        if let Some(html) = self.get(&key) {
+            return Ok(html);
+        }
+        let html: Arc<str> = render.await?.into();
+        self.insert(key, html.clone());
+        Ok(html)
+    }
+
+    fn get(&self, key: &[u8; 32]) -> Option<Arc<str>> {
+        let mut entries = self.entries();
+        entries.clock += 1;
+        let now = entries.clock;
+        let (html, used) = entries.map.get_mut(key)?;
+        *used = now;
+        Some(html.clone())
+    }
+
+    fn insert(&self, key: [u8; 32], html: Arc<str>) {
+        // One huge page should not push out the rest of the site.
+        if html.len() > RENDER_CACHE_BYTES / 8 {
+            return;
+        }
+        let mut entries = self.entries();
+        while !entries.map.is_empty()
+            && (entries.map.len() >= RENDER_CACHE_ENTRIES
+                || entries.bytes + html.len() > RENDER_CACHE_BYTES)
+        {
+            let oldest = entries
+                .map
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| *key);
+            if let Some((evicted, _)) = oldest.and_then(|key| entries.map.remove(&key)) {
+                entries.bytes -= evicted.len();
+            }
+        }
+        entries.clock += 1;
+        let now = entries.clock;
+        entries.bytes += html.len();
+        if let Some((replaced, _)) = entries.map.insert(key, (html, now)) {
+            entries.bytes -= replaced.len();
+        }
+    }
 }
 
 /// Every published page, for search engines. The home page is listed as
@@ -369,7 +496,8 @@ pub async fn preview(
     slug: Option<&str>,
     body: String,
 ) -> Result<Html<String>, AppError> {
-    let frame = frame(state).await?;
+    let frame = frame(state, settings::get(&state.pool).await?).await?;
+    // Not cached: previews change with every keystroke.
     let html = content_html(state, &frame, body).await?;
     let site_title = &frame.settings.site_title;
     Ok(layout(
@@ -734,5 +862,48 @@ impl IntoResponse for SiteError {
                     .into_response()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(n: usize) -> [u8; 32] {
+        render_key(&[&n.to_le_bytes()])
+    }
+
+    #[test]
+    fn render_cache_keeps_recent_entries_within_bounds() {
+        let cache = RenderCache::default();
+        cache.insert(key(0), "first".into());
+        for n in 1..RENDER_CACHE_ENTRIES * 2 {
+            // Kept in use, so it is never the oldest.
+            assert!(cache.get(&key(0)).is_some(), "{n}");
+            cache.insert(key(n), "page".into());
+        }
+        assert_eq!(cache.entries().map.len(), RENDER_CACHE_ENTRIES);
+        assert!(cache.get(&key(1)).is_none());
+        assert!(cache.get(&key(RENDER_CACHE_ENTRIES * 2 - 1)).is_some());
+
+        let big: Arc<str> = "x".repeat(RENDER_CACHE_BYTES / 8).into();
+        for n in 0..10 {
+            cache.insert(key(10_000 + n), big.clone());
+        }
+        let entries = cache.entries();
+        assert!(entries.bytes <= RENDER_CACHE_BYTES, "{}", entries.bytes);
+        assert_eq!(
+            entries.bytes,
+            entries
+                .map
+                .values()
+                .map(|(html, _)| html.len())
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn render_keys_separate_their_parts() {
+        assert_ne!(render_key(&[b"ab", b"c"]), render_key(&[b"a", b"bc"]));
     }
 }

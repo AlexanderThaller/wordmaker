@@ -140,6 +140,7 @@ async fn serve(config: Config, args: ServeArgs) -> anyhow::Result<()> {
         token: token.into(),
         themes: Arc::default(),
         images: Arc::default(),
+        renders: Arc::default(),
         oauth_clients: Arc::default(),
         analytics,
     };

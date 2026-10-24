@@ -52,6 +52,8 @@ pub struct AppState {
     pub token: Arc<str>,
     pub themes: Arc<ThemeCache>,
     pub images: Arc<Images>,
+    /// Rendered page bodies and footers.
+    pub renders: Arc<site::RenderCache>,
     pub oauth_clients: Arc<oauth::ClientCache>,
     /// Records page views; `None` when analytics is off.
     pub analytics: Option<Analytics>,
@@ -201,6 +203,7 @@ mod tests {
             token: "secret".into(),
             themes: Arc::default(),
             images: Arc::default(),
+            renders: Arc::default(),
             oauth_clients: Arc::default(),
             analytics,
         };
@@ -631,6 +634,53 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NOT_MODIFIED, "{path}");
             assert_eq!(sandboxed(response.headers()), extension != "pdf", "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn rendered_pages_follow_edits_and_settings() {
+        let app = app().await;
+        send(
+            &app,
+            Method::POST,
+            "/api/v1/pages",
+            Some(json!({ "title": "News", "body": "Old *news*.", "publish": true })),
+        )
+        .await;
+        let (_, html) = send(&app, Method::GET, "/news", None).await;
+        assert!(html.contains("Old <strong>news</strong>."), "{html}");
+
+        send(
+            &app,
+            Method::PATCH,
+            "/api/v1/pages/news",
+            Some(json!({ "title": "Latest", "body": "New *news*." })),
+        )
+        .await;
+        send(
+            &app,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(json!({ "footer_text": "Footer *one*." })),
+        )
+        .await;
+        let (_, html) = send(&app, Method::GET, "/news", None).await;
+        assert!(html.contains("New <strong>news</strong>."), "{html}");
+        assert!(html.contains("Latest</h1>"), "{html}");
+        assert!(html.contains("Footer <strong>one</strong>."), "{html}");
+
+        send(
+            &app,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(json!({ "footer_text": "Footer *two*." })),
+        )
+        .await;
+        let (_, html) = send(&app, Method::GET, "/news", None).await;
+        assert!(html.contains("Footer <strong>two</strong>."), "{html}");
+        // Unpublished pages are not served from the cache.
+        send(&app, Method::POST, "/api/v1/pages/news/unpublish", None).await;
+        let (status, _) = send(&app, Method::GET, "/news", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
