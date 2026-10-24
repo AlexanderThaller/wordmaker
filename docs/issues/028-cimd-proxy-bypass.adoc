@@ -1,13 +1,13 @@
 = 028: Client metadata fetches honour HTTPS_PROXY, bypassing DNS pinning
 :severity: Low
 :area: OAuth
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: OAuth
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -27,3 +27,9 @@ Only in deployments with a proxy environment variable set (uncertain).
 
 * Add `.no_proxy()` to the client builder. The same applies to the theme
   downloader once it gets address checks.
+
+== Resolution
+
+The client metadata fetcher's reqwest client is built with `.no_proxy()`,
+so it always connects to the pinned, checked address. No test: proxy
+environment variables are process-wide and would leak into parallel tests.

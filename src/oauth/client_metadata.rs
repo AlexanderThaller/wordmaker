@@ -119,7 +119,9 @@ async fn fetch(client_id: &str) -> Result<ClientInfo, String> {
         return Err(format!("{host} is not a public address"));
     }
 
+    // No proxy: a proxy would resolve the host itself, past the check.
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(FETCH_TIMEOUT)
         .resolve(&host, address)
