@@ -79,13 +79,15 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/_wm/img/{width}/{filename}", get(scaled_image))
         .nest_service(
             "/media",
-            // Stored names carry a random prefix and are never reused, so a
-            // file at a given URL never changes.
-            SetResponseHeaderLayer::if_not_present(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static(IMMUTABLE),
-            )
-            .layer(ServeDir::new(&state.config.media_dir)),
+            middleware::from_fn(media_file).layer(
+                // Stored names carry a random prefix and are never reused, so
+                // a file at a given URL never changes.
+                SetResponseHeaderLayer::if_not_present(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static(IMMUTABLE),
+                )
+                .layer(ServeDir::new(&state.config.media_dir)),
+            ),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -151,6 +153,51 @@ fn forwarded_for(headers: &HeaderMap) -> Option<String> {
 }
 
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
+/// Uploads and theme files are served from the site's origin, where a
+/// script would run with access to everything the site can do. Opened on
+/// their own, none of them may run one: the sandbox gives the document an
+/// origin of its own and turns scripts off. Embedded as images, fonts or
+/// stylesheets they are unaffected, since this policy only applies to the
+/// file as a document.
+const FILE_POLICY: &str = "sandbox; default-src 'none'; img-src 'self' data:; style-src \
+                           'unsafe-inline'; frame-ancestors 'self'";
+
+/// Locks down the response for a media or theme file at `path`; see
+/// [`FILE_POLICY`]. Types a browser shows without running anything of the
+/// file's are shown inline; everything else (HTML, XML, scripts, unknown
+/// types) is a download. Decided by the name, as the file's content type
+/// is, so that a `304` without a content type gets the same headers.
+fn harden_file<B>(response: &mut Response<B>, path: &str) {
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    let essence = mime.essence_str();
+    let headers = response.headers_mut();
+    // Browsers refuse to show a PDF in a sandbox; their viewers run PDF
+    // scripts apart from the page's origin anyway.
+    if essence != "application/pdf" {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(FILE_POLICY),
+        );
+    }
+    let inline = matches!(essence, "application/pdf" | "text/css" | "text/plain")
+        || ["image/", "font/", "audio/", "video/"]
+            .iter()
+            .any(|kind| essence.starts_with(kind));
+    if !inline {
+        headers.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
+    }
+}
+
+async fn media_file(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_owned();
+    let mut response = next.run(request).await;
+    harden_file(&mut response, &path);
+    response
+}
 
 /// Everything a page needs besides its own content.
 struct Frame {
@@ -605,6 +652,7 @@ async fn theme_asset(
     let file = state.config.themes_dir.join(theme).join(&path);
     match ServeFile::new(file).oneshot(request).await {
         Ok(mut response) => {
+            harden_file(&mut response, &path);
             response.headers_mut().insert(
                 header::CACHE_CONTROL,
                 HeaderValue::from_static(if stamped {
@@ -633,6 +681,7 @@ async fn scaled_image(
     };
     match ServeFile::new(file).oneshot(request).await {
         Ok(mut response) => {
+            harden_file(&mut response, &filename);
             response
                 .headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static(IMMUTABLE));

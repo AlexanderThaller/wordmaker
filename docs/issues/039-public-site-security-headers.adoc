@@ -1,13 +1,13 @@
 = 039: Public site sends no security headers
 :severity: Low
 :area: Site
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Site
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -31,3 +31,17 @@ link:005-media-active-content-site-origin.adoc[issue 5]).
 * Add `X-Content-Type-Options: nosniff`, `Referrer-Policy:
   strict-origin-when-cross-origin` and `frame-ancestors 'self'` to all
   responses.
+
+== Resolution
+
+`app::router` adds `X-Content-Type-Options: nosniff`, `Referrer-Policy:
+strict-origin-when-cross-origin`, `X-Frame-Options: SAMEORIGIN` and
+`Content-Security-Policy: frame-ancestors 'self'` to every response that
+does not set them itself. The OAuth pages keep their stricter
+`frame-ancestors 'none'` policy, and media files their sandbox policy
+(link:005-media-active-content-site-origin.adoc[issue 5]).
+
+Framing stays possible from the site itself. The admin interface does not
+frame the public site: it renders previews from its own origin into an
+`srcdoc` iframe and fetches `/_wm` and `/media` through its proxy, so it
+is unaffected.

@@ -8,6 +8,7 @@ use axum::{
     },
     http::{
         HeaderMap,
+        HeaderValue,
         header,
     },
     middleware::{
@@ -28,6 +29,7 @@ use sqlx::SqlitePool;
 use subtle::ConstantTimeEq;
 use tower_http::{
     compression::CompressionLayer,
+    set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
 };
 
@@ -80,11 +82,28 @@ pub fn router(state: AppState, mcp_allowed_hosts: Vec<String>) -> Router {
             require_mcp_auth,
         ));
 
+    // Every response gets these unless it sets its own, as the OAuth pages
+    // and media files do: no content sniffing, no framing by other sites,
+    // and only the origin in the `Referer` of links to other sites. The
+    // admin interface shows previews on its own origin and never frames
+    // the site.
+    let default_header =
+        |name, value| SetResponseHeaderLayer::if_not_present(name, HeaderValue::from_static(value));
     Router::new()
         .merge(api)
         .merge(mcp)
         .merge(oauth::router())
         .merge(site::router(&state).layer(CompressionLayer::new()))
+        .layer(default_header(header::X_CONTENT_TYPE_OPTIONS, "nosniff"))
+        .layer(default_header(
+            header::REFERRER_POLICY,
+            "strict-origin-when-cross-origin",
+        ))
+        .layer(default_header(header::X_FRAME_OPTIONS, "SAMEORIGIN"))
+        .layer(default_header(
+            header::CONTENT_SECURITY_POLICY,
+            "frame-ancestors 'self'",
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -516,6 +535,102 @@ mod tests {
             xml.contains("<loc>http://localhost:3000/about</loc>"),
             "{xml}"
         );
+    }
+
+    async fn get_response(app: &Router, uri: &str) -> Response {
+        app.clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn responses_carry_security_headers() {
+        let app = app().await;
+        for uri in ["/", "/missing", "/_wm/style.css", "/api/v1/pages"] {
+            let response = get_response(&app, uri).await;
+            let headers = response.headers();
+            assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{uri}");
+            assert_eq!(
+                headers[header::REFERRER_POLICY],
+                "strict-origin-when-cross-origin",
+                "{uri}"
+            );
+            assert_eq!(headers[header::X_FRAME_OPTIONS], "SAMEORIGIN", "{uri}");
+            assert_eq!(
+                headers[header::CONTENT_SECURITY_POLICY],
+                "frame-ancestors 'self'",
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn uploads_cannot_run_scripts_on_the_site() {
+        let app = app().await;
+        let boundary = "wm-boundary";
+        let parts: String = ["x.html", "x.svg", "x.png", "x.pdf", "x.js"]
+            .map(|name| {
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+                     filename=\"{name}\"\r\n\r\n<script>alert(1)</script>\r\n"
+                )
+            })
+            .concat();
+        let body = format!("{parts}--{boundary}--\r\n");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/media")
+                    .header("authorization", "Bearer secret")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let stored: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+
+        let sandboxed = |headers: &HeaderMap| {
+            headers[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap()
+                .starts_with("sandbox; default-src 'none'")
+        };
+        for media in &stored {
+            let path = media["path"].as_str().unwrap();
+            let response = get_response(&app, path).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let headers = response.headers();
+            assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+            let download = headers.get(header::CONTENT_DISPOSITION).is_some();
+            let extension = path.rsplit('.').next().unwrap();
+            match extension {
+                "html" | "js" => assert!(download && sandboxed(headers), "{path}"),
+                "svg" | "png" => assert!(!download && sandboxed(headers), "{path}"),
+                // A sandbox would keep the browser's viewer from showing it.
+                "pdf" => assert!(!download && !sandboxed(headers), "{path}"),
+                other => panic!("unexpected {other}"),
+            }
+            // Revalidating does not lift the policy.
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .header(header::IF_MODIFIED_SINCE, "Fri, 01 Jan 2100 00:00:00 GMT")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_MODIFIED, "{path}");
+            assert_eq!(sandboxed(response.headers()), extension != "pdf", "{path}");
+        }
     }
 
     #[tokio::test]
