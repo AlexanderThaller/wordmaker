@@ -16,7 +16,6 @@ use axum::{
         State,
     },
     http::{
-        HeaderMap,
         HeaderValue,
         Method,
         StatusCode,
@@ -135,7 +134,7 @@ async fn record_page_view(State(state): State<AppState>, request: Request, next:
     };
     analytics.record(Hit {
         time,
-        ip: analytics.client_ip(forwarded_for(&headers).as_deref(), peer),
+        ip: analytics.client_ip(crate::analytics::forwarded_for(&headers).as_deref(), peer),
         slug: uri.path().trim_start_matches('/').to_owned(),
         path: uri.path().to_owned(),
         query: uri.query().map(str::to_owned),
@@ -146,16 +145,6 @@ async fn record_page_view(State(state): State<AppState>, request: Request, next:
         accept_language: header(header::ACCEPT_LANGUAGE),
     });
     response
-}
-
-/// All `X-Forwarded-For` headers as one list, in order.
-fn forwarded_for(headers: &HeaderMap) -> Option<String> {
-    let values: Vec<&str> = headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .collect();
-    (!values.is_empty()).then(|| values.join(","))
 }
 
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";

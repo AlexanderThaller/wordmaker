@@ -150,12 +150,13 @@ fn is_admin_token(state: &AppState, presented: &str) -> bool {
     presented.as_bytes().ct_eq(state.token.as_bytes()).into()
 }
 
-/// The address the request came from, if the server knows it.
-pub fn peer(request: &Request) -> Option<std::net::IpAddr> {
-    request
+/// The client a request's wrong tokens are counted against.
+fn guesser(state: &AppState, request: &Request) -> Option<std::net::IpAddr> {
+    let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(peer)| peer.ip())
+        .map(|&ConnectInfo(peer)| peer);
+    state.guesses.client(request.headers(), peer)
 }
 
 /// The answer while a client has presented too many wrong tokens.
@@ -176,7 +177,7 @@ async fn require_token(
     let Some(presented) = presented_token(request.headers()) else {
         return Err(AppError::Unauthorized);
     };
-    let peer = peer(&request);
+    let peer = guesser(&state, &request);
     if !state.guesses.allowed(peer) {
         return Ok(too_many_guesses());
     }
@@ -202,7 +203,7 @@ async fn require_mcp_auth(
         if oauth::access_token_valid(&state, presented).await? {
             return Ok(next.run(request).await);
         }
-        let peer = peer(&request);
+        let peer = guesser(&state, &request);
         if !state.guesses.allowed(peer) {
             return Ok(too_many_guesses());
         }
@@ -247,6 +248,14 @@ mod tests {
     }
 
     async fn app_until(analytics: Option<Analytics>, shutdown: CancellationToken) -> Router {
+        app_guessing(analytics, shutdown, Arc::default()).await
+    }
+
+    async fn app_guessing(
+        analytics: Option<Analytics>,
+        shutdown: CancellationToken,
+        guesses: Arc<Guesses>,
+    ) -> Router {
         let config = Config {
             database_url: String::new(),
             media_dir: std::env::temp_dir().join("wordmaker-app-test"),
@@ -265,7 +274,7 @@ mod tests {
             images: Arc::default(),
             renders: Arc::default(),
             oauth_clients: Arc::default(),
-            guesses: Arc::default(),
+            guesses,
             analytics,
         };
         router(state, vec!["localhost".into()], shutdown)
@@ -526,6 +535,50 @@ mod tests {
         );
         assert_eq!(
             status("/mcp", "secret").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn guesses_behind_a_proxy_count_per_client() {
+        let guesses = Arc::new(Guesses::behind(1));
+        let app = app_guessing(None, CancellationToken::new(), guesses).await;
+        let status = |peer: [u8; 4], client: &'static str, token: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::get("/api/v1/pages")
+                        .extension(axum::extract::ConnectInfo(SocketAddr::from((peer, 4000))))
+                        .header("x-forwarded-for", client)
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+        let proxy = [127, 0, 0, 1];
+        for _ in 0..20 {
+            status(proxy, "203.0.113.7", "wrong").await;
+        }
+        assert_eq!(
+            status(proxy, "203.0.113.7", "secret").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // Someone else behind the same proxy is not locked out.
+        assert_eq!(
+            status(proxy, "198.51.100.9", "secret").await,
+            StatusCode::OK
+        );
+        // A direct connection cannot pick its address to escape the limit.
+        let direct = [192, 0, 2, 1];
+        for _ in 0..20 {
+            status(direct, "198.51.100.1", "wrong").await;
+        }
+        assert_eq!(
+            status(direct, "198.51.100.2", "secret").await,
             StatusCode::TOO_MANY_REQUESTS
         );
     }

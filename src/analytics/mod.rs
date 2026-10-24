@@ -105,6 +105,11 @@ pub struct AnalyticsArgs {
 }
 
 impl AnalyticsArgs {
+    /// How many reverse proxies are in front, for finding client addresses.
+    pub fn proxy_hops(&self) -> usize {
+        self.proxy_hops
+    }
+
     /// Warns when the server can be reached without the proxy that
     /// `proxy_hops` assumes, since then visitors on the local network could
     /// pick their own address.
@@ -303,7 +308,9 @@ pub(crate) fn truncate(text: &mut String, max: usize) {
     }
 }
 
-fn client_ip(
+/// The client's address: `proxy_hops` entries from the right of
+/// `X-Forwarded-For` if the connection's peer is a proxy, else the peer.
+pub fn client_ip(
     forwarded_for: Option<&str>,
     peer: Option<SocketAddr>,
     proxy_hops: usize,
@@ -315,6 +322,16 @@ fn client_ip(
         .and_then(|header| header.rsplit(',').nth(proxy_hops - 1))
         .and_then(|entry| parse_forwarded_ip(entry.trim()));
     forwarded.or(peer)
+}
+
+/// All `X-Forwarded-For` headers as one list, in order.
+pub fn forwarded_for(headers: &axum::http::HeaderMap) -> Option<String> {
+    let values: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    (!values.is_empty()).then(|| values.join(","))
 }
 
 /// Whether a reverse proxy may connect from `ip`: this host, or a private

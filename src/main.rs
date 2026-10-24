@@ -146,7 +146,7 @@ async fn serve(config: Config, args: ServeArgs) -> anyhow::Result<()> {
         images: Arc::default(),
         renders: Arc::default(),
         oauth_clients: Arc::default(),
-        guesses: Arc::default(),
+        guesses: Arc::new(token::Guesses::behind(args.analytics.proxy_hops())),
         analytics,
     };
     let shutdown = CancellationToken::new();

@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    net::IpAddr,
+    net::{
+        IpAddr,
+        SocketAddr,
+    },
     path::{
         Path,
         PathBuf,
@@ -45,14 +48,37 @@ pub fn check_strength(token: &str) -> anyhow::Result<()> {
 
 /// Wrong admin tokens per client address, shared by every place that
 /// checks one (`/api`, `/mcp` and the OAuth sign-in), so that guessing is
-/// slow however many requests run in parallel. Behind a reverse proxy all
-/// clients have the proxy's address and share one allowance.
+/// slow however many requests run in parallel. Clients are told apart as
+/// analytics tells visitors apart, so behind a reverse proxy one guesser
+/// does not lock everyone else out.
 #[derive(Debug, Default)]
 pub struct Guesses {
     clients: Mutex<HashMap<Option<IpAddr>, (f64, Instant)>>,
+    proxy_hops: usize,
 }
 
 impl Guesses {
+    /// Guesses counted per client behind `proxy_hops` reverse proxies.
+    pub fn behind(proxy_hops: usize) -> Self {
+        Self {
+            proxy_hops,
+            ..Self::default()
+        }
+    }
+
+    /// The address a request is counted against.
+    pub fn client(
+        &self,
+        headers: &axum::http::HeaderMap,
+        peer: Option<SocketAddr>,
+    ) -> Option<IpAddr> {
+        crate::analytics::client_ip(
+            crate::analytics::forwarded_for(headers).as_deref(),
+            peer,
+            self.proxy_hops,
+        )
+    }
+
     /// Whether a token from `peer` may be checked now.
     pub fn allowed(&self, peer: Option<IpAddr>) -> bool {
         self.allowed_at(peer, Instant::now())

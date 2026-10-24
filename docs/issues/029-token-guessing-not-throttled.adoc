@@ -46,3 +46,10 @@ safe. A weak, hand-chosen `WORDMAKER_TOKEN` can be brute-forced.
   allowance.
 * `serve` refuses tokens shorter than 32 characters (`wordmaker token`
   prints 64). A test checks that generated tokens pass.
+
+Behind a reverse proxy every connection comes from the proxy, so counting
+by the connection's address would let one guesser lock everyone out with
+429s. The limiter therefore counts by the client address analytics uses:
+`WORDMAKER_PROXY_HOPS` entries from the right of `X-Forwarded-For`, read
+only from loopback and private-network peers, so a direct client cannot
+pick its own address to escape the limit.

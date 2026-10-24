@@ -400,7 +400,9 @@ async fn decide(
     if form.decision.as_deref() != Some("approve") {
         return deny(&state, &request, &headers);
     }
-    let peer = connect.map(|Extension(ConnectInfo(peer))| peer.ip());
+    let peer = state
+        .guesses
+        .client(&headers, connect.map(|Extension(ConnectInfo(peer))| peer));
     if !state.guesses.allowed(peer) {
         let mut response = login_page(
             &state,
