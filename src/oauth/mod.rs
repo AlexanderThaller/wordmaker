@@ -703,9 +703,47 @@ async fn redeem_code(state: &AppState, request: &TokenRequest) -> Result<Respons
     let client_id = required(request.client_id.as_ref(), "client_id")?;
     let verifier = required(request.code_verifier.as_ref(), "code_verifier")?;
 
-    let stored = store::take_code(&state.pool, &hash(state, code))
-        .await?
-        .ok_or_else(TokenError::invalid_grant)?;
+    let grant_id = uuid::Uuid::new_v4().to_string();
+    let mut tx = state.pool.begin().await.map_err(AppError::from)?;
+    let stored = match store::redeem_code(&mut tx, &hash(state, code), &grant_id).await? {
+        store::Redeemed::Fresh(stored) => stored,
+        store::Redeemed::Unknown => return Err(TokenError::invalid_grant()),
+        store::Redeemed::Replayed { grant_id } => {
+            // The code was intercepted, or the client is confused; either
+            // way the tokens it was exchanged for are not to be trusted
+            // (RFC 6749, section 4.1.2).
+            store::revoke_grant(&mut tx, &grant_id).await?;
+            tx.commit().await.map_err(AppError::from)?;
+            tracing::warn!(
+                grant_id,
+                "authorization code replayed; OAuth sign-in revoked"
+            );
+            return Err(TokenError::invalid_grant());
+        }
+    };
+    // The code is spent even if the request turns out to be wrong.
+    if let Err(err) = check_code(state, request, &stored, client_id, verifier) {
+        tx.commit().await.map_err(AppError::from)?;
+        return Err(err);
+    }
+
+    let grant = store::TokenGrant {
+        grant_id,
+        client_id: stored.client_id,
+        resource: stored.resource,
+    };
+    let response = issue(state, &mut tx, &grant).await?;
+    tx.commit().await.map_err(AppError::from)?;
+    Ok(response)
+}
+
+fn check_code(
+    state: &AppState,
+    request: &TokenRequest,
+    stored: &store::AuthCode,
+    client_id: &str,
+    verifier: &str,
+) -> Result<(), TokenError> {
     let redirect_ok = request
         .redirect_uri
         .as_deref()
@@ -725,17 +763,7 @@ async fn redeem_code(state: &AppState, request: &TokenRequest) -> Result<Respons
             "code_verifier does not match the code_challenge",
         ));
     }
-    check_resource(state, request, &stored.resource)?;
-
-    let grant = store::TokenGrant {
-        grant_id: uuid::Uuid::new_v4().to_string(),
-        client_id: stored.client_id,
-        resource: stored.resource,
-    };
-    let mut tx = state.pool.begin().await.map_err(AppError::from)?;
-    let response = issue(state, &mut tx, &grant).await?;
-    tx.commit().await.map_err(AppError::from)?;
-    Ok(response)
+    check_resource(state, request, &stored.resource)
 }
 
 async fn refresh(state: &AppState, request: &TokenRequest) -> Result<Response, TokenError> {
@@ -1149,20 +1177,6 @@ mod tests {
         .await;
         assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
 
-        // A code works once.
-        let reply = post_form(
-            &app,
-            "/oauth/token",
-            &[
-                ("grant_type", "authorization_code"),
-                ("code", &code),
-                ("client_id", &client_id),
-                ("code_verifier", VERIFIER),
-            ],
-        )
-        .await;
-        assert_eq!(reply.json()["error"], "invalid_grant");
-
         // Refreshing rotates both tokens.
         let reply = post_form(
             &app,
@@ -1260,6 +1274,27 @@ mod tests {
         assert_eq!(reply.json()["error"], "invalid_grant");
         let reply = refresh_with(&app, &client_id, &refresh).await;
         assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    }
+
+    #[tokio::test]
+    async fn code_replay_revokes_the_sign_in() {
+        let app = app().await;
+        let client_id = register_client(&app).await;
+        let code = sign_in(&app, &client_id).await;
+        let reply = redeem(&app, &client_id, &code).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        let access = reply.json()["access_token"].as_str().unwrap().to_owned();
+        let refresh = reply.json()["refresh_token"].as_str().unwrap().to_owned();
+        assert_eq!(mcp_status(&app, &access).await.status, StatusCode::OK);
+
+        let reply = redeem(&app, &client_id, &code).await;
+        assert_eq!(reply.json()["error"], "invalid_grant");
+        assert_eq!(
+            mcp_status(&app, &access).await.status,
+            StatusCode::UNAUTHORIZED
+        );
+        let reply = refresh_with(&app, &client_id, &refresh).await;
+        assert_eq!(reply.json()["error"], "invalid_grant");
     }
 
     #[tokio::test]

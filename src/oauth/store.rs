@@ -83,16 +83,47 @@ pub async fn insert_code(pool: &SqlitePool, code_hash: &str, code: &AuthCode) ->
     Ok(())
 }
 
-/// Remove a code and return it; a code can be redeemed only once.
-pub async fn take_code(pool: &SqlitePool, code_hash: &str) -> AppResult<Option<AuthCode>> {
-    let code = sqlx::query_as(
-        "DELETE FROM oauth_codes WHERE code_hash = ?
+/// What an authorization code turned out to be when it was redeemed.
+#[derive(Debug)]
+pub enum Redeemed {
+    /// Not redeemed before; it now belongs to the new grant.
+    Fresh(AuthCode),
+    /// Redeemed before, for `grant_id`.
+    Replayed {
+        grant_id: String,
+    },
+    Unknown,
+}
+
+/// Redeem a code for `grant_id`; a code can be redeemed only once. The code
+/// stays until it expires, to recognise replays.
+pub async fn redeem_code(
+    conn: &mut SqliteConnection,
+    code_hash: &str,
+    grant_id: &str,
+) -> AppResult<Redeemed> {
+    let fresh = sqlx::query_as(
+        "UPDATE oauth_codes SET grant_id = ? WHERE code_hash = ? AND grant_id IS NULL
          RETURNING client_id, redirect_uri, code_challenge, resource, expires_at",
     )
+    .bind(grant_id)
     .bind(code_hash)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
-    Ok(code)
+    if let Some(code) = fresh {
+        return Ok(Redeemed::Fresh(code));
+    }
+    let replayed: Option<(String,)> = sqlx::query_as(
+        "SELECT grant_id FROM oauth_codes WHERE code_hash = ? AND grant_id IS NOT NULL",
+    )
+    .bind(code_hash)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(
+        replayed.map_or(Redeemed::Unknown, |(grant_id,)| Redeemed::Replayed {
+            grant_id,
+        }),
+    )
 }
 
 /// One sign-in of a client, shared by the tokens issued for it.
