@@ -50,29 +50,33 @@ pub const API_GUARD_HEADER: &str = "x-wordmaker-admin";
 /// What the interface's own pages may load. Script only from here (and
 /// the editor's wasm); styles, images, fonts and media more widely, since
 /// the preview shows pages as the site would, and its frame inherits this.
-const ADMIN_CSP: &str = "default-src 'self'; \
-    script-src 'self' 'wasm-unsafe-eval'; \
-    style-src 'self' 'unsafe-inline' https:; \
-    img-src * data: blob:; \
-    font-src * data:; \
-    media-src * data: blob:; \
-    frame-src 'self' https:; \
-    connect-src 'self'; \
-    object-src 'none'; \
-    base-uri 'self'; \
-    form-action 'self'; \
-    frame-ancestors 'self'";
+const ADMIN_CSP: &str = concat!(
+    "default-src 'self'; ",
+    "script-src 'self' 'wasm-unsafe-eval'; ",
+    "style-src 'self' 'unsafe-inline' https:; ",
+    "img-src * data: blob:; ",
+    "font-src * data:; ",
+    "media-src * data: blob:; ",
+    "frame-src 'self' https:; ",
+    "connect-src 'self'; ",
+    "object-src 'none'; ",
+    "base-uri 'self'; ",
+    "form-action 'self'; ",
+    "frame-ancestors 'self'",
+);
 
 /// Files passed on from the site's `/_wm` and `/media` may be anything a
 /// theme or an upload holds, SVG and HTML included. Opened on their own on
 /// this origin they could script the API with the token, so they are shown
 /// sandboxed, without script. Loading them into the interface's pages as
 /// images, styles or fonts is not affected.
-const PUBLIC_CSP: &str = "default-src 'none'; \
-    img-src 'self' data:; \
-    style-src 'self' 'unsafe-inline'; \
-    font-src 'self'; \
-    sandbox";
+const PUBLIC_CSP: &str = concat!(
+    "default-src 'none'; ",
+    "img-src 'self' data:; ",
+    "style-src 'self' 'unsafe-inline'; ",
+    "font-src 'self'; ",
+    "sandbox",
+);
 
 #[derive(Debug, Clone)]
 pub struct Admin {
