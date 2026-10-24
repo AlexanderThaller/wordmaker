@@ -104,6 +104,8 @@ pub async fn get_client(pool: &SqlitePool, client_id: &str) -> AppResult<Option<
 pub struct AuthCode {
     pub client_id: String,
     pub redirect_uri: String,
+    /// Whether the authorization request named `redirect_uri` itself.
+    pub redirect_uri_sent: bool,
     pub code_challenge: String,
     pub resource: String,
     pub expires_at: DateTime<Utc>,
@@ -112,12 +114,14 @@ pub struct AuthCode {
 pub async fn insert_code(pool: &SqlitePool, code_hash: &str, code: &AuthCode) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO oauth_codes
-             (code_hash, client_id, redirect_uri, code_challenge, resource, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
+             (code_hash, client_id, redirect_uri, redirect_uri_sent, code_challenge, resource,
+              expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(code_hash)
     .bind(&code.client_id)
     .bind(&code.redirect_uri)
+    .bind(code.redirect_uri_sent)
     .bind(&code.code_challenge)
     .bind(&code.resource)
     .bind(code.expires_at)
@@ -147,7 +151,8 @@ pub async fn redeem_code(
 ) -> AppResult<Redeemed> {
     let fresh = sqlx::query_as(
         "UPDATE oauth_codes SET grant_id = ? WHERE code_hash = ? AND grant_id IS NULL
-         RETURNING client_id, redirect_uri, code_challenge, resource, expires_at",
+         RETURNING client_id, redirect_uri, redirect_uri_sent, code_challenge, resource,
+                   expires_at",
     )
     .bind(grant_id)
     .bind(code_hash)
@@ -311,6 +316,8 @@ pub async fn revoke(pool: &SqlitePool, token_hash: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Drop expired codes and tokens, including the used ones kept to spot
+/// reuse.
 pub async fn purge_expired(pool: &SqlitePool) -> AppResult<()> {
     let now = Utc::now();
     sqlx::query("DELETE FROM oauth_codes WHERE expires_at < ?")

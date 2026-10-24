@@ -122,6 +122,7 @@ async fn serve(config: Config, args: ServeArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 3000)));
 
     let pool = db::connect(&config.database_url).await?;
+    oauth::spawn_purge(pool.clone());
     let mut allowed_hosts: Vec<String> = ["localhost", "127.0.0.1", "::1"]
         .into_iter()
         .map(str::to_owned)

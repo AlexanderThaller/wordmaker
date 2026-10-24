@@ -106,7 +106,10 @@ fn presented_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(|value| value.split_once(' '))
+        // The scheme is case-insensitive (RFC 9110, section 11.1).
+        .filter(|(scheme, _)| scheme.to_lowercase() == "bearer")
+        .map(|(_, token)| token.trim_start())
         .or_else(|| {
             headers
                 .get(TOKEN_HEADER)
@@ -417,6 +420,24 @@ mod tests {
             status("/mcp", "secret").await,
             StatusCode::TOO_MANY_REQUESTS
         );
+    }
+
+    #[tokio::test]
+    async fn bearer_scheme_is_case_insensitive() {
+        let app = app().await;
+        for value in ["bearer secret", "BEARER secret", "Bearer  secret"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get("/api/v1/pages")
+                        .header("authorization", value)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{value}");
+        }
     }
 
     #[tokio::test]

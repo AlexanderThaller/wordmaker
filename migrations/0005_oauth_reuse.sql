@@ -6,6 +6,10 @@ ALTER TABLE oauth_tokens ADD COLUMN used INTEGER NOT NULL DEFAULT 0;
 -- until it expires, so that a replay can revoke that grant.
 ALTER TABLE oauth_codes ADD COLUMN grant_id TEXT;
 
+-- Whether the authorization request named its redirect_uri, in which case
+-- the token request has to repeat it.
+ALTER TABLE oauth_codes ADD COLUMN redirect_uri_sent INTEGER NOT NULL DEFAULT 1;
+
 -- When a registered client first got tokens. Clients that never did can
 -- be dropped to make room for new registrations.
 ALTER TABLE oauth_clients ADD COLUMN used_at TEXT;

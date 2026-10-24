@@ -25,6 +25,7 @@ use axum::{
         ConnectInfo,
         Query,
         State,
+        rejection::FormRejection,
     },
     http::{
         HeaderMap,
@@ -427,6 +428,7 @@ async fn decide(
     let stored = store::AuthCode {
         client_id: request.client.client_id.clone(),
         redirect_uri: request.redirect_uri.clone(),
+        redirect_uri_sent: form.params.redirect_uri.is_some(),
         code_challenge: request.code_challenge,
         resource: resource(&state.config),
         expires_at: Utc::now() + CODE_TTL,
@@ -657,10 +659,37 @@ struct TokenRequest {
     resource: Option<String>,
 }
 
-async fn token(State(state): State<AppState>, Form(request): Form<TokenRequest>) -> Response {
-    if let Err(err) = store::purge_expired(&state.pool).await {
-        tracing::warn!(error = %err, "could not purge expired OAuth codes and tokens");
-    }
+/// Expired codes and tokens are useless; drop them from time to time.
+pub fn spawn_purge(pool: sqlx::SqlitePool) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_mins(10));
+        loop {
+            interval.tick().await;
+            if let Err(err) = store::purge_expired(&pool).await {
+                tracing::warn!(error = %err, "could not purge expired OAuth codes and tokens");
+            }
+        }
+    });
+}
+
+/// The OAuth error for a missing or malformed form body, instead of
+/// axum's plain-text rejection.
+fn form_rejected(rejection: &FormRejection) -> Response {
+    oauth_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        &format!("expected an application/x-www-form-urlencoded body: {rejection}"),
+    )
+}
+
+async fn token(
+    State(state): State<AppState>,
+    request: Result<Form<TokenRequest>, FormRejection>,
+) -> Response {
+    let request = match request {
+        Ok(Form(request)) => request,
+        Err(rejection) => return form_rejected(&rejection),
+    };
     let result = match request.grant_type.as_deref() {
         Some("authorization_code") => redeem_code(&state, &request).await,
         Some("refresh_token") => refresh(&state, &request).await,
@@ -768,14 +797,16 @@ fn check_code(
     client_id: &str,
     verifier: &str,
 ) -> Result<(), TokenError> {
-    let redirect_ok = request
-        .redirect_uri
-        .as_deref()
-        .is_none_or(|uri| uri == stored.redirect_uri);
+    // The redirect URI has to be repeated if the authorization request
+    // named it (RFC 6749, section 4.1.3).
+    let redirect_ok = match request.redirect_uri.as_deref() {
+        Some(uri) => uri == stored.redirect_uri,
+        None => !stored.redirect_uri_sent,
+    };
     if stored.expires_at < Utc::now() || stored.client_id != client_id || !redirect_ok {
         return Err(TokenError::invalid_grant());
     }
-    if !(43..=128).contains(&verifier.len())
+    if !valid_verifier(verifier)
         || !bool::from(
             pkce_challenge(verifier)
                 .as_bytes()
@@ -882,7 +913,14 @@ struct RevokeRequest {
     token: Option<String>,
 }
 
-async fn revoke(State(state): State<AppState>, Form(request): Form<RevokeRequest>) -> Response {
+async fn revoke(
+    State(state): State<AppState>,
+    request: Result<Form<RevokeRequest>, FormRejection>,
+) -> Response {
+    let request = match request {
+        Ok(Form(request)) => request,
+        Err(rejection) => return form_rejected(&rejection),
+    };
     let Some(token) = request.token.filter(|t| !t.is_empty()) else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -916,6 +954,15 @@ fn hash(state: &AppState, value: &str) -> String {
     hasher.update([0]);
     hasher.update(value.as_bytes());
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+/// A PKCE verifier: 43 to 128 unreserved characters (RFC 7636, section
+/// 4.1).
+fn valid_verifier(verifier: &str) -> bool {
+    (43..=128).contains(&verifier.len())
+        && verifier
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
 }
 
 fn pkce_challenge(verifier: &str) -> String {
@@ -1440,6 +1487,36 @@ mod tests {
         )
         .await;
         assert_eq!(reply.json()["error"], "invalid_grant");
+
+        // A redirect URI named at authorization has to be repeated.
+        let code = sign_in(&app, &client_id).await;
+        let without_redirect = [
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("client_id", client_id.as_str()),
+            ("code_verifier", VERIFIER),
+        ];
+        let reply = post_form(&app, "/oauth/token", &without_redirect).await;
+        assert_eq!(reply.json()["error"], "invalid_grant");
+
+        // Verifiers are made of unreserved characters only.
+        assert!(valid_verifier(VERIFIER));
+        assert!(!valid_verifier(&format!("{VERIFIER}+/=")));
+        assert!(!valid_verifier(&"é".repeat(30)));
+
+        // Malformed bodies get OAuth errors.
+        for path in ["/oauth/token", "/oauth/revoke"] {
+            let reply = call(
+                &app,
+                axum::http::Request::post(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
+            assert_eq!(reply.json()["error"], "invalid_request", "{path}");
+        }
 
         // Registration refuses redirect URIs that are not safe.
         for uri in [
