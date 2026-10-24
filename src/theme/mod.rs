@@ -589,10 +589,15 @@ struct CacheKey {
     modified: Option<SystemTime>,
 }
 
+type Cached = Arc<Mutex<Option<(CacheKey, Arc<Stylesheet>)>>>;
+
 /// Compiling a theme takes a few milliseconds; this keeps the last result.
 #[derive(Default)]
 pub struct ThemeCache {
-    last: Mutex<Option<(CacheKey, Arc<Stylesheet>)>>,
+    last: Cached,
+    /// Held for the whole of a build, so requests that miss the cache at the
+    /// same time wait for one build instead of each starting their own.
+    building: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ThemeCache {
@@ -616,36 +621,56 @@ impl ThemeCache {
             theme,
             modified,
         };
-        if let Some((cached_key, sheet)) = self
-            .last
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            && *cached_key == key
-        {
-            return sheet.clone();
+        if let Some(sheet) = cached(&self.last, &key) {
+            return sheet;
+        }
+        let guard = self.building.clone().lock_owned().await;
+        if let Some(sheet) = cached(&self.last, &key) {
+            return sheet;
         }
 
+        // The build keeps the lock and fills the cache itself, so it counts
+        // even when the request that started it has gone away.
         let dir = themes_dir.to_owned();
-        let build_key = key.clone();
-        let (css, layout) = blocking(move || {
-            build(&dir, build_key.theme.as_deref(), &build_key.variations)
+        let last = self.last.clone();
+        blocking(move || {
+            let _guard = guard;
+            let sheet = Arc::new(stylesheet(
+                build(&dir, key.theme.as_deref(), &key.variations).unwrap_or_else(|err| {
+                    tracing::error!(error = %err, "failed to compile theme, using the built-in one");
+                    builtin()
+                }),
+            ));
+            *last.lock().unwrap_or_else(PoisonError::into_inner) = Some((key, sheet.clone()));
+            Ok(sheet)
         })
         .await
         .unwrap_or_else(|err| {
             tracing::error!(error = %err, "failed to compile theme, using the built-in one");
-            build(Path::new(""), None, &[]).expect("built-in theme compiles")
-        });
-        let css = css::minify(&css);
-        let mut hasher = DefaultHasher::new();
-        css.hash(&mut hasher);
-        let sheet = Arc::new(Stylesheet {
-            css,
-            version: format!("{:016x}", hasher.finish()),
-            layout,
-        });
-        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some((key, sheet.clone()));
-        sheet
+            Arc::new(stylesheet(builtin()))
+        })
+    }
+}
+
+fn cached(last: &Cached, key: &CacheKey) -> Option<Arc<Stylesheet>> {
+    match last.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+        Some((cached_key, sheet)) if cached_key == key => Some(sheet.clone()),
+        _ => None,
+    }
+}
+
+fn builtin() -> (String, Layout) {
+    build(Path::new(""), None, &[]).expect("built-in theme compiles")
+}
+
+fn stylesheet((css, layout): (String, Layout)) -> Stylesheet {
+    let css = css::minify(&css);
+    let mut hasher = DefaultHasher::new();
+    css.hash(&mut hasher);
+    Stylesheet {
+        css,
+        version: format!("{:016x}", hasher.finish()),
+        layout,
     }
 }
 
@@ -662,7 +687,8 @@ fn build(
             block_styles: &[],
             asset_base: "",
             style_css: None,
-        });
+        })
+        .map_err(|err| AppError::Internal(format!("built-in theme: {err}")))?;
         return Ok((site_css::assemble(&json, &compiled, true), layout(&json)));
     };
 
@@ -690,7 +716,8 @@ fn build(
         block_styles: &block_styles,
         asset_base: &asset_base(&dir, slug),
         style_css: style_css.as_deref(),
-    });
+    })
+    .map_err(|err| AppError::BadRequest(format!("theme '{slug}': {err}")))?;
     Ok((site_css::assemble(&json, &compiled, false), layout(&json)))
 }
 
@@ -821,4 +848,41 @@ async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|err| AppError::Internal(format!("theme task failed: {err}")))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings(theme: Option<&str>, variations: &[&str]) -> Settings {
+        Settings {
+            site_title: String::new(),
+            site_language: "en".into(),
+            site_tagline: None,
+            footer_text: None,
+            home_slug: None,
+            theme: theme.map(str::to_owned),
+            theme_variations: variations.iter().map(|v| (*v).to_owned()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_share_one_build() {
+        let cache = Arc::new(ThemeCache::default());
+        let builds: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = cache.clone();
+                tokio::spawn(async move {
+                    cache
+                        .stylesheet(Path::new("/nonexistent"), &settings(None, &[]))
+                        .await
+                })
+            })
+            .collect();
+        let mut sheets = Vec::new();
+        for build in builds {
+            sheets.push(build.await.unwrap());
+        }
+        assert!(sheets.iter().all(|s| Arc::ptr_eq(s, &sheets[0])));
+    }
 }

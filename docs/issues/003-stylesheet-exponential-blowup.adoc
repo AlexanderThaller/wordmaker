@@ -1,13 +1,13 @@
 = 003: Nested block styles make the stylesheet grow exponentially
 :severity: High
 :area: Themes
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: High
 Area:: Themes
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -40,3 +40,20 @@ its own build.
   total output size; fail the build with an error when exceeded.
 * Reject a `ref` whose target is an object.
 * Make builds single-flight per cache key.
+
+== Resolution
+
+* `css::compile` now fails with an error when blocks and elements nest more
+  than four levels deep (`WordPress` uses three at most), when one rule
+  would get more than 500 selectors, or when the stylesheet grows past
+  4 MiB. The size is checked as rules are written, so a build stops early
+  rather than after allocating the whole output. A theme that hits a limit
+  is logged and the built-in theme is used.
+* A `ref` whose target is an object or an array resolves to `initial`
+  instead of serialising the target, as `WordPress` ignores such
+  references. This also covers references to references.
+* `ThemeCache` holds a build lock for the whole build: requests that miss
+  the cache at the same time wait for the first build and then share its
+  result. The blocking task keeps the lock and stores the result itself,
+  so a request that is cancelled mid-build does not let another build
+  start.
