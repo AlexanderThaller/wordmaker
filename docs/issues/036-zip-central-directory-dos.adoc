@@ -1,13 +1,13 @@
 = 036: Zips with millions of entries are fully scanned before the file limit applies
 :severity: Low
 :area: Themes
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Themes
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -26,3 +26,10 @@ during install.
 == Suggested fix
 
 * Reject `archive.len() > MAX_FILES` right after opening.
+
+== Resolution
+
+`extract` refuses a zip with more than `MAX_FILES` (10,000) entries right
+after opening it, before the root scan or any extraction. Opening still
+reads the central directory, as `ZipArchive::new` does that itself; its
+size stays bounded by the 100 MB download and the upload body limit.

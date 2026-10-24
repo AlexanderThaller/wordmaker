@@ -234,7 +234,7 @@ fn is_loopback(url: &Url) -> bool {
 
 /// Addresses on the public internet: not loopback, private, link-local,
 /// shared, documentation, multicast or otherwise reserved.
-fn is_public(ip: IpAddr) -> bool {
+pub fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let [a, b, ..] = ip.octets();

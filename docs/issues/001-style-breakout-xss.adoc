@@ -1,13 +1,13 @@
 = 001: Theme CSS can break out of the inline <style> element
 :severity: High
 :area: Site rendering / themes
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: High
 Area:: Site rendering / themes
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -40,3 +40,13 @@ turns installing a third-party theme into code execution on the site.
   selectors), or match `</style` case-insensitively.
 * Optionally serve the stylesheet as an external file and add a CSP to
   public pages.
+
+== Resolution
+
+The inlined stylesheet now has every `</` written as `<\/`, whatever
+follows, so no end tag in any letter case can close the `<style>` element.
+`<\/` means the same as `</` in a CSS string, comment or URL. A lone `<`
+is left alone rather than escaped as `\3c `, since media queries use it as
+an operator (`(width < 600px)`), where an escape would break them; only
+`</` can end a raw-text element. A test installs a theme whose `style.css`
+contains `</STYLE><script>` and checks the page has a single `</style>`.

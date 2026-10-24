@@ -31,7 +31,8 @@ workspace = true
 inherits = "release"
 lto = true
 codegen-units = 1
-panic = "abort"
+# Panics unwind (the default): one in a request's blocking task then fails
+# that request with a 500 instead of taking the whole server down.
 opt-level = 3
 debug = false
 strip = "none"

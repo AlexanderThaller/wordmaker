@@ -10,6 +10,9 @@
 mod client_metadata;
 mod store;
 
+/// Also guards theme downloads.
+pub use client_metadata::is_public;
+
 use std::fmt::Write;
 
 use axum::{

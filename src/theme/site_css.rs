@@ -68,6 +68,11 @@ fn bridge_variables(theme: &Value) -> String {
 /// Relative luminance of a `#rgb`, `#rrggbb` or `#rrggbbaa` colour.
 fn luminance(color: &str) -> Option<f64> {
     let hex = color.trim().strip_prefix('#')?;
+    // Byte offsets below are only character boundaries for ASCII, and
+    // `from_str_radix` would also take a sign.
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     let channel = |s: &str| u8::from_str_radix(s, 16).ok().map(f64::from);
     let (r, g, b) = match hex.len() {
         3 => {
@@ -237,5 +242,9 @@ mod tests {
         assert!(luminance("#fff").unwrap() > 0.99);
         assert!(luminance("#FFFFFF33").unwrap() > 0.99);
         assert!(luminance("var(--x)").is_none());
+        assert!(luminance("#é1").is_none());
+        assert!(luminance("#ffé").is_none());
+        assert!(luminance("#+f+f+f").is_none());
+        assert!(luminance("#ff+fff").is_none());
     }
 }
