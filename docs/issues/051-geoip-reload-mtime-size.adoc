@@ -1,13 +1,13 @@
 = 051: GeoIP reload only compares mtime and size
 :severity: Low
 :area: Analytics
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Analytics
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -25,3 +25,9 @@ A replacement with the same mtime and size is never loaded.
 == Suggested fix
 
 * Also compare the inode (`MetadataExt::ino`).
+
+== Resolution
+
+A database file's stamp now includes its device and inode besides mtime and
+size. Updates rename a new file over the old one, which always changes the
+inode, so a replacement with identical mtime and size is loaded too.
