@@ -1,13 +1,13 @@
 = 048: ClickHouse URL is logged in full, possibly with credentials
 :severity: Low
 :area: Analytics
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Analytics
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -25,3 +25,11 @@ the logs. Whether clickhouse-rs honours URL userinfo was not verified.
 == Suggested fix
 
 * Redact userinfo before logging.
+
+== Resolution
+
+The startup log line replaces any user info in the ClickHouse URL with
+`***`, and logs "an unparsable URL" instead of a value that does not parse
+as a URL with a host (`user:pass@host` parses as a path otherwise). Whether
+clickhouse-rs uses URL credentials is still unverified; the documented way
+remains `WORDMAKER_CLICKHOUSE_USER` and `WORDMAKER_CLICKHOUSE_PASSWORD(_FILE)`.

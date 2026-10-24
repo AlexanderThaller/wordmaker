@@ -120,10 +120,27 @@ impl AnalyticsArgs {
         }
         let geo = geo::Geo::open(self.geoip_city_db.as_deref(), self.geoip_asn_db.as_deref());
         tracing::info!(
-            "analytics: page views go to {url}, database {}",
+            "analytics: page views go to {}, database {}",
+            redact(url),
             self.clickhouse_database
         );
         Ok(Some(Analytics::start(client, site, geo, self.proxy_hops)))
+    }
+}
+
+/// `url` for the log, without credentials someone may have put in it.
+fn redact(url: &str) -> String {
+    match url::Url::parse(url) {
+        // `user:password@host` parses too, as a path after `user:`.
+        Ok(mut url) if url.has_host() => {
+            if !url.username().is_empty() || url.password().is_some() {
+                // Cannot fail: a URL with credentials has a host.
+                let _ = url.set_username("***");
+                let _ = url.set_password(None);
+            }
+            url.into()
+        }
+        _ => "an unparsable URL".to_owned(),
     }
 }
 
@@ -305,6 +322,17 @@ mod tests {
         assert_eq!(ip(Some("203.0.113.7"), 2), "127.0.0.1");
         assert_eq!(ip(None, 1), "127.0.0.1");
         assert_eq!(client_ip(None, None, 1), None);
+    }
+
+    #[test]
+    fn logged_urls_lose_credentials() {
+        assert_eq!(
+            redact("http://user:hunter2@clickhouse:8123/"),
+            "http://***@clickhouse:8123/"
+        );
+        assert_eq!(redact("http://:hunter2@clickhouse"), "http://***@clickhouse/");
+        assert_eq!(redact("http://127.0.0.1:8123"), "http://127.0.0.1:8123/");
+        assert_eq!(redact("user:hunter2@clickhouse"), "an unparsable URL");
     }
 
     #[test]
