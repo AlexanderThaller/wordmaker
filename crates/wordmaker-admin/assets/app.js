@@ -545,7 +545,7 @@ async function save() {
     updateDirty();
     if (ok) {
       loadPages();
-      toast(`Saved “${page.title}”`);
+      toast(`Saved “${savedContent(page).title}”`);
     }
     return false;
   }
