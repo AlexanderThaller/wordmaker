@@ -1,13 +1,13 @@
 = 010: Page-view fields have no length limit, allowing memory exhaustion
 :severity: Medium
 :area: Analytics
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Medium
 Area:: Analytics
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -41,3 +41,12 @@ and the sink buffer (`MAX_BUFFER`, 50,000) are capped by rows, not bytes.
   referrer 1 KB, utm/language 64–128 B).
 * Cap the buffer by bytes as well as rows.
 * Scale the insert timeout with batch size.
+
+== Resolution
+
+* `Analytics::record` cuts every field before queueing: path, slug, query
+  and referrer to 1 KiB, the user agent to 512 B and `Accept-Language` to
+  128 B (at a character boundary). UTM values are cut to 128 B.
+* The sink's buffer is capped at 64 MiB as well as 50,000 rows; the oldest
+  page views are dropped (and counted) first.
+* The insert timeout grows by a second per MiB written.

@@ -44,8 +44,13 @@ const BATCH: usize = 1000;
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 /// Page views kept while `ClickHouse` is unreachable; older ones are dropped.
 const MAX_BUFFER: usize = 50_000;
-/// Longest a single `ClickHouse` call may take.
+/// The same limit in bytes, for page views with long fields.
+const MAX_BUFFER_BYTES: usize = 64 << 20;
+/// Longest a single `ClickHouse` call may take; inserts get a second more
+/// per MiB they write.
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest kept UTM value.
+const MAX_UTM: usize = 128;
 /// How often the `GeoIP` databases are checked for a new version.
 const GEO_CHECK: Duration = Duration::from_secs(60);
 
@@ -124,6 +129,35 @@ pub struct PageView {
     pub visitor_id: u64,
 }
 
+impl PageView {
+    /// Roughly the memory the row takes up.
+    fn size(&self) -> usize {
+        let strings = [
+            &self.site,
+            &self.path,
+            &self.slug,
+            &self.referrer,
+            &self.referrer_host,
+            &self.utm_source,
+            &self.utm_medium,
+            &self.utm_campaign,
+            &self.user_agent,
+            &self.browser,
+            &self.browser_version,
+            &self.os,
+            &self.os_version,
+            &self.device,
+            &self.language,
+            &self.country_code,
+            &self.country,
+            &self.region,
+            &self.city,
+            &self.as_org,
+        ];
+        size_of::<Self>() + strings.iter().map(|s| s.len()).sum::<usize>()
+    }
+}
+
 #[derive(Debug)]
 pub struct Sink {
     client: clickhouse::Client,
@@ -134,6 +168,8 @@ pub struct Sink {
     dropped: Arc<AtomicU64>,
     salt: DailySalt,
     buffer: VecDeque<PageView>,
+    /// [`PageView::size`] of everything in `buffer`.
+    buffer_bytes: usize,
     table_ready: bool,
     healthy: bool,
 }
@@ -154,6 +190,7 @@ impl Sink {
             dropped,
             salt: DailySalt::default(),
             buffer: VecDeque::new(),
+            buffer_bytes: 0,
             table_ready: false,
             healthy: true,
         }
@@ -203,10 +240,15 @@ impl Sink {
     }
 
     fn push(&mut self, view: PageView) {
-        if self.buffer.len() >= MAX_BUFFER {
-            self.buffer.pop_front();
+        let size = view.size();
+        while self.buffer.len() >= MAX_BUFFER || self.buffer_bytes + size > MAX_BUFFER_BYTES {
+            let Some(oldest) = self.buffer.pop_front() else {
+                break;
+            };
+            self.buffer_bytes -= oldest.size();
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
+        self.buffer_bytes += size;
         self.buffer.push_back(view);
     }
 
@@ -233,6 +275,7 @@ impl Sink {
                     self.healthy = true;
                 }
                 self.buffer.clear();
+                self.buffer_bytes = 0;
                 true
             }
             Err(err) => {
@@ -268,7 +311,8 @@ impl Sink {
             }
             insert.end().await
         };
-        tokio::time::timeout(TIMEOUT, insert)
+        let mib = u64::try_from(self.buffer_bytes >> 20).unwrap_or(u64::MAX);
+        tokio::time::timeout(TIMEOUT + Duration::from_secs(mib), insert)
             .await
             .map_err(|_| anyhow::anyhow!("writing page views timed out"))??;
         Ok(())
@@ -292,14 +336,17 @@ impl Sink {
             u64::from_le_bytes(id)
         };
         let utm = |key: &str| {
-            hit.query
+            let mut value = hit
+                .query
                 .as_deref()
                 .and_then(|query| {
                     url::form_urlencoded::parse(query.as_bytes())
                         .find(|(name, _)| name == key)
                         .map(|(_, value)| value.into_owned())
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+            super::truncate(&mut value, MAX_UTM);
+            value
         };
         PageView {
             timestamp: hit.time,
@@ -442,6 +489,34 @@ mod tests {
         other.ip = Some("198.51.100.1".parse().unwrap());
         sink.salt.for_day(day1.date_naive());
         assert_ne!(sink.enrich(other).visitor_id, first);
+    }
+
+    #[test]
+    fn buffer_is_capped_in_bytes() {
+        let (mut sink, _) = sink(clickhouse::Client::default());
+        let mut view = sink.enrich(hit(Utc::now()));
+        view.user_agent = "x".repeat(1 << 20);
+        for _ in 0..100 {
+            sink.push(view.clone());
+        }
+        assert!(sink.buffer.len() < 64, "{}", sink.buffer.len());
+        assert!(sink.buffer_bytes <= MAX_BUFFER_BYTES);
+        assert_eq!(
+            sink.buffer_bytes,
+            sink.buffer.iter().map(PageView::size).sum::<usize>()
+        );
+        assert_eq!(
+            sink.dropped.load(Ordering::Relaxed),
+            100 - sink.buffer.len() as u64
+        );
+    }
+
+    #[test]
+    fn utm_values_are_truncated() {
+        let (mut sink, _) = sink(clickhouse::Client::default());
+        let mut long = hit(Utc::now());
+        long.query = Some(format!("utm_campaign={}", "c".repeat(500)));
+        assert_eq!(sink.enrich(long).utm_campaign.len(), MAX_UTM);
     }
 
     #[test]

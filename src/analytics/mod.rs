@@ -42,6 +42,14 @@ use crate::token::read_secret;
 /// Hits waiting for the sink; more are dropped rather than slowing requests.
 const QUEUE: usize = 10_000;
 
+/// Longest kept path (and slug), query and referrer, in bytes. Requests may
+/// carry far longer ones, and every hit is held in memory until written.
+const MAX_URL: usize = 1024;
+/// Longest kept user agent, in bytes.
+const MAX_USER_AGENT: usize = 512;
+/// Longest kept `Accept-Language`; only its first tag is used.
+const MAX_ACCEPT_LANGUAGE: usize = 128;
+
 /// Where to send page views; without a `ClickHouse` URL nothing is recorded.
 #[derive(clap::Args, Debug, Default)]
 pub struct AnalyticsArgs {
@@ -178,7 +186,7 @@ impl Analytics {
     /// Queues a hit without waiting; when the queue is full it is dropped
     /// and counted, and the sink reports the count.
     pub fn record(&self, hit: Hit) {
-        if let Err(mpsc::error::TrySendError::Full(_)) = self.queue.try_send(hit) {
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.queue.try_send(hit.truncated()) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -222,6 +230,30 @@ pub struct Hit {
     pub user_agent: String,
     pub referrer: String,
     pub accept_language: String,
+}
+
+impl Hit {
+    /// The hit with every field cut to its limit, so neither the queue nor
+    /// the sink's buffer can be filled with huge headers.
+    fn truncated(mut self) -> Self {
+        truncate(&mut self.path, MAX_URL);
+        truncate(&mut self.slug, MAX_URL);
+        if let Some(query) = &mut self.query {
+            truncate(query, MAX_URL);
+        }
+        truncate(&mut self.referrer, MAX_URL);
+        truncate(&mut self.user_agent, MAX_USER_AGENT);
+        truncate(&mut self.accept_language, MAX_ACCEPT_LANGUAGE);
+        self
+    }
+}
+
+/// Cuts `text` to at most `max` bytes, at a character boundary.
+pub(crate) fn truncate(text: &mut String, max: usize) {
+    if text.len() > max {
+        text.truncate(text.floor_char_boundary(max));
+        text.shrink_to_fit();
+    }
 }
 
 fn client_ip(
@@ -273,6 +305,32 @@ mod tests {
         assert_eq!(ip(Some("203.0.113.7"), 2), "127.0.0.1");
         assert_eq!(ip(None, 1), "127.0.0.1");
         assert_eq!(client_ip(None, None, 1), None);
+    }
+
+    #[test]
+    fn hits_are_truncated() {
+        let (analytics, mut hits) = Analytics::channel(1);
+        let long = "ä".repeat(100_000);
+        analytics.record(Hit {
+            time: Utc::now(),
+            ip: None,
+            path: format!("/{long}"),
+            query: Some(long.clone()),
+            slug: long.clone(),
+            status: 404,
+            duration: Duration::ZERO,
+            user_agent: long.clone(),
+            referrer: long.clone(),
+            accept_language: long,
+        });
+        let hit = hits.try_recv().unwrap();
+        assert_eq!(hit.path.len(), MAX_URL - 1, "cut before a split character");
+        assert!(hit.path.starts_with("/ä"));
+        assert_eq!(hit.slug.len(), MAX_URL);
+        assert_eq!(hit.query.unwrap().len(), MAX_URL);
+        assert_eq!(hit.referrer.len(), MAX_URL);
+        assert_eq!(hit.user_agent.len(), MAX_USER_AGENT);
+        assert_eq!(hit.accept_language.len(), MAX_ACCEPT_LANGUAGE);
     }
 
     #[test]
