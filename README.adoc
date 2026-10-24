@@ -16,6 +16,11 @@ export WORDMAKER_TOKEN=$(./target/release/wordmaker token)
 
 The site is now at http://127.0.0.1:3000.
 
+The token must be at least 32 characters long; `wordmaker token` prints a random one of 64.
+Wrong tokens are throttled: after 20 in a row from one address (one /64 for IPv6), `/api`, `/mcp` and the OAuth sign-in refuse to check further tokens from it, the right one included, and answer 429 until the allowance comes back at one try per second.
+OAuth access tokens on `/mcp` are still accepted meanwhile.
+Behind a reverse proxy all clients share the proxy's address and so share this allowance.
+
 === Configuration
 
 [cols="1,1,2"]
@@ -28,7 +33,7 @@ The site is now at http://127.0.0.1:3000.
 |`WORDMAKER_BASE_URL` |`http://127.0.0.1:3000` |Public URL, used for links returned by the API
 |`WORDMAKER_MAX_UPLOAD` |`26214400` |Largest upload in bytes
 |`WORDMAKER_BIND` |`127.0.0.1:3000` |Listen address (`serve` only)
-|`WORDMAKER_TOKEN` |– |Bearer token for `/api` and `/mcp` (required by `serve`, `client` and `wordmaker-admin`)
+|`WORDMAKER_TOKEN` |– |Bearer token for `/api` and `/mcp` (required by `serve`, `client` and `wordmaker-admin`); `serve` needs at least 32 characters
 |`WORDMAKER_TOKEN_FILE` |– |File holding the token instead, e.g. a systemd credential (`$CREDENTIALS_DIRECTORY/token`) or Docker secret; surrounding whitespace is ignored
 |`WORDMAKER_MCP_URL` |`$WORDMAKER_BASE_URL/mcp` |MCP endpoint (`client` only)
 |`WORDMAKER_ALLOWED_HOSTS` |– |Extra comma-separated `Host` values accepted by `/mcp`

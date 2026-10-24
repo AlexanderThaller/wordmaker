@@ -1,13 +1,18 @@
 use std::sync::Arc;
 
+use std::net::SocketAddr;
+
 use axum::{
+    Json,
     Router,
     extract::{
+        ConnectInfo,
         Request,
         State,
     },
     http::{
         HeaderMap,
+        StatusCode,
         header,
     },
     middleware::{
@@ -24,6 +29,7 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpService,
     session::local::LocalSessionManager,
 };
+use serde_json::json;
 use sqlx::SqlitePool;
 use subtle::ConstantTimeEq;
 use tower_http::{
@@ -41,6 +47,7 @@ use crate::{
     oauth,
     site,
     theme::ThemeCache,
+    token::Guesses,
 };
 
 #[derive(Clone)]
@@ -51,6 +58,8 @@ pub struct AppState {
     pub themes: Arc<ThemeCache>,
     pub images: Arc<Images>,
     pub oauth_clients: Arc<oauth::ClientCache>,
+    /// Wrong admin tokens, to throttle guessing.
+    pub guesses: Arc<Guesses>,
     /// Records page views; `None` when analytics is off.
     pub analytics: Option<Analytics>,
 }
@@ -109,15 +118,41 @@ fn is_admin_token(state: &AppState, presented: &str) -> bool {
     presented.as_bytes().ct_eq(state.token.as_bytes()).into()
 }
 
+/// The address the request came from, if the server knows it.
+pub fn peer(request: &Request) -> Option<std::net::IpAddr> {
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(peer)| peer.ip())
+}
+
+/// The answer while a client has presented too many wrong tokens.
+pub fn too_many_guesses() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, "60")],
+        Json(json!({ "error": "too many wrong tokens; try again later" })),
+    )
+        .into_response()
+}
+
 async fn require_token(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    match presented_token(request.headers()) {
-        Some(presented) if is_admin_token(&state, presented) => Ok(next.run(request).await),
-        _ => Err(AppError::Unauthorized),
+    let Some(presented) = presented_token(request.headers()) else {
+        return Err(AppError::Unauthorized);
+    };
+    let peer = peer(&request);
+    if !state.guesses.allowed(peer) {
+        return Ok(too_many_guesses());
     }
+    if is_admin_token(&state, presented) {
+        return Ok(next.run(request).await);
+    }
+    state.guesses.failed(peer);
+    Err(AppError::Unauthorized)
 }
 
 /// `/mcp` takes the admin token or an OAuth access token. Without either,
@@ -128,11 +163,21 @@ async fn require_mcp_auth(
     next: Next,
 ) -> Result<Response, AppError> {
     let presented = presented_token(request.headers()).map(str::to_owned);
-    if let Some(presented) = &presented
-        && (is_admin_token(&state, presented)
-            || oauth::access_token_valid(&state, presented).await?)
-    {
-        return Ok(next.run(request).await);
+    if let Some(presented) = &presented {
+        // OAuth access tokens are random and long, so they are checked
+        // even while wrong tokens are throttled; signed-in clients keep
+        // working when someone guesses at the admin token.
+        if oauth::access_token_valid(&state, presented).await? {
+            return Ok(next.run(request).await);
+        }
+        let peer = peer(&request);
+        if !state.guesses.allowed(peer) {
+            return Ok(too_many_guesses());
+        }
+        if is_admin_token(&state, presented) {
+            return Ok(next.run(request).await);
+        }
+        state.guesses.failed(peer);
     }
     let mut response = AppError::Unauthorized.into_response();
     response.headers_mut().insert(
@@ -183,6 +228,7 @@ mod tests {
             themes: Arc::default(),
             images: Arc::default(),
             oauth_clients: Arc::default(),
+            guesses: Arc::default(),
             analytics,
         };
         router(state, vec!["localhost".into()])
@@ -337,6 +383,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn wrong_tokens_are_throttled() {
+        let app = app().await;
+        let status = |path: &'static str, token: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::post(path)
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("host", "localhost")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+        // /api and /mcp share one allowance.
+        for i in 0..20 {
+            let path = if i % 2 == 0 { "/api/v1/pages" } else { "/mcp" };
+            assert_eq!(status(path, "wrong").await, StatusCode::UNAUTHORIZED);
+        }
+        // Now even the right token is not checked.
+        assert_eq!(
+            status("/api/v1/pages", "secret").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            status("/mcp", "secret").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 
     #[tokio::test]

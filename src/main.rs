@@ -106,12 +106,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Client(args) => client::run(&cli.config, args).await,
         Command::Geoip(args) => analytics::download::run(&args).await,
         Command::Token => {
-            let token = format!(
-                "{}{}",
-                uuid::Uuid::new_v4().simple(),
-                uuid::Uuid::new_v4().simple()
-            );
-            println!("{token}");
+            println!("{}", token::generate());
             Ok(())
         }
     }
@@ -121,6 +116,7 @@ async fn serve(config: Config, args: ServeArgs) -> anyhow::Result<()> {
     let token = args
         .token
         .require("; generate one with `wordmaker token`")?;
+    token::check_strength(&token)?;
     let bind = args
         .bind
         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 3000)));
@@ -141,6 +137,7 @@ async fn serve(config: Config, args: ServeArgs) -> anyhow::Result<()> {
         themes: Arc::default(),
         images: Arc::default(),
         oauth_clients: Arc::default(),
+        guesses: Arc::default(),
         analytics,
     };
     let router = app::router(state, allowed_hosts);

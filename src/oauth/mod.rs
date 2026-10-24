@@ -10,14 +10,19 @@
 mod client_metadata;
 mod store;
 
-use std::fmt::Write;
+use std::{
+    fmt::Write,
+    net::SocketAddr,
+};
 
 use axum::{
+    Extension,
     Form,
     Json,
     Router,
     body::Bytes,
     extract::{
+        ConnectInfo,
         Query,
         State,
     },
@@ -378,6 +383,7 @@ async fn authorize(
 
 async fn decide(
     State(state): State<AppState>,
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Form(form): Form<DecisionForm>,
 ) -> Response {
@@ -390,9 +396,21 @@ async fn decide(
     if form.decision.as_deref() != Some("approve") {
         return deny(&state, &request, &headers);
     }
+    let peer = connect.map(|Extension(ConnectInfo(peer))| peer.ip());
+    if !state.guesses.allowed(peer) {
+        let mut response = login_page(
+            &state,
+            &form.params,
+            &request,
+            Some("Too many wrong tokens. Wait a minute, then try again."),
+        )
+        .await;
+        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        return response;
+    }
     let presented = form.token.unwrap_or_default();
     if !bool::from(presented.trim().as_bytes().ct_eq(state.token.as_bytes())) {
-        // Slows down guessing; the token itself is long enough not to be.
+        state.guesses.failed(peer);
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let mut response = login_page(
             &state,
@@ -947,6 +965,10 @@ mod tests {
     const REDIRECT: &str = "https://claude.ai/api/mcp/auth_callback";
 
     async fn app() -> Router {
+        app_with(Arc::default()).await
+    }
+
+    async fn app_with(guesses: Arc<crate::token::Guesses>) -> Router {
         let config = Config {
             database_url: String::new(),
             media_dir: std::env::temp_dir().join("wordmaker-oauth-test"),
@@ -961,6 +983,7 @@ mod tests {
             themes: Arc::default(),
             images: Arc::default(),
             oauth_clients: Arc::default(),
+            guesses,
             analytics: None,
         };
         crate::app::router(state, vec!["site.example".into()])
@@ -1301,6 +1324,37 @@ mod tests {
         );
         let reply = refresh_with(&app, &client_id, &refresh).await;
         assert_eq!(reply.json()["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn sign_in_is_throttled_after_wrong_tokens() {
+        let guesses = Arc::new(crate::token::Guesses::default());
+        let app = app_with(guesses.clone()).await;
+        let client_id = register_client(&app).await;
+        let (access, _) = tokens(&app, &client_id).await;
+        // Wrong tokens elsewhere, e.g. on /api, count here too.
+        for _ in 0..20 {
+            guesses.failed(None);
+        }
+        // Signed-in clients are not locked out, but the admin token is no
+        // longer checked.
+        assert_eq!(mcp_status(&app, &access).await.status, StatusCode::OK);
+        assert_eq!(
+            mcp_status(&app, "admin-secret").await.status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let mut form = authorize_params(&client_id);
+        form.push(("token", "admin-secret".into()));
+        form.push(("decision", "approve".into()));
+        let pairs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let reply = post_form(&app, "/oauth/authorize", &pairs).await;
+        assert_eq!(reply.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(!reply.headers.contains_key(header::LOCATION));
+        assert!(
+            reply.body.contains("Too many wrong tokens"),
+            "{}",
+            reply.body
+        );
     }
 
     #[tokio::test]
