@@ -329,7 +329,7 @@ pub async fn write_file(
     if extension.as_deref() == Some("json") {
         let json: Value = serde_json::from_str(&content)
             .map_err(|err| AppError::BadRequest(format!("{path} is not valid JSON: {err}")))?;
-        if path == "theme.json" && !json.is_object() {
+        if is_theme_json(path) && !json.is_object() {
             return Err(AppError::BadRequest("theme.json must be an object".into()));
         }
     }
@@ -359,6 +359,17 @@ pub async fn write_file(
         })
     })
     .await
+}
+
+/// Whether `path` names the theme's own `theme.json`, also as `theme.json/`
+/// or in another case, which is the same file on macOS and Windows.
+fn is_theme_json(path: &str) -> bool {
+    let mut components = Path::new(path).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(name)), None)
+            if name.to_str().is_some_and(|name| name.to_lowercase() == "theme.json")
+    )
 }
 
 fn existing_theme_dir(themes_dir: &Path, slug: &str) -> AppResult<PathBuf> {
@@ -918,6 +929,16 @@ mod tests {
         let dir = themes_dir.join(slug);
         std::fs::create_dir_all(dir.join("styles")).unwrap();
         std::fs::write(dir.join("theme.json"), theme_json).unwrap();
+    }
+
+    #[test]
+    fn theme_json_in_any_spelling() {
+        for path in ["theme.json", "THEME.JSON", "Theme.Json", "theme.json/"] {
+            assert!(is_theme_json(path), "{path}");
+        }
+        for path in ["styles/theme.json", "theme.json5", "xtheme.json"] {
+            assert!(!is_theme_json(path), "{path}");
+        }
     }
 
     #[test]
