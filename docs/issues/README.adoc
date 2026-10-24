@@ -6,64 +6,64 @@ The threat model: anyone holding the API token or an OAuth grant can already
 publish raw HTML, so the issues that matter come from third-party themes,
 prompt-injected MCP clients and anonymous visitors.
 
-[cols="1,1,2,6"]
+[cols="1,1,2,6,1"]
 |===
-|# |Severity |Area |Issue
+|# |Severity |Area |Issue |Status
 
-|001 |High |Site rendering / themes |link:001-style-breakout-xss.adoc[Theme CSS can break out of the inline <style> element]
-|002 |High |wordmaker-admin |link:002-admin-origin-active-content.adoc[Admin proxy serves script-capable upstream files on the admin origin]
-|003 |High |Themes |link:003-stylesheet-exponential-blowup.adoc[Nested block styles make the stylesheet grow exponentially]
-|004 |Medium |Themes |link:004-luminance-panic-crash-loop.adoc[Non-ASCII colour value panics and, under panic=abort, crash-loops the server]
-|005 |Medium |Media / themes |link:005-media-active-content-site-origin.adoc[Uploaded HTML/SVG and theme SVGs are served inline on the site origin]
-|006 |Medium |Themes |link:006-install-theme-ssrf.adoc[install_theme from a URL allows SSRF into the internal network]
-|007 |Medium |wordmaker-admin |link:007-admin-proxy-path-traversal.adoc[Admin proxy forwards dot segments, sending the token to any upstream path]
-|008 |Medium |OAuth |link:008-oauth-preconsent-open-redirect.adoc[Anonymous open redirect through /oauth/authorize, including custom schemes]
-|009 |Medium |OAuth / wordmaker-admin |link:009-unbounded-tables-lockout.adoc[Anonymous requests can fill fixed-size tables and lock out DCR and admin sign-in]
-|010 |Medium |Analytics |link:010-page-view-fields-unbounded.adoc[Page-view fields have no length limit, allowing memory exhaustion]
-|011 |Medium |Media |link:011-image-variant-redecode.adoc[Image variants wider than the original re-decode the full image every time]
-|012 |Medium |OAuth |link:012-refresh-token-reuse.adoc[Refresh token reuse is not detected and refresh is not atomic]
-|013 |Medium |MCP / analytics |link:013-shutdown-hangs-mcp-stream.adoc[Graceful shutdown hangs while an MCP client is connected]
-|014 |Medium |wordmaker-admin UI |link:014-admin-save-race.adoc[Switching pages during a save can write one page's content into another]
-|015 |Low |Pages |link:015-update-lost-on-publish.adoc[Live edits made while a draft is pending are reverted by the next publish]
-|016 |Low |Database |link:016-sqlite-deferred-begin.adoc[Read-then-write transactions fail with "database is locked" under concurrency]
-|017 |Low |API |link:017-internal-errors-leak.adoc[5xx responses expose raw database, IO and ClickHouse error text]
-|018 |Low |Analytics |link:018-xff-trusted-by-default.adoc[Client IP is spoofable through X-Forwarded-For by default]
-|019 |Low |Grafana |link:019-grafana-database-variable-sqli.adoc[Grafana dashboard variable allows SQL injection by viewers]
-|020 |Low |wordmaker-admin UI |link:020-not-found-list-phishing-link.adoc[404 list in the admin dashboard can link to another host]
-|021 |Low |Media |link:021-media-name-collision-delete.adoc[A colliding upload name overwrites and then deletes the existing file]
-|022 |Low |OAuth |link:022-oauth-page-stray-backslash.adoc[OAuth sign-in page shows a stray backslash and "n"]
-|023 |Low |wordmaker-admin |link:023-admin-proxy-no-timeout.adoc[Admin proxy's upstream client has no timeout]
-|024 |Low |Analytics |link:024-geoip-download-hardening.adoc[wordmaker geoip download lacks timeouts, size limits and durability]
-|025 |Low |CLI client |link:025-cli-client-robustness.adoc[wordmaker client: broken-pipe panic, unbounded $ref recursion, plain-HTTP token]
-|026 |Low |Supply chain |link:026-vendor-scripts-unpinned.adoc[Vendor update scripts install unpinned, unverified code]
-|027 |Low |OAuth |link:027-is-public-ipv6-gaps.adoc[is_public misses IPv6 ranges that embed IPv4 or are not public]
-|028 |Low |OAuth |link:028-cimd-proxy-bypass.adoc[Client metadata fetches honour HTTPS_PROXY, bypassing DNS pinning]
-|029 |Low |Auth |link:029-token-guessing-not-throttled.adoc[Wrong-token delay does not limit guessing; /api and /mcp have no delay]
-|030 |Low |OAuth |link:030-cimd-fetch-amplification.adoc[Anonymous client metadata fetches: no negative cache, full cache stops caching]
-|031 |Low |OAuth |link:031-auth-code-replay-no-revoke.adoc[Replayed authorization codes do not revoke tokens issued from them]
-|032 |Low |Themes |link:032-missing-variation-drops-theme.adoc[One missing style variation makes the whole theme fall back to the default]
-|033 |Low |Themes |link:033-theme-asset-immutable-any-stamp.adoc[Theme assets are cached as immutable for any stamp, and stamps are predictable]
-|034 |Low |Themes |link:034-theme-mutation-races.adoc[Theme install, delete and write are not atomic and race each other]
-|035 |Low |Themes |link:035-theme-json-case-check.adoc[theme.json object check is a raw string comparison]
-|036 |Low |Themes |link:036-zip-central-directory-dos.adoc[Zips with millions of entries are fully scanned before the file limit applies]
-|037 |Low |Settings / site |link:037-home-slug-not-synced.adoc[home_slug is not kept in step with page renames and deletes]
-|038 |Low |Site rendering |link:038-no-render-cache.adoc[Every public request re-renders AsciiDoc and the footer]
-|039 |Low |Site |link:039-public-site-security-headers.adoc[Public site sends no security headers]
-|040 |Low |Build |link:040-panic-abort-hardening.adoc[panic = "abort" turns any request-path panic into an outage]
-|041 |Low |wordmaker-admin UI |link:041-admin-editor-null-draft-overwrite.adoc[Saving while the editor is not loaded overwrites the draft with the published body]
-|042 |Low |wordmaker-admin UI |link:042-admin-revision-wrong-page.adoc[A revision that loads after a page switch is shown on the wrong page]
-|043 |Low |wordmaker-admin UI |link:043-admin-open-page-out-of-order.adoc[Two quick page clicks can show the wrong page]
-|044 |Low |wordmaker-admin |link:044-admin-cookie-prefix.adoc[Admin cookies lack the __Host- prefix]
-|045 |Low |wordmaker-admin UI |link:045-admin-snippet-attribute-injection.adoc[Copied image snippets can carry attributes from the uploaded filename]
-|046 |Low |Analytics |link:046-analytics-duplicate-insert.adoc[Page views can be written twice after an insert timeout]
-|047 |Low |Analytics |link:047-visitor-salt-midnight.adoc[Visitor salt is regenerated repeatedly around midnight]
-|048 |Low |Analytics |link:048-clickhouse-url-logged.adoc[ClickHouse URL is logged in full, possibly with credentials]
-|049 |Low |Analytics |link:049-report-queries-not-cancelled.adoc[Timed-out report queries keep running in ClickHouse]
-|050 |Low |Analytics / privacy |link:050-full-referrer-stored.adoc[Full Referer URLs, including query strings, are stored]
-|051 |Low |Analytics |link:051-geoip-reload-mtime-size.adoc[GeoIP reload only compares mtime and size]
-|052 |Low |MCP |link:052-mcp-body-limit.adoc[MCP accepts bodies of twice the upload limit for every tool; base64 strictness]
-|053 |Low |Themes |link:053-theme-minor-robustness.adoc[Minor theme robustness issues]
-|054 |Low |wordmaker-admin |link:054-admin-minor-issues.adoc[Minor admin UI issues]
-|055 |Info |OAuth |link:055-token-endpoint-details.adoc[Token endpoint details]
-|056 |Info |Config |link:056-base-url-hosts-parsing.adoc[base_url_hosts parses the base URL by hand]
+|001 |High |Site rendering / themes |link:001-style-breakout-xss.adoc[Theme CSS can break out of the inline <style> element] |Fixed
+|002 |High |wordmaker-admin |link:002-admin-origin-active-content.adoc[Admin proxy serves script-capable upstream files on the admin origin] |Fixed
+|003 |High |Themes |link:003-stylesheet-exponential-blowup.adoc[Nested block styles make the stylesheet grow exponentially] |Fixed
+|004 |Medium |Themes |link:004-luminance-panic-crash-loop.adoc[Non-ASCII colour value panics and, under panic=abort, crash-loops the server] |Fixed
+|005 |Medium |Media / themes |link:005-media-active-content-site-origin.adoc[Uploaded HTML/SVG and theme SVGs are served inline on the site origin] |Fixed
+|006 |Medium |Themes |link:006-install-theme-ssrf.adoc[install_theme from a URL allows SSRF into the internal network] |Fixed
+|007 |Medium |wordmaker-admin |link:007-admin-proxy-path-traversal.adoc[Admin proxy forwards dot segments, sending the token to any upstream path] |Fixed
+|008 |Medium |OAuth |link:008-oauth-preconsent-open-redirect.adoc[Anonymous open redirect through /oauth/authorize, including custom schemes] |Fixed
+|009 |Medium |OAuth / wordmaker-admin |link:009-unbounded-tables-lockout.adoc[Anonymous requests can fill fixed-size tables and lock out DCR and admin sign-in] |Fixed
+|010 |Medium |Analytics |link:010-page-view-fields-unbounded.adoc[Page-view fields have no length limit, allowing memory exhaustion] |Fixed
+|011 |Medium |Media |link:011-image-variant-redecode.adoc[Image variants wider than the original re-decode the full image every time] |Fixed
+|012 |Medium |OAuth |link:012-refresh-token-reuse.adoc[Refresh token reuse is not detected and refresh is not atomic] |Fixed
+|013 |Medium |MCP / analytics |link:013-shutdown-hangs-mcp-stream.adoc[Graceful shutdown hangs while an MCP client is connected] |Fixed
+|014 |Medium |wordmaker-admin UI |link:014-admin-save-race.adoc[Switching pages during a save can write one page's content into another] |Fixed
+|015 |Low |Pages |link:015-update-lost-on-publish.adoc[Live edits made while a draft is pending are reverted by the next publish] |Fixed
+|016 |Low |Database |link:016-sqlite-deferred-begin.adoc[Read-then-write transactions fail with "database is locked" under concurrency] |Fixed
+|017 |Low |API |link:017-internal-errors-leak.adoc[5xx responses expose raw database, IO and ClickHouse error text] |Fixed
+|018 |Low |Analytics |link:018-xff-trusted-by-default.adoc[Client IP is spoofable through X-Forwarded-For by default] |Fixed
+|019 |Low |Grafana |link:019-grafana-database-variable-sqli.adoc[Grafana dashboard variable allows SQL injection by viewers] |Fixed
+|020 |Low |wordmaker-admin UI |link:020-not-found-list-phishing-link.adoc[404 list in the admin dashboard can link to another host] |Fixed
+|021 |Low |Media |link:021-media-name-collision-delete.adoc[A colliding upload name overwrites and then deletes the existing file] |Fixed
+|022 |Low |OAuth |link:022-oauth-page-stray-backslash.adoc[OAuth sign-in page shows a stray backslash and "n"] |Fixed
+|023 |Low |wordmaker-admin |link:023-admin-proxy-no-timeout.adoc[Admin proxy's upstream client has no timeout] |Fixed
+|024 |Low |Analytics |link:024-geoip-download-hardening.adoc[wordmaker geoip download lacks timeouts, size limits and durability] |Fixed
+|025 |Low |CLI client |link:025-cli-client-robustness.adoc[wordmaker client: broken-pipe panic, unbounded $ref recursion, plain-HTTP token] |Fixed
+|026 |Low |Supply chain |link:026-vendor-scripts-unpinned.adoc[Vendor update scripts install unpinned, unverified code] |Fixed
+|027 |Low |OAuth |link:027-is-public-ipv6-gaps.adoc[is_public misses IPv6 ranges that embed IPv4 or are not public] |Fixed
+|028 |Low |OAuth |link:028-cimd-proxy-bypass.adoc[Client metadata fetches honour HTTPS_PROXY, bypassing DNS pinning] |Fixed
+|029 |Low |Auth |link:029-token-guessing-not-throttled.adoc[Wrong-token delay does not limit guessing; /api and /mcp have no delay] |Fixed
+|030 |Low |OAuth |link:030-cimd-fetch-amplification.adoc[Anonymous client metadata fetches: no negative cache, full cache stops caching] |Fixed
+|031 |Low |OAuth |link:031-auth-code-replay-no-revoke.adoc[Replayed authorization codes do not revoke tokens issued from them] |Fixed
+|032 |Low |Themes |link:032-missing-variation-drops-theme.adoc[One missing style variation makes the whole theme fall back to the default] |Fixed
+|033 |Low |Themes |link:033-theme-asset-immutable-any-stamp.adoc[Theme assets are cached as immutable for any stamp, and stamps are predictable] |Fixed
+|034 |Low |Themes |link:034-theme-mutation-races.adoc[Theme install, delete and write are not atomic and race each other] |Fixed
+|035 |Low |Themes |link:035-theme-json-case-check.adoc[theme.json object check is a raw string comparison] |Fixed
+|036 |Low |Themes |link:036-zip-central-directory-dos.adoc[Zips with millions of entries are fully scanned before the file limit applies] |Fixed
+|037 |Low |Settings / site |link:037-home-slug-not-synced.adoc[home_slug is not kept in step with page renames and deletes] |Fixed
+|038 |Low |Site rendering |link:038-no-render-cache.adoc[Every public request re-renders AsciiDoc and the footer] |Fixed
+|039 |Low |Site |link:039-public-site-security-headers.adoc[Public site sends no security headers] |Fixed
+|040 |Low |Build |link:040-panic-abort-hardening.adoc[panic = "abort" turns any request-path panic into an outage] |Fixed
+|041 |Low |wordmaker-admin UI |link:041-admin-editor-null-draft-overwrite.adoc[Saving while the editor is not loaded overwrites the draft with the published body] |Fixed
+|042 |Low |wordmaker-admin UI |link:042-admin-revision-wrong-page.adoc[A revision that loads after a page switch is shown on the wrong page] |Fixed
+|043 |Low |wordmaker-admin UI |link:043-admin-open-page-out-of-order.adoc[Two quick page clicks can show the wrong page] |Fixed
+|044 |Low |wordmaker-admin |link:044-admin-cookie-prefix.adoc[Admin cookies lack the __Host- prefix] |Fixed
+|045 |Low |wordmaker-admin UI |link:045-admin-snippet-attribute-injection.adoc[Copied image snippets can carry attributes from the uploaded filename] |Fixed
+|046 |Low |Analytics |link:046-analytics-duplicate-insert.adoc[Page views can be written twice after an insert timeout] |Fixed
+|047 |Low |Analytics |link:047-visitor-salt-midnight.adoc[Visitor salt is regenerated repeatedly around midnight] |Fixed
+|048 |Low |Analytics |link:048-clickhouse-url-logged.adoc[ClickHouse URL is logged in full, possibly with credentials] |Fixed
+|049 |Low |Analytics |link:049-report-queries-not-cancelled.adoc[Timed-out report queries keep running in ClickHouse] |Fixed
+|050 |Low |Analytics / privacy |link:050-full-referrer-stored.adoc[Full Referer URLs, including query strings, are stored] |Fixed
+|051 |Low |Analytics |link:051-geoip-reload-mtime-size.adoc[GeoIP reload only compares mtime and size] |Fixed
+|052 |Low |MCP |link:052-mcp-body-limit.adoc[MCP accepts bodies of twice the upload limit for every tool; base64 strictness] |Fixed
+|053 |Low |Themes |link:053-theme-minor-robustness.adoc[Minor theme robustness issues] |Fixed
+|054 |Low |wordmaker-admin |link:054-admin-minor-issues.adoc[Minor admin UI issues] |Fixed
+|055 |Info |OAuth |link:055-token-endpoint-details.adoc[Token endpoint details] |Fixed
+|056 |Info |Config |link:056-base-url-hosts-parsing.adoc[base_url_hosts parses the base URL by hand] |Fixed
 |===
