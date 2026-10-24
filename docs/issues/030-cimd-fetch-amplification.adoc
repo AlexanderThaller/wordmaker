@@ -44,3 +44,9 @@ valid entries fill the cache nothing new is cached.
 No per-IP limit was added: the server does not reliably know the client
 address behind a proxy (see 018). The concurrency cap bounds the
 amplification instead.
+
+Requests beyond the 8 concurrent fetches wait their turn, first come first
+served, for up to one fetch timeout instead of being refused at once, so
+holding every slot with slow fetches delays a real client rather than
+turning it away. When the cache is full, failures are evicted before
+verified clients.

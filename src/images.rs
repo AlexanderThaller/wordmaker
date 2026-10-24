@@ -10,7 +10,13 @@ use std::{
         PathBuf,
     },
     rc::Rc,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{
+            AtomicU64,
+            Ordering,
+        },
+    },
 };
 
 use image::{
@@ -123,6 +129,9 @@ const JPEG_QUALITY: u8 = 80;
 pub struct Images {
     sizes: Mutex<HashMap<String, Option<Size>>>,
     scaling: Semaphore,
+    /// Counts changes to what [`Images::rewrite`] makes of a page, so that
+    /// rendered pages kept elsewhere can tell they are out of date.
+    generation: AtomicU64,
 }
 
 impl Default for Images {
@@ -130,6 +139,7 @@ impl Default for Images {
         Self {
             sizes: Mutex::default(),
             scaling: Semaphore::new(2),
+            generation: AtomicU64::new(0),
         }
     }
 }
@@ -180,9 +190,18 @@ impl Images {
     /// Stops offering and attempting scaled copies of an image that could
     /// not be decoded.
     fn mark_unscalable(&self, filename: &str) {
-        if let Some(Some(size)) = self.sizes().get_mut(filename) {
+        if let Some(Some(size)) = self.sizes().get_mut(filename)
+            && size.scalable
+        {
             size.scalable = false;
+            self.generation.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Changes whenever a page rewritten before would now come out
+    /// differently.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     /// Add size, `srcset` and loading hints to the `<img>` elements of a
@@ -297,7 +316,9 @@ impl Images {
             Ok(Ok(true)) => Some(target),
             Ok(Ok(false)) => Some(source),
             Ok(Err(err)) => {
-                if source.is_file() {
+                // A broken image stays broken; a full disk or the like may
+                // not, so trying again later is fine.
+                if source.is_file() && !transient(&err) {
                     tracing::warn!(error = %err, filename, width, "could not scale image");
                     self.mark_unscalable(filename);
                 }
@@ -309,6 +330,12 @@ impl Images {
             }
         }
     }
+}
+
+/// Whether scaling failed for a reason other than the image itself.
+fn transient(err: &image::ImageError) -> bool {
+    matches!(err, image::ImageError::IoError(io)
+        if !matches!(io.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData))
 }
 
 /// Remove the scaled copies of a deleted file.
@@ -585,5 +612,34 @@ mod tests {
         let html = images.rewrite(r#"<img src="/media/broken.png">"#, &dir, Layout::default());
         assert!(!html.contains("srcset"), "{html}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn marking_an_image_unscalable_dates_rendered_pages() {
+        let images = Images::default();
+        images.sizes().insert(
+            "photo.jpg".into(),
+            Some(Size {
+                width: 3000,
+                height: 2000,
+                scalable: true,
+            }),
+        );
+        let before = images.generation();
+        images.mark_unscalable("photo.jpg");
+        assert_ne!(images.generation(), before);
+        let after = images.generation();
+        images.mark_unscalable("photo.jpg");
+        assert_eq!(images.generation(), after);
+    }
+
+    #[test]
+    fn only_problems_with_the_image_make_it_unscalable() {
+        let io = |kind| image::ImageError::IoError(std::io::Error::from(kind));
+        assert!(transient(&io(std::io::ErrorKind::StorageFull)));
+        assert!(!transient(&io(std::io::ErrorKind::UnexpectedEof)));
+        assert!(!transient(&image::ImageError::Limits(
+            image::error::LimitError::from_kind(image::error::LimitErrorKind::DimensionError)
+        )));
     }
 }

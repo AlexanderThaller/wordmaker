@@ -48,3 +48,8 @@ recently used entry, and skips any single entry over 8 MiB.
 A page URL now looks the page up before building the frame, so a 404
 costs one query. `/` reads the settings once and reuses them for the
 frame.
+
+The page key also includes a generation counter from `Images`, bumped when
+an image turns out not to be scalable, so cached pages stop offering its
+`srcset`. Only problems with the image itself mark it so; I/O failures
+such as a full disk do not.

@@ -31,8 +31,10 @@ const CACHE_TTL: Duration = Duration::from_mins(10);
 const FAILURE_TTL: Duration = Duration::from_mins(1);
 const CACHE_ENTRIES: usize = 256;
 /// Fetches are started by anonymous requests; this bounds how many run at
-/// once.
-const CONCURRENT_FETCHES: usize = 4;
+/// once. Others wait their turn, first come first served, for as long as
+/// one fetch may take: someone holding every slot with slow fetches then
+/// delays a real client by one fetch, rather than turning it away.
+const CONCURRENT_FETCHES: usize = 8;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Metadata documents are small; anything larger is not one.
 const MAX_DOCUMENT_BYTES: usize = 16 * 1024;
@@ -91,7 +93,8 @@ impl ClientCache {
         {
             return result.clone();
         }
-        let Ok(_permit) = self.fetching.try_acquire() else {
+        let Ok(Ok(_permit)) = tokio::time::timeout(FETCH_TIMEOUT, self.fetching.acquire()).await
+        else {
             return Err("too many clients are being verified right now; try again".into());
         };
         let result = fetch(client_id).await.map(Arc::new);
@@ -100,7 +103,8 @@ impl ClientCache {
     }
 
     /// Remember `result`, making room by dropping expired entries and then
-    /// the oldest one.
+    /// the oldest one, failures first: anyone can add those, by naming
+    /// documents that do not exist, and they must not push out real clients.
     fn insert(&self, client_id: &str, result: Fetched) {
         let mut entries = self.lock();
         entries.retain(|_, (fetched, result)| still_valid(*fetched, result));
@@ -108,7 +112,7 @@ impl ClientCache {
             && !entries.contains_key(client_id)
             && let Some(oldest) = entries
                 .iter()
-                .min_by_key(|(_, (fetched, _))| *fetched)
+                .min_by_key(|(_, (fetched, result))| (result.is_ok(), *fetched))
                 .map(|(id, _)| id.clone())
         {
             entries.remove(&oldest);
@@ -480,5 +484,29 @@ mod tests {
         assert_eq!(entries.len(), CACHE_ENTRIES);
         assert!(entries.contains_key("https://new.example/c.json"));
         assert!(!entries.contains_key("https://c0.example/c.json"));
+    }
+
+    #[test]
+    fn failures_do_not_push_out_verified_clients() {
+        let cache = ClientCache::default();
+        let real = "https://real.example/c.json";
+        cache.insert(
+            real,
+            Ok(Arc::new(ClientInfo {
+                client_id: real.into(),
+                client_name: None,
+                redirect_uris: vec!["https://real.example/cb".into()],
+                verified: true,
+            })),
+        );
+        for i in 0..CACHE_ENTRIES * 2 {
+            cache.insert(&format!("https://c{i}.example/c.json"), Err("x".into()));
+        }
+        assert!(
+            cache
+                .lock()
+                .get(real)
+                .is_some_and(|(_, result)| result.is_ok())
+        );
     }
 }

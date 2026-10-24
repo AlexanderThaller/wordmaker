@@ -96,10 +96,13 @@ impl Guesses {
                 .get(&key)
                 .map_or(0.0, |&(failures, since)| decayed(failures, since, now))
         };
-        // Room for one more wrong token is needed. The shared allowance
-        // counts for everyone once it is in use.
+        // Room for one more wrong token is needed. Addresses that are not
+        // tracked, once too many are, share one allowance; the ones that
+        // are keep their own, so filling the shared one locks out nobody
+        // else.
         let room = |key| used(key) + 1.0 <= GUESS_BURST;
-        room(client_key(peer)) && room(None)
+        let key = client_key(peer);
+        room(key) && (clients.contains_key(&key) || room(None))
     }
 
     fn failed_at(&self, peer: Option<IpAddr>, now: Instant) {
@@ -233,6 +236,23 @@ mod tests {
         }
         assert!(!guesses.allowed_at(b, start));
         assert!(guesses.allowed_at(Some("2001:db8:1:3::1".parse().unwrap()), start));
+    }
+
+    #[test]
+    fn too_many_addresses_share_an_allowance_without_locking_out_others() {
+        let guesses = Guesses::default();
+        let start = Instant::now();
+        let known: Option<IpAddr> = Some("203.0.113.1".parse().unwrap());
+        guesses.failed_at(known, start);
+        // Someone with a whole IPv6 prefix fills the table, then the shared
+        // allowance.
+        for n in 0..GUESS_CLIENTS as u128 + 20 {
+            let ip = std::net::Ipv6Addr::from(0x2001_0db8_u128 << 96 | n << 64);
+            guesses.failed_at(Some(IpAddr::V6(ip)), start);
+        }
+        let new: Option<IpAddr> = Some("198.51.100.1".parse().unwrap());
+        assert!(!guesses.allowed_at(new, start));
+        assert!(guesses.allowed_at(known, start));
     }
 
     #[test]

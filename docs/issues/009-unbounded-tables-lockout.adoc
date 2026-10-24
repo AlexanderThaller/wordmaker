@@ -62,3 +62,8 @@ login cookie, HMAC-SHA256-signed together with the `state` under a key made
 at start-up. The callback checks the MAC and the 10-minute lifetime and
 uses the provider as currently discovered. Any number of anonymous
 `/auth/login` requests therefore fill nothing and cannot lock anyone out.
+
+Clients registered in the last 15 minutes never make way: their user may
+still be on the sign-in page. Registrations that find only such clients
+are refused, so a burst of anonymous registrations cannot push out a
+client in the middle of signing in.

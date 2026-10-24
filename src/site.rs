@@ -290,6 +290,7 @@ async fn render_page(
         b"page",
         &layout_widths.content.to_le_bytes(),
         &layout_widths.wide.to_le_bytes(),
+        &state.images.generation().to_le_bytes(),
         page.body.as_bytes(),
     ]);
     let html = state

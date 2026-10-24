@@ -203,21 +203,33 @@ async fn require_mcp_auth(
         if oauth::access_token_valid(&state, presented).await? {
             return Ok(next.run(request).await);
         }
+        // An expired or revoked OAuth token lands here too. Its client only
+        // signs in again on a 401 with a challenge, so a throttled client
+        // gets that rather than a 429, without its token being checked.
         let peer = guesser(&state, &request);
         if !state.guesses.allowed(peer) {
-            return Ok(too_many_guesses());
+            let mut response = unauthorized(&state, true);
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+            return Ok(response);
         }
         if is_admin_token(&state, presented) {
             return Ok(next.run(request).await);
         }
         state.guesses.failed(peer);
     }
+    Ok(unauthorized(&state, presented.is_some()))
+}
+
+/// A 401 that tells MCP clients where to find out how to sign in.
+fn unauthorized(state: &AppState, presented: bool) -> Response {
     let mut response = AppError::Unauthorized.into_response();
     response.headers_mut().insert(
         header::WWW_AUTHENTICATE,
-        oauth::challenge(&state.config, presented.is_some()),
+        oauth::challenge(&state.config, presented),
     );
-    Ok(response)
+    response
 }
 
 #[cfg(test)]
@@ -533,10 +545,8 @@ mod tests {
             status("/api/v1/pages", "secret").await,
             StatusCode::TOO_MANY_REQUESTS
         );
-        assert_eq!(
-            status("/mcp", "secret").await,
-            StatusCode::TOO_MANY_REQUESTS
-        );
+        // MCP clients only sign in again on a 401 with a challenge.
+        assert_eq!(status("/mcp", "secret").await, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

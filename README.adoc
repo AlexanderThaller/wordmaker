@@ -17,9 +17,9 @@ export WORDMAKER_TOKEN=$(./target/release/wordmaker token)
 The site is now at http://127.0.0.1:3000.
 
 The token must be at least 32 characters long; `wordmaker token` prints a random one of 64.
-Wrong tokens are throttled: after 20 in a row from one address (one /64 for IPv6; behind a reverse proxy, the client's address from `X-Forwarded-For` as for analytics, see `WORDMAKER_PROXY_HOPS`), `/api`, `/mcp` and the OAuth sign-in refuse to check further tokens from it, the right one included, and answer 429 until the allowance comes back at one try per second.
+Wrong tokens are throttled: after 20 in a row from one address (one /64 for IPv6; behind a reverse proxy, the client's address from `X-Forwarded-For` as for analytics, see `WORDMAKER_PROXY_HOPS`), `/api`, `/mcp` and the OAuth sign-in refuse to check further tokens from it, the right one included, until the allowance comes back at one try per second.
+`/api` and the sign-in answer 429; `/mcp` answers 401 with its sign-in challenge, since MCP clients only sign in again on that.
 OAuth access tokens on `/mcp` are still accepted meanwhile.
-Behind a reverse proxy all clients share the proxy's address and so share this allowance.
 
 === Configuration
 

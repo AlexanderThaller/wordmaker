@@ -22,12 +22,15 @@ pub struct RegisteredClient {
 /// Register `client`, keeping at most `max` clients. Unused clients (that
 /// never got tokens and have no sign-in under way) registered before
 /// `stale` are dropped; if there is still no room, the oldest unused ones
-/// make way. Returns false when every client is in use.
+/// registered before `fresh` make way. Newer ones may be waiting for their
+/// user to approve, so they are never pushed out by registrations that
+/// follow. Returns false when no client can make way.
 pub async fn insert_client(
     pool: &SqlitePool,
     client: &RegisteredClient,
     max: i64,
     stale: DateTime<Utc>,
+    fresh: DateTime<Utc>,
 ) -> AppResult<bool> {
     // Starting with a write takes the database's write lock, so the count
     // below cannot change before the insert.
@@ -47,11 +50,12 @@ pub async fn insert_client(
         sqlx::query(
             "DELETE FROM oauth_clients WHERE client_id IN
                  (SELECT client_id FROM oauth_clients
-                  WHERE used_at IS NULL AND NOT EXISTS
+                  WHERE used_at IS NULL AND created_at < ? AND NOT EXISTS
                       (SELECT 1 FROM oauth_codes
                        WHERE oauth_codes.client_id = oauth_clients.client_id)
                   ORDER BY created_at LIMIT ?)",
         )
+        .bind(fresh)
         .bind(count - max + 1)
         .execute(&mut *tx)
         .await?;
@@ -356,16 +360,17 @@ mod tests {
     async fn registration_makes_room_from_unused_clients() {
         let pool = crate::db::connect_memory().await;
         let long_ago = Utc::now() - TimeDelta::days(1);
+        let soon = Utc::now() + TimeDelta::days(1);
         for id in ["a", "b", "c"] {
             assert!(
-                insert_client(&pool, &client(id), 3, long_ago)
+                insert_client(&pool, &client(id), 3, long_ago, soon)
                     .await
                     .unwrap()
             );
         }
         // A full table drops the oldest client that was never used.
         assert!(
-            insert_client(&pool, &client("d"), 3, long_ago)
+            insert_client(&pool, &client("d"), 3, long_ago, soon)
                 .await
                 .unwrap()
         );
@@ -386,7 +391,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            insert_client(&pool, &client("e"), 3, long_ago)
+            insert_client(&pool, &client("e"), 3, long_ago, soon)
                 .await
                 .unwrap()
         );
@@ -395,7 +400,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !insert_client(&pool, &client("f"), 3, long_ago)
+            !insert_client(&pool, &client("f"), 3, long_ago, soon)
                 .await
                 .unwrap()
         );
@@ -406,7 +411,32 @@ mod tests {
             .await
             .unwrap();
         let later = Utc::now() + TimeDelta::seconds(1);
-        assert!(insert_client(&pool, &client("g"), 3, later).await.unwrap());
+        assert!(
+            insert_client(&pool, &client("g"), 3, later, soon)
+                .await
+                .unwrap()
+        );
         assert_eq!(ids(&pool).await, ["b", "e", "g"]);
+    }
+
+    #[tokio::test]
+    async fn new_clients_are_not_pushed_out() {
+        let pool = crate::db::connect_memory().await;
+        let long_ago = Utc::now() - TimeDelta::days(1);
+        let fresh = Utc::now() - TimeDelta::minutes(15);
+        for id in ["a", "b"] {
+            assert!(
+                insert_client(&pool, &client(id), 2, long_ago, fresh)
+                    .await
+                    .unwrap()
+            );
+        }
+        // Both may still be waiting for their user to approve.
+        assert!(
+            !insert_client(&pool, &client("c"), 2, long_ago, fresh)
+                .await
+                .unwrap()
+        );
+        assert_eq!(ids(&pool).await, ["a", "b"]);
     }
 }

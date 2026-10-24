@@ -40,10 +40,12 @@ safe. A weak, hand-chosen `WORDMAKER_TOKEN` can be brute-forced.
   back at one per second. Because the check is refused rather than delayed,
   parallel requests do not help. Valid OAuth access tokens on `/mcp` are
   still accepted while an address is throttled, so signed-in MCP clients
-  keep working while someone guesses. Behind a reverse proxy every client has
-  the proxy's address and shares one allowance; this is documented in
-  README.adoc. More than 10,000 tracked addresses fall back to one shared
-  allowance.
+  keep working while someone guesses. On `/mcp` a throttled request gets
+  the usual 401 with its `WWW-Authenticate` challenge (and `Retry-After`)
+  instead of 429, so an MCP client whose access token expired still signs
+  in again. Beyond 10,000 tracked addresses, new ones share one allowance;
+  addresses already tracked keep their own, so filling the shared one
+  locks out nobody else.
 * `serve` refuses tokens shorter than 32 characters (`wordmaker token`
   prints 64). A test checks that generated tokens pass.
 

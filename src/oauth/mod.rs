@@ -88,6 +88,9 @@ const CODE_TTL: TimeDelta = TimeDelta::minutes(5);
 const MAX_REGISTERED_CLIENTS: i64 = 500;
 /// How long a registered client may go without getting tokens.
 const UNUSED_CLIENT_TTL: TimeDelta = TimeDelta::days(1);
+/// How long a new client is safe from making way for later ones: long
+/// enough for its user to read the sign-in page and approve.
+const NEW_CLIENT_GRACE: TimeDelta = TimeDelta::minutes(15);
 
 pub fn router() -> Router<AppState> {
     // Metadata, registration and the token endpoint are called from
@@ -249,6 +252,7 @@ async fn register(State(state): State<AppState>, body: Bytes) -> Response {
         &client,
         MAX_REGISTERED_CLIENTS,
         Utc::now() - UNUSED_CLIENT_TTL,
+        Utc::now() - NEW_CLIENT_GRACE,
     )
     .await
     {
@@ -1398,7 +1402,7 @@ mod tests {
         assert_eq!(mcp_status(&app, &access).await.status, StatusCode::OK);
         assert_eq!(
             mcp_status(&app, "admin-secret").await.status,
-            StatusCode::TOO_MANY_REQUESTS
+            StatusCode::UNAUTHORIZED
         );
         let mut form = authorize_params(&client_id);
         form.push(("token", "admin-secret".into()));
