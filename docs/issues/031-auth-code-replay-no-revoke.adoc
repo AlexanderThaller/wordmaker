@@ -1,0 +1,30 @@
+= 031: Replayed authorization codes do not revoke tokens issued from them
+:severity: Low
+:area: OAuth
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: OAuth
+Status:: Open
+
+== Summary
+
+Codes are correctly single-use (deleted on redemption), but a second use
+only returns `invalid_grant`. RFC 6749 §4.1.2 says tokens already issued
+from the code should be revoked.
+
+== Location
+
+* `src/oauth/mod.rs:694`
+
+== Impact
+
+An intercepted code redeemed by an attacker first is never detected when
+the legitimate client tries it.
+
+== Suggested fix
+
+* Keep a tombstone (code hash → grant id) until the code's expiry, and
+  revoke the grant on replay.

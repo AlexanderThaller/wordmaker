@@ -1,0 +1,43 @@
+= 007: Admin proxy forwards dot segments, sending the token to any upstream path
+:severity: Medium
+:area: wordmaker-admin
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Medium
+Area:: wordmaker-admin
+Status:: Open
+
+== Summary
+
+The upstream URL is built as `+format!("{}{path}", base_url)+` from the
+raw `path_and_query`. The router matches `/api/v1/{*path}` against
+`/api/v1/../../mcp` or `/api/v1/%2e%2e/%2e%2e/x` without normalising, and
+reqwest's WHATWG URL parser then resolves the dot segments.
+
+== Location
+
+* `crates/wordmaker-admin/src/proxy.rs:69-76`
+* `crates/wordmaker-admin/src/app.rs:108`
+* `crates/wordmaker-admin/src/app.rs:149-157`
+
+== Impact
+
+* A signed-in user (or anyone on loopback without OIDC) requests
+  `/api/v1/../../x`; the request reaches `<base>/x` with
+  `Authorization: Bearer <token>`.
+* Against this server alone the gain is small, since `/mcp` has the same
+  power as the API.
+* If `WORDMAKER_BASE_URL` has a path prefix on a host shared with other
+  services (`https://host/wordmaker`), the token leaks to those services.
+* `/media/../<slug>` also lets the admin origin serve arbitrary site pages,
+  widening link:002-admin-origin-active-content.adoc[issue 2].
+
+== Suggested fix
+
+* Reject paths containing `.`/`..` segments or percent-encoded `.`, `/`
+  or `\`.
+* Better: build the upstream URL from the matched `path` and check that the
+  parsed result still starts with `base_url + "/api/v1/"` (or `/media/`,
+  `/_wm/`) before sending.

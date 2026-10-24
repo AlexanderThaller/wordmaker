@@ -1,0 +1,35 @@
+= 016: Read-then-write transactions fail with "database is locked" under concurrency
+:severity: Low
+:area: Database
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Database
+Status:: Open
+
+== Summary
+
+`pool.begin()` issues a deferred `BEGIN`. `update`, `set_status`,
+`save_draft` and `discard_draft` read first and then write. In WAL mode,
+upgrading to a write lock after another connection has committed fails
+immediately with `SQLITE_BUSY`; the busy timeout does not apply (confirmed
+with a Python sqlite3 test).
+
+== Location
+
+* `src/domain/pages.rs:223`
+* `src/domain/pages.rs:274`
+* `src/domain/pages.rs:301`
+* `src/domain/pages.rs:335`
+
+== Impact
+
+Two concurrent edits: one of them gets a 500 "database is locked". No
+data is lost and revision numbers stay unique; the errors are spurious.
+
+== Suggested fix
+
+* Use `begin_with("BEGIN IMMEDIATE")` for transactions that read and then
+  write.

@@ -1,0 +1,27 @@
+= 048: ClickHouse URL is logged in full, possibly with credentials
+:severity: Low
+:area: Analytics
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Analytics
+Status:: Open
+
+== Summary
+
+The configured ClickHouse URL is logged at startup.
+
+== Location
+
+* `src/analytics/mod.rs:115`
+
+== Impact
+
+With credentials in the URL (`+http://user:pass@host+`) they end up in
+the logs. Whether clickhouse-rs honours URL userinfo was not verified.
+
+== Suggested fix
+
+* Redact userinfo before logging.

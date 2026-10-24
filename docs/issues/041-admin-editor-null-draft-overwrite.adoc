@@ -1,0 +1,31 @@
+= 041: Saving while the editor is not loaded overwrites the draft with the published body
+:severity: Low
+:area: wordmaker-admin UI
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: wordmaker-admin UI
+Status:: Open
+
+== Summary
+
+`draft()` falls back to `current.body` when `state.editor` is null, but
+`changes()` compares against `draft_body ?? body`.
+
+== Location
+
+* `crates/wordmaker-admin/assets/app.js:398-401`
+* `crates/wordmaker-admin/assets/app.js:448`
+* `crates/wordmaker-admin/assets/app.js:457`
+
+== Impact
+
+For a page with a pending draft, saving while the wasm editor is still
+loading or failed to load (the page is shown before `await ensureEditor()`)
+sends the published body as the draft; the draft is lost.
+
+== Suggested fix
+
+* Fall back to `savedContent(current).body`.

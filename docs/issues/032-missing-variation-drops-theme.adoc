@@ -1,0 +1,28 @@
+= 032: One missing style variation makes the whole theme fall back to the default
+:severity: Low
+:area: Themes
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Themes
+Status:: Open
+
+== Summary
+
+When a variation stored in settings no longer exists (e.g. after
+reinstalling the theme from a different zip), `build` returns an error.
+
+== Location
+
+* `src/theme/mod.rs:671-673`
+
+== Impact
+
+The site silently switches to the built-in look instead of the active
+theme without that variation.
+
+== Suggested fix
+
+* Skip and log a missing variation.

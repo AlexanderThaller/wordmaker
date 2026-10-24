@@ -1,0 +1,37 @@
+= 054: Minor admin UI issues
+:severity: Low
+:area: wordmaker-admin
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: wordmaker-admin
+Status:: Open
+
+== Summary
+
+Small correctness gaps in the admin.
+
+== Location
+
+* `crates/wordmaker-admin/assets/app.js:193`
+* `crates/wordmaker-admin/src/app.rs:143`
+* `crates/wordmaker-admin/src/auth.rs:96`
+* `crates/wordmaker-admin/src/auth.rs:500`
+
+== Impact
+
+* A malformed hash like `#/pages/%zz` makes `decodeURIComponent` throw, an
+  unhandled rejection (self-inflicted only).
+* `/config.json`, "Open site" and the dashboard links use the internal
+  `WORDMAKER_BASE_URL`; they break and expose that address when it is
+  internal.
+* The fixed login cookie name means two sign-ins started in parallel tabs
+  make the first fail.
+
+== Suggested fix
+
+* Catch decoding errors in the router.
+* Add a separate public site URL setting for links.
+* Key the login cookie by state, or tolerate parallel logins.

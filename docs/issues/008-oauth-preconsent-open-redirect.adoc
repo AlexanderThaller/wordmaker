@@ -1,0 +1,42 @@
+= 008: Anonymous open redirect through /oauth/authorize, including custom schemes
+:severity: Medium
+:area: OAuth
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Medium
+Area:: OAuth
+Status:: Open
+
+== Summary
+
+Anyone can register a client with dynamic client registration (or host a
+client metadata document). Once the client and redirect URI are accepted,
+every later validation error is sent as a redirect to the client, before the
+user has seen or approved anything. `valid_redirect_uri` uses a deny-list of
+schemes, so any other scheme is accepted.
+
+== Location
+
+* `src/oauth/mod.rs:331-352`
+* `src/oauth/mod.rs:441-489`
+* `src/oauth/mod.rs:180-259`
+* `src/oauth/client_metadata.rs:187-202`
+
+== Impact
+
+. `POST /oauth/register` with `+{"redirect_uris":["https://evil.example/x"]}+`.
+. Send a victim to
+  `https://site/oauth/authorize?client_id=<id>&redirect_uri=https://evil.example/x`
+  with no `response_type`.
+. The trusted site answers with a 303 to `evil.example`.
+. With schemes like `ms-msdt:`, `search-ms:` or `intent:`, the trusted
+  origin bounces the victim into OS protocol handlers.
+
+== Suggested fix
+
+* Before the user has approved, show the error page instead of
+  redirecting, unless the client is trusted (RFC 9700 §4.11.2).
+* Allow-list redirect schemes: `https`, loopback `http`, and reverse-domain
+  private-use schemes (RFC 8252 §7.1).

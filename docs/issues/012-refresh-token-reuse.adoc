@@ -1,0 +1,39 @@
+= 012: Refresh token reuse is not detected and refresh is not atomic
+:severity: Medium
+:area: OAuth
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Medium
+Area:: OAuth
+Status:: Open
+
+== Summary
+
+`refresh` looks the token up with a `SELECT`, then in a separate
+transaction deletes all of the grant's tokens and inserts new ones. Old
+hashes are gone, so a replayed rotated token is indistinguishable from an
+unknown one.
+
+== Location
+
+* `src/oauth/mod.rs:726-740`
+* `src/oauth/store.rs:119-146`
+
+== Impact
+
+* *Theft:* if an attacker refreshes a stolen token first, the legitimate
+  client is locked out and the attacker keeps rolling 30-day access
+  forever; the server never notices. OAuth 2.1 §4.3.1 and RFC 9700 §4.14.2
+  expect reuse of a rotated token to revoke the grant.
+* *Race:* two concurrent refreshes with the same token both get 200 with
+  different pairs; only the last commit's pair survives.
+
+== Suggested fix
+
+* Consume the refresh token atomically
+  (`+DELETE ... WHERE token_hash = ? AND kind = 'refresh' RETURNING ...+`)
+  inside the issuing transaction.
+* Keep used refresh hashes (e.g. a `used` flag) until the grant expires; on
+  reuse, revoke the whole grant.

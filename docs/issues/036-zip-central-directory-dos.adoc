@@ -1,0 +1,28 @@
+= 036: Zips with millions of entries are fully scanned before the file limit applies
+:severity: Low
+:area: Themes
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Themes
+Status:: Open
+
+== Summary
+
+`ZipArchive::new` and the root-scan loop process every entry before
+`MAX_FILES` is checked.
+
+== Location
+
+* `src/theme/mod.rs:468-487`
+
+== Impact
+
+A 100 MB zip with millions of empty entries costs hundreds of MB of RAM
+during install.
+
+== Suggested fix
+
+* Reject `archive.len() > MAX_FILES` right after opening.

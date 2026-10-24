@@ -1,0 +1,43 @@
+= 009: Anonymous requests can fill fixed-size tables and lock out DCR and admin sign-in
+:severity: Medium
+:area: OAuth / wordmaker-admin
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Medium
+Area:: OAuth / wordmaker-admin
+Status:: Open
+
+== Summary
+
+Two tables have a hard cap and refuse new entries when full instead of
+evicting old ones.
+
+== Location
+
+* `src/oauth/mod.rs:78`
+* `src/oauth/mod.rs:230-236`
+* `src/oauth/store.rs:33`
+* `crates/wordmaker-admin/src/auth.rs:103`
+* `crates/wordmaker-admin/src/auth.rs:478-488`
+
+== Impact
+
+* *Dynamic client registration:* 500 anonymous `POST /oauth/register`
+  calls fill `oauth_clients`. Rows never expire (`created_at` is unused), so
+  all later registrations fail with "too many registered clients" until
+  the database is edited by hand. Count-then-insert is not atomic either,
+  so concurrent calls can overshoot 500.
+* *Admin sign-in:* every `GET /auth/login` adds a pending-login entry. With
+  1000 entries younger than 10 minutes every sign-in gets a 503. About 2
+  requests per second keep legitimate users out indefinitely; existing
+  sessions are unaffected.
+
+== Suggested fix
+
+* Expire clients that never received a grant (e.g. after 24 h), or evict
+  the oldest such client; rate-limit registration per IP.
+* Keep no server-side state before the OIDC callback: put the PKCE verifier
+  and nonce in a signed or encrypted login cookie. Or evict the oldest entry
+  and cap entries per client IP.

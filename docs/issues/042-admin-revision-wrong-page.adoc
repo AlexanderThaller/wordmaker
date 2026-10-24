@@ -1,0 +1,30 @@
+= 042: A revision that loads after a page switch is shown on the wrong page
+:severity: Low
+:area: wordmaker-admin UI
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: wordmaker-admin UI
+Status:: Open
+
+== Summary
+
+`openRevision` does not check that the page is still the same after its
+await (`loadRevisions` at line 796 does).
+
+== Location
+
+* `crates/wordmaker-admin/assets/app.js:817-826`
+* `crates/wordmaker-admin/assets/app.js:850-851`
+
+== Impact
+
+Click a revision of A, switch to B before it loads; A's revision shows on
+B, and Restore puts A's content into B's editor.
+
+== Suggested fix
+
+* Remember the slug before the request and ignore the response if it
+  changed.

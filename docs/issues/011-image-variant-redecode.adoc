@@ -1,0 +1,41 @@
+= 011: Image variants wider than the original re-decode the full image every time
+:severity: Medium
+:area: Media
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Medium
+Area:: Media
+Status:: Open
+
+== Summary
+
+`scale()` only checks `+image.width() <= width+` after
+`DynamicImage::from_decoder` has decoded the whole image. In that case it
+returns `Ok(false)` and nothing is cached, so the next request decodes
+again.
+
+== Location
+
+* `src/images.rs:239-275`
+* `src/images.rs:331-349`
+
+== Impact
+
+* `GET /_wm/img/1600/<upload at most 1600 px wide>` in a loop, without
+  authentication.
+* Each request takes one of the two semaphore permits and decodes the full
+  image. Worst case is a 1600×80000 JPEG (~384 MB, under the 512 MB decode
+  limit).
+* Legitimate variant requests queue behind it with no timeout.
+* Missing or non-image files also take a permit before failing.
+
+== Suggested fix
+
+* Check `decoder.dimensions()` (or the cached `Images::size`) before
+  decoding.
+* Accept only widths smaller than the original; otherwise redirect to or
+  serve `/media/<file>`.
+* Remember failures, and return 404 before taking a permit when the source
+  file does not exist.

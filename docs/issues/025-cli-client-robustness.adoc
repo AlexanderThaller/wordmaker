@@ -1,0 +1,36 @@
+= 025: wordmaker client: broken-pipe panic, unbounded $ref recursion, plain-HTTP token
+:severity: Low
+:area: CLI client
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: CLI client
+Status:: Open
+
+== Summary
+
+Several robustness gaps in the stdio-to-HTTP client.
+
+== Location
+
+* `src/client.rs:122-124`
+* `src/client.rs:275-284`
+
+== Impact
+
+* `println!` panics on a broken pipe (`wordmaker client tools | head -1`).
+* `type_name` recurses without limit on a self-referential `$ref` from a
+  malicious server and overflows the stack.
+* The token is sent over plain `http://` to non-loopback hosts without a
+  warning.
+* There is no timeout on the rmcp transport, so a hung server blocks the
+  agent forever.
+
+== Suggested fix
+
+* Handle EPIPE (write with `writeln!` and exit quietly).
+* Add a recursion depth limit to `type_name`.
+* Warn or refuse when the URL is plain HTTP to a non-loopback host.
+* Set request timeouts.

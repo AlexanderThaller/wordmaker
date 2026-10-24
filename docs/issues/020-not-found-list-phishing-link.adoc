@@ -1,0 +1,31 @@
+= 020: 404 list in the admin dashboard can link to another host
+:severity: Low
+:area: wordmaker-admin UI
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: wordmaker-admin UI
+Status:: Open
+
+== Summary
+
+The http crate accepts `\` in paths, so a request for `/\evil.com` is
+recorded as a 404. The dashboard builds `+new URL("/\\evil.com", siteUrl)+`,
+which browsers resolve to `https://evil.com/`. The DOM is built safely, so
+there is no XSS.
+
+== Location
+
+* `crates/wordmaker-admin/assets/app.js:1257`
+
+== Impact
+
+An attacker requests `/\evil.com` a few times; the admin sees it in
+"Not found" and clicks it.
+
+== Suggested fix
+
+* Only link paths that start with a single `/` and contain no `\`, or do
+  not link 404 paths at all.

@@ -1,0 +1,30 @@
+= 027: is_public misses IPv6 ranges that embed IPv4 or are not public
+:severity: Low
+:area: OAuth
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: OAuth
+Status:: Open
+
+== Summary
+
+The address check used for client metadata fetches does not reject
+IPv4-compatible `::a.b.c.d` (e.g. `::7f00:1`), 6to4 `2002::/16`, Teredo
+`2001::/32`, site-local `fec0::/10` or discard `100::/64`.
+
+== Location
+
+* `src/oauth/client_metadata.rs:254-266`
+
+== Impact
+
+Depending on the network, a metadata URL resolving to such an address may
+reach an internal host. Exploitability is uncertain.
+
+== Suggested fix
+
+* Reject these ranges and check embedded IPv4 addresses against the IPv4
+  rules.

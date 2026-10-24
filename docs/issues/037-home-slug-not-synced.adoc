@@ -1,0 +1,33 @@
+= 037: home_slug is not kept in step with page renames and deletes
+:severity: Low
+:area: Settings / site
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Settings / site
+Status:: Open
+
+== Summary
+
+Renaming or deleting the home page, or setting `home_slug` to a page that
+does not exist or is unpublished, leaves the setting dangling.
+
+== Location
+
+* `src/domain/settings.rs:119-125`
+* `src/domain/pages.rs:222-270`
+* `src/site.rs:184-186`
+* `src/site.rs:251-274`
+
+== Impact
+
+`/` returns 404 instead of the page list, while the sitemap still lists
+`/`.
+
+== Suggested fix
+
+* Update or clear `home_slug` on rename and delete.
+* Validate the page when the setting is saved.
+* Fall back to the page list when the home page is missing.

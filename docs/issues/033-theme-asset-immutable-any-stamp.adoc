@@ -1,0 +1,33 @@
+= 033: Theme assets are cached as immutable for any stamp, and stamps are predictable
+:severity: Low
+:area: Themes
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Themes
+Status:: Open
+
+== Summary
+
+Any `slug@<anything>` URL is served with a one-year `immutable` header.
+The stamp is `theme.json`'s mtime in whole seconds.
+
+== Location
+
+* `src/site.rs:590-605`
+* `src/theme/mod.rs:700-707`
+
+== Impact
+
+* An attacker pre-fetches future `slug@<stamp>` URLs into a shared cache
+  or CDN, which then keeps serving the old content.
+* Two writes within the same second keep the same stamp, so browsers keep a
+  stale asset.
+
+== Suggested fix
+
+* Send `immutable` only when the stamp matches the current one; otherwise
+  `no-cache` or redirect.
+* Use a content hash or nanosecond stamp.

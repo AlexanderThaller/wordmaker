@@ -1,0 +1,38 @@
+= 015: Live edits made while a draft is pending are reverted by the next publish
+:severity: Low
+:area: Pages
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Pages
+Status:: Open
+
+== Summary
+
+`update()` never touches `draft_*`. `set_status(Published)` calls
+`apply_draft`, which overwrites title and body with the pending draft.
+`restore_revision` goes through `update()` too.
+
+== Location
+
+* `src/domain/pages.rs:222-259`
+* `src/domain/pages.rs:344-361`
+* `src/domain/pages.rs:401-413`
+
+== Impact
+
+. A draft is saved for a published page.
+. An MCP client calls `update_page` or `restore_revision`; the site shows
+  the change.
+. The next `publish_page` silently replaces it with the stale draft; the
+  edit survives only in revision history.
+
+The admin UI avoids this; the API and MCP tools do not.
+
+== Suggested fix
+
+* In `update()`, clear the draft or refuse with 409 when title or body
+  change and a draft exists.
+* Or make `restore_revision` write into the draft when one is pending.

@@ -1,0 +1,39 @@
+= 006: install_theme from a URL allows SSRF into the internal network
+:severity: Medium
+:area: Themes
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Medium
+Area:: Themes
+Status:: Open
+
+== Summary
+
+Only an `http://` or `https://` prefix is checked (case-sensitively).
+There is no filter for loopback, private, link-local or metadata addresses,
+reqwest follows up to 10 redirects to any host, and nothing protects
+against DNS rebinding.
+
+== Location
+
+* `src/theme/mod.rs:412-445`
+
+== Impact
+
+* A prompt-injected MCP client calls
+  `+install_theme{url:"http://10.0.0.5:8080/..."}+` or
+  `+http://169.254.169.254/...+`.
+* The different errors ("not a zip", HTTP status, connect error) allow
+  internal port scanning.
+* Any internal resource that is a zip with a `theme.json` is installed and
+  can then be read with `read_theme_file`.
+
+== Suggested fix
+
+* Reuse the approach of `src/oauth/client_metadata.rs`: resolve the host,
+  reject non-public addresses, pin the resolved address.
+* Re-check on every redirect (`redirect::Policy::custom`), or only allow
+  redirects to `downloads.wordpress.org`.
+* Return a generic error message.

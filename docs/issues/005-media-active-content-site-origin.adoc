@@ -1,0 +1,42 @@
+= 005: Uploaded HTML/SVG and theme SVGs are served inline on the site origin
+:severity: Medium
+:area: Media / themes
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Medium
+Area:: Media / themes
+Status:: Open
+
+== Summary
+
+`sanitize_filename` keeps any extension, and `/media` is served by
+`ServeDir`, which picks the content type from the extension. The content
+type stored at upload is never used. Theme assets allow `svg`. Neither
+response has `nosniff`, a CSP or `Content-Disposition`.
+
+== Location
+
+* `src/domain/media.rs:229`
+* `src/domain/media.rs:294-312`
+* `src/site.rs:67-69`
+* `src/site.rs:80-89`
+* `src/site.rs:576-612`
+
+== Impact
+
+. A prompt-injected MCP or OAuth client uploads `x.html` (or a theme
+  contains `x.svg`) with a script.
+. A visitor or the admin opens `/media/xxxxxxxx-x.html`.
+. The script runs on the site origin. It can `window.open` the OAuth sign-in
+  page and read the token as it is typed; the CSP on that page does not stop
+  a same-origin opener.
+
+== Suggested fix
+
+* Allow-list upload types, or serve everything that is not a raster image
+  with `Content-Disposition: attachment`.
+* Add `X-Content-Type-Options: nosniff` to `/media` and theme assets.
+* Serve SVG with `Content-Security-Policy: sandbox` (or `default-src 'none'`),
+  or drop `svg` from the theme asset allow-list.

@@ -1,0 +1,32 @@
+= 026: Vendor update scripts install unpinned, unverified code
+:severity: Low
+:area: Supply chain
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Supply chain
+Status:: Open
+
+== Summary
+
+`update-editor.sh` takes the npm "latest" release with no pinned hash;
+that code is built into the admin and runs with full API power.
+`update-world.sh` runs `npm install d3-geo@3` with an unpinned range and
+install scripts enabled on the developer's machine.
+
+== Location
+
+* `crates/wordmaker-admin/vendor/update-editor.sh:13-17`
+* `crates/wordmaker-admin/vendor/update-world.sh:45`
+
+== Impact
+
+A compromised npm release reaches the admin origin (or the developer
+machine) on the next vendor update.
+
+== Suggested fix
+
+* Pin exact versions and verify `sha512` integrity.
+* Use `npm install --ignore-scripts`.

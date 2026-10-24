@@ -1,0 +1,36 @@
+= 024: wordmaker geoip download lacks timeouts, size limits and durability
+:severity: Low
+:area: Analytics
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Analytics
+Status:: Open
+
+== Summary
+
+The download only sets a connect timeout. Decompression is unbounded, and
+`open_readfile` then loads the whole file into memory. There is no checksum
+(only HTTPS and a database-type check), no fsync before the rename, and a
+fixed `.partial` name.
+
+== Location
+
+* `src/analytics/download.rs:349`
+* `src/analytics/download.rs:401-411`
+* `src/analytics/download.rs:425`
+
+== Impact
+
+* A stalled transfer hangs a cron run forever.
+* A crash after rename can leave a truncated database.
+* Two overlapping runs write the same `.partial` file.
+
+== Suggested fix
+
+* Add an overall or read timeout and a cap on decompressed size.
+* fsync the file and directory before and after the rename.
+* Use a unique temporary name.
+* Verify the published SHA-256 when available.

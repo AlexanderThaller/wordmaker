@@ -1,0 +1,40 @@
+= 013: Graceful shutdown hangs while an MCP client is connected
+:severity: Medium
+:area: MCP / analytics
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Medium
+Area:: MCP / analytics
+Status:: Open
+
+== Summary
+
+The MCP service uses `StreamableHttpServerConfig::default()`, whose
+cancellation token is never cancelled. `axum::serve` with
+`with_graceful_shutdown` waits for every connection to close.
+
+== Location
+
+* `src/app.rs:60-71`
+* `src/main.rs:146-154`
+* `src/analytics/sink.rs:197`
+
+== Impact
+
+. An MCP client holds rmcp's standalone `GET /mcp` SSE stream open
+  (15 s keep-alives, never ends).
+. On SIGTERM the server stops accepting but `serve` never returns, so the
+  router and its `Analytics` senders are never dropped and the sink's final
+  flush never runs.
+. systemd or Docker sends SIGKILL; up to 50,000 buffered page views are lost
+  and every restart is slow.
+
+(Derived from reading the code, not reproduced.)
+
+== Suggested fix
+
+* Create a `CancellationToken`, pass it via `with_cancellation_token`,
+  and cancel it in `shutdown_signal()`.
+* Bound the graceful shutdown with a timeout.

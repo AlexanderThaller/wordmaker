@@ -1,0 +1,31 @@
+= 038: Every public request re-renders AsciiDoc and the footer
+:severity: Low
+:area: Site rendering
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Site rendering
+Status:: Open
+
+== Summary
+
+Every GET, 404s included, reparses and highlights the page body and
+re-renders the footer AsciiDoc.
+
+== Location
+
+* `src/site.rs:163-180`
+* `src/site.rs:332-340`
+
+== Impact
+
+A 180 KB highlighted page took about 250 ms of CPU per request. Authors
+control content, so this is a cost and DoS-amplification concern rather
+than a vulnerability.
+
+== Suggested fix
+
+* Cache rendered HTML keyed by page id, `updated_at` and settings version.
+* Look the page up before building the frame, so 404s are cheap.

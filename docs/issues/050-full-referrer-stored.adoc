@@ -1,0 +1,27 @@
+= 050: Full Referer URLs, including query strings, are stored
+:severity: Low
+:area: Analytics / privacy
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Analytics / privacy
+Status:: Open
+
+== Summary
+
+The complete Referer header is stored.
+
+== Location
+
+* `src/analytics/sink.rs:332`
+
+== Impact
+
+Query strings from referring sites (search terms, tokens, email
+addresses) end up in ClickHouse.
+
+== Suggested fix
+
+* Store only scheme, host and path, or just `referrer_host`.
