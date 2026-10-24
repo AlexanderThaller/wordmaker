@@ -412,21 +412,46 @@ fn primary_language(accept_language: &str) -> String {
 /// Random bytes for the visitor hash, replaced every UTC day and only ever
 /// held in memory, so a visitor ID cannot be traced back to an address or
 /// linked to the same visitor on another day.
+///
+/// Hits are timed when a request starts but arrive when it ends, so around
+/// midnight they come out of order; the previous day's salt is kept for
+/// those, and a day's salt is never made twice.
 #[derive(Debug, Default)]
 struct DailySalt {
-    day: Option<NaiveDate>,
-    salt: [u8; 32],
+    /// The two latest days seen, newest first.
+    days: Vec<(NaiveDate, [u8; 32])>,
+    /// For a hit older than both, which only a day-long request makes.
+    stale: [u8; 32],
 }
 
 impl DailySalt {
     fn for_day(&mut self, day: NaiveDate) -> &[u8; 32] {
-        if self.day != Some(day) {
-            self.day = Some(day);
-            self.salt[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-            self.salt[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        }
-        &self.salt
+        let index = match self.days.iter().position(|(known, _)| *known == day) {
+            Some(index) => index,
+            None if self.days.len() == 2 && day < self.days[1].0 => {
+                self.stale = random_salt();
+                return &self.stale;
+            }
+            None => {
+                self.days.push((day, random_salt()));
+                self.days
+                    .sort_unstable_by_key(|(day, _)| std::cmp::Reverse(*day));
+                self.days.truncate(2);
+                self.days
+                    .iter()
+                    .position(|(known, _)| *known == day)
+                    .unwrap_or(0)
+            }
+        };
+        &self.days[index].1
     }
+}
+
+fn random_salt() -> [u8; 32] {
+    let mut salt = [0; 32];
+    salt[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    salt[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    salt
 }
 
 #[cfg(test)]
@@ -552,6 +577,41 @@ mod tests {
         );
         assert_eq!(referrer(""), (String::new(), String::new()));
         assert_eq!(referrer("not a url?q=x"), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn visitor_id_survives_hits_out_of_order_around_midnight() {
+        let (mut sink, _) = sink(clickhouse::Client::default());
+        let at = |time| DateTime::parse_from_rfc3339(time).unwrap().to_utc();
+        let before = sink.enrich(hit(at("2026-10-08T23:59:59.9Z"))).visitor_id;
+        let after = sink.enrich(hit(at("2026-10-09T00:00:00.1Z"))).visitor_id;
+        assert_ne!(before, after);
+        // A slow request from before midnight, then fast ones after it.
+        assert_eq!(
+            sink.enrich(hit(at("2026-10-08T23:59:59.8Z"))).visitor_id,
+            before
+        );
+        assert_eq!(
+            sink.enrich(hit(at("2026-10-09T00:00:00.2Z"))).visitor_id,
+            after
+        );
+        assert_eq!(
+            sink.enrich(hit(at("2026-10-08T23:59:59.7Z"))).visitor_id,
+            before
+        );
+
+        // Two days on, the oldest salt is gone.
+        let later = sink.enrich(hit(at("2026-10-10T00:00:00Z"))).visitor_id;
+        assert_ne!(later, after);
+        assert_eq!(
+            sink.enrich(hit(at("2026-10-09T23:59:59Z"))).visitor_id,
+            after
+        );
+        assert_eq!(sink.salt.days.len(), 2);
+        assert_ne!(
+            sink.enrich(hit(at("2026-10-08T12:00:00Z"))).visitor_id,
+            before
+        );
     }
 
     #[test]
