@@ -1,13 +1,13 @@
 = 024: wordmaker geoip download lacks timeouts, size limits and durability
 :severity: Low
 :area: Analytics
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Analytics
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -34,3 +34,17 @@ fixed `.partial` name.
 * fsync the file and directory before and after the rename.
 * Use a unique temporary name.
 * Verify the published SHA-256 when available.
+
+== Resolution
+
+* The HTTP client has a 60 s read timeout and a 30 min overall timeout
+  besides the connect timeout, so a stalled transfer fails.
+* Decompression goes through a writer that fails beyond 1 GiB (the city
+  database is about 130 MB), which also bounds what `open_readfile` loads.
+* The unpacked file is fsynced before the rename and the directory after.
+* The temporary file has a unique name (`<name>.mmdb.<uuid>.partial`,
+  created with `create_new`), so overlapping runs do not share it.
+* Not done: SHA-256 verification. DB-IP publishes no machine-readable
+  checksum next to the `.mmdb.gz` files, so integrity still rests on HTTPS
+  and the database type check.
+* Checked by downloading both current DB-IP Lite databases.

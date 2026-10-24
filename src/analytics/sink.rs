@@ -28,6 +28,7 @@ use tokio::{
     sync::mpsc,
     time::Instant,
 };
+use tokio_util::sync::CancellationToken;
 
 use super::{
     Hit,
@@ -44,8 +45,13 @@ const BATCH: usize = 1000;
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 /// Page views kept while `ClickHouse` is unreachable; older ones are dropped.
 const MAX_BUFFER: usize = 50_000;
-/// Longest a single `ClickHouse` call may take.
+/// The same limit in bytes, for page views with long fields.
+const MAX_BUFFER_BYTES: usize = 64 << 20;
+/// Longest a single `ClickHouse` call may take; inserts get a second more
+/// per MiB they write.
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest kept UTM value.
+const MAX_UTM: usize = 128;
 /// How often the `GeoIP` databases are checked for a new version.
 const GEO_CHECK: Duration = Duration::from_secs(60);
 
@@ -78,7 +84,8 @@ const CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS page_views (
     visitor_id      UInt64
 ) ENGINE = MergeTree
 PARTITION BY toYYYYMM(timestamp)
-ORDER BY (site, toDate(timestamp), path, timestamp)";
+ORDER BY (site, toDate(timestamp), path, timestamp)
+SETTINGS non_replicated_deduplication_window = 1000";
 
 /// A client for the `ClickHouse` server at `url`, set up the way the sink
 /// needs it.
@@ -124,6 +131,35 @@ pub struct PageView {
     pub visitor_id: u64,
 }
 
+impl PageView {
+    /// Roughly the memory the row takes up.
+    fn size(&self) -> usize {
+        let strings = [
+            &self.site,
+            &self.path,
+            &self.slug,
+            &self.referrer,
+            &self.referrer_host,
+            &self.utm_source,
+            &self.utm_medium,
+            &self.utm_campaign,
+            &self.user_agent,
+            &self.browser,
+            &self.browser_version,
+            &self.os,
+            &self.os_version,
+            &self.device,
+            &self.language,
+            &self.country_code,
+            &self.country,
+            &self.region,
+            &self.city,
+            &self.as_org,
+        ];
+        size_of::<Self>() + strings.iter().map(|s| s.len()).sum::<usize>()
+    }
+}
+
 #[derive(Debug)]
 pub struct Sink {
     client: clickhouse::Client,
@@ -132,8 +168,15 @@ pub struct Sink {
     hits: mpsc::Receiver<Hit>,
     /// Hits the request side could not queue.
     dropped: Arc<AtomicU64>,
+    /// Stops taking hits even while handles remain, e.g. held by
+    /// connections a shutdown gave up waiting for.
+    stop: CancellationToken,
     salt: DailySalt,
     buffer: VecDeque<PageView>,
+    /// [`PageView::size`] of everything in `buffer`.
+    buffer_bytes: usize,
+    /// The insert being retried, if the last one failed.
+    attempt: Option<Attempt>,
     table_ready: bool,
     healthy: bool,
 }
@@ -145,6 +188,7 @@ impl Sink {
         geo: Geo,
         hits: mpsc::Receiver<Hit>,
         dropped: Arc<AtomicU64>,
+        stop: CancellationToken,
     ) -> Self {
         Self {
             client,
@@ -152,15 +196,18 @@ impl Sink {
             geo,
             hits,
             dropped,
+            stop,
             salt: DailySalt::default(),
             buffer: VecDeque::new(),
+            buffer_bytes: 0,
+            attempt: None,
             table_ready: false,
             healthy: true,
         }
     }
 
-    /// Runs until every [`super::Analytics`] handle is gone, then writes
-    /// what is left.
+    /// Runs until every [`super::Analytics`] handle is gone or `stop` is
+    /// cancelled, then writes what is left.
     pub async fn run(mut self) {
         // Fail early in the log if ClickHouse is misconfigured; page views
         // are buffered either way.
@@ -171,8 +218,14 @@ impl Sink {
         let mut next_flush = Instant::now() + FLUSH_INTERVAL;
         let mut geo_check = tokio::time::interval_at(Instant::now() + GEO_CHECK, GEO_CHECK);
         geo_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let stop = self.stop.clone();
         loop {
             tokio::select! {
+                // Takes what is queued already, then ends the loop below.
+                () = stop.cancelled(), if !self.hits.is_closed() => {
+                    self.hits.close();
+                    continue;
+                }
                 hit = self.hits.recv() => {
                     let Some(hit) = hit else { break };
                     let view = self.enrich(hit);
@@ -203,10 +256,19 @@ impl Sink {
     }
 
     fn push(&mut self, view: PageView) {
-        if self.buffer.len() >= MAX_BUFFER {
-            self.buffer.pop_front();
+        let size = view.size();
+        while self.buffer.len() >= MAX_BUFFER || self.buffer_bytes + size > MAX_BUFFER_BYTES {
+            let Some(oldest) = self.buffer.pop_front() else {
+                break;
+            };
+            self.buffer_bytes -= oldest.size();
             self.dropped.fetch_add(1, Ordering::Relaxed);
+            // The rows of a failed insert changed, so its retry must not be
+            // mistaken for it; should it have arrived after all, its rows
+            // are written twice.
+            self.attempt = None;
         }
+        self.buffer_bytes += size;
         self.buffer.push_back(view);
     }
 
@@ -216,30 +278,36 @@ impl Sink {
         if dropped > 0 {
             tracing::warn!("analytics: dropped {dropped} page views, the queue was full");
         }
-        if self.buffer.is_empty() {
-            return true;
-        }
-        let result = match self.ensure_table().await {
-            Ok(()) => self.insert().await,
-            Err(err) => Err(err),
-        };
-        match result {
-            Ok(()) => {
-                if !self.healthy {
-                    tracing::info!(
-                        "analytics: ClickHouse is back, wrote {} buffered page views",
-                        self.buffer.len()
-                    );
-                    self.healthy = true;
-                }
-                self.buffer.clear();
-                true
-            }
-            Err(err) => {
+        let mut written = 0;
+        while !self.buffer.is_empty() {
+            // A timed-out insert may still have been written, so the same
+            // rows are sent again with the same deduplication token, which
+            // has ClickHouse ignore them the second time. Page views that
+            // came in since go in the next insert.
+            let attempt = self.attempt.get_or_insert_with(|| Attempt {
+                token: uuid::Uuid::new_v4().to_string(),
+                rows: self.buffer.len(),
+                bytes: self.buffer_bytes,
+            });
+            let attempt = attempt.clone();
+            let result = match self.ensure_table().await {
+                Ok(()) => self.insert(&attempt).await,
+                Err(err) => Err(err),
+            };
+            if let Err(err) = result {
                 self.went_down(&err);
-                false
+                return false;
             }
+            self.buffer.drain(..attempt.rows);
+            self.buffer_bytes -= attempt.bytes;
+            self.attempt = None;
+            written += attempt.rows;
         }
+        if !self.healthy {
+            tracing::info!("analytics: ClickHouse is back, wrote {written} buffered page views");
+            self.healthy = true;
+        }
+        true
     }
 
     fn went_down(&mut self, err: &anyhow::Error) {
@@ -260,15 +328,21 @@ impl Sink {
         Ok(())
     }
 
-    async fn insert(&self) -> anyhow::Result<()> {
+    /// Writes the first `attempt.rows` buffered page views.
+    async fn insert(&self, attempt: &Attempt) -> anyhow::Result<()> {
         let insert = async {
-            let mut insert = self.client.insert::<PageView>(TABLE).await?;
-            for view in &self.buffer {
+            let mut insert = self
+                .client
+                .insert::<PageView>(TABLE)
+                .await?
+                .with_setting("insert_deduplication_token", &attempt.token);
+            for view in self.buffer.iter().take(attempt.rows) {
                 insert.write(view).await?;
             }
             insert.end().await
         };
-        tokio::time::timeout(TIMEOUT, insert)
+        let mib = u64::try_from(attempt.bytes >> 20).unwrap_or(u64::MAX);
+        tokio::time::timeout(TIMEOUT + Duration::from_secs(mib), insert)
             .await
             .map_err(|_| anyhow::anyhow!("writing page views timed out"))??;
         Ok(())
@@ -292,15 +366,19 @@ impl Sink {
             u64::from_le_bytes(id)
         };
         let utm = |key: &str| {
-            hit.query
+            let mut value = hit
+                .query
                 .as_deref()
                 .and_then(|query| {
                     url::form_urlencoded::parse(query.as_bytes())
                         .find(|(name, _)| name == key)
                         .map(|(_, value)| value.into_owned())
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+            super::truncate(&mut value, MAX_UTM);
+            value
         };
+        let (referrer, referrer_host) = referrer(&hit.referrer);
         PageView {
             timestamp: hit.time,
             site: self.site.clone(),
@@ -308,10 +386,8 @@ impl Sink {
             slug: hit.slug.clone(),
             status: hit.status,
             duration_ms: u32::try_from(hit.duration.as_millis()).unwrap_or(u32::MAX),
-            referrer_host: url::Url::parse(&hit.referrer)
-                .ok()
-                .and_then(|url| url.host_str().map(str::to_owned))
-                .unwrap_or_default(),
+            referrer,
+            referrer_host,
             utm_source: utm("utm_source"),
             utm_medium: utm("utm_medium"),
             utm_campaign: utm("utm_campaign"),
@@ -329,10 +405,34 @@ impl Sink {
             asn: location.asn,
             as_org: location.as_org,
             visitor_id,
-            referrer: hit.referrer,
             user_agent: hit.user_agent,
         }
     }
+}
+
+/// The `Referer` as stored, and its host: only scheme, host and path, since
+/// the query string, fragment and user info can carry search terms, tokens
+/// or email addresses. Anything that is not a URL is dropped.
+fn referrer(referer: &str) -> (String, String) {
+    let Ok(mut url) = url::Url::parse(referer) else {
+        return (String::new(), String::new());
+    };
+    url.set_query(None);
+    url.set_fragment(None);
+    // Fails only for URLs that cannot have credentials in the first place.
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    let host = url.host_str().unwrap_or_default().to_owned();
+    (url.into(), host)
+}
+
+/// An insert of the oldest `rows` buffered page views (`bytes` in size),
+/// identified by `token` across retries.
+#[derive(Clone, Debug)]
+struct Attempt {
+    token: String,
+    rows: usize,
+    bytes: usize,
 }
 
 /// `de-DE,de;q=0.9,en;q=0.8` yields `de`.
@@ -351,21 +451,46 @@ fn primary_language(accept_language: &str) -> String {
 /// Random bytes for the visitor hash, replaced every UTC day and only ever
 /// held in memory, so a visitor ID cannot be traced back to an address or
 /// linked to the same visitor on another day.
+///
+/// Hits are timed when a request starts but arrive when it ends, so around
+/// midnight they come out of order; the previous day's salt is kept for
+/// those, and a day's salt is never made twice.
 #[derive(Debug, Default)]
 struct DailySalt {
-    day: Option<NaiveDate>,
-    salt: [u8; 32],
+    /// The two latest days seen, newest first.
+    days: Vec<(NaiveDate, [u8; 32])>,
+    /// For a hit older than both, which only a day-long request makes.
+    stale: [u8; 32],
 }
 
 impl DailySalt {
     fn for_day(&mut self, day: NaiveDate) -> &[u8; 32] {
-        if self.day != Some(day) {
-            self.day = Some(day);
-            self.salt[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-            self.salt[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        }
-        &self.salt
+        let index = match self.days.iter().position(|(known, _)| *known == day) {
+            Some(index) => index,
+            None if self.days.len() == 2 && day < self.days[1].0 => {
+                self.stale = random_salt();
+                return &self.stale;
+            }
+            None => {
+                self.days.push((day, random_salt()));
+                self.days
+                    .sort_unstable_by_key(|(day, _)| std::cmp::Reverse(*day));
+                self.days.truncate(2);
+                self.days
+                    .iter()
+                    .position(|(known, _)| *known == day)
+                    .unwrap_or(0)
+            }
+        };
+        &self.days[index].1
     }
+}
+
+fn random_salt() -> [u8; 32] {
+    let mut salt = [0; 32];
+    salt[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    salt[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    salt
 }
 
 #[cfg(test)]
@@ -402,6 +527,7 @@ mod tests {
             Geo::default(),
             rx,
             Arc::default(),
+            CancellationToken::new(),
         );
         (sink, tx)
     }
@@ -414,6 +540,7 @@ mod tests {
         assert_eq!(view.browser, "Chrome");
         assert_eq!(view.device, "pc");
         assert!(!view.is_bot);
+        assert_eq!(view.referrer, "https://search.example/");
         assert_eq!(view.referrer_host, "search.example");
         assert_eq!(view.utm_source, "newsletter");
         assert_eq!(view.utm_medium, "");
@@ -442,6 +569,89 @@ mod tests {
         other.ip = Some("198.51.100.1".parse().unwrap());
         sink.salt.for_day(day1.date_naive());
         assert_ne!(sink.enrich(other).visitor_id, first);
+    }
+
+    #[test]
+    fn buffer_is_capped_in_bytes() {
+        let (mut sink, _) = sink(clickhouse::Client::default());
+        let mut view = sink.enrich(hit(Utc::now()));
+        view.user_agent = "x".repeat(1 << 20);
+        for _ in 0..100 {
+            sink.push(view.clone());
+        }
+        assert!(sink.buffer.len() < 64, "{}", sink.buffer.len());
+        assert!(sink.buffer_bytes <= MAX_BUFFER_BYTES);
+        assert_eq!(
+            sink.buffer_bytes,
+            sink.buffer.iter().map(PageView::size).sum::<usize>()
+        );
+        assert_eq!(
+            sink.dropped.load(Ordering::Relaxed),
+            100 - sink.buffer.len() as u64
+        );
+    }
+
+    #[test]
+    fn utm_values_are_truncated() {
+        let (mut sink, _) = sink(clickhouse::Client::default());
+        let mut long = hit(Utc::now());
+        long.query = Some(format!("utm_campaign={}", "c".repeat(500)));
+        assert_eq!(sink.enrich(long).utm_campaign.len(), MAX_UTM);
+    }
+
+    #[test]
+    fn referrers_lose_query_and_credentials() {
+        assert_eq!(
+            referrer("https://user:pw@mail.example/inbox/read?to=a%40b.example&t=secret#msg"),
+            (
+                "https://mail.example/inbox/read".to_owned(),
+                "mail.example".to_owned()
+            )
+        );
+        assert_eq!(
+            referrer("android-app://com.example.app/"),
+            (
+                "android-app://com.example.app/".to_owned(),
+                "com.example.app".to_owned()
+            )
+        );
+        assert_eq!(referrer(""), (String::new(), String::new()));
+        assert_eq!(referrer("not a url?q=x"), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn visitor_id_survives_hits_out_of_order_around_midnight() {
+        let (mut sink, _) = sink(clickhouse::Client::default());
+        let at = |time| DateTime::parse_from_rfc3339(time).unwrap().to_utc();
+        let before = sink.enrich(hit(at("2026-10-08T23:59:59.9Z"))).visitor_id;
+        let after = sink.enrich(hit(at("2026-10-09T00:00:00.1Z"))).visitor_id;
+        assert_ne!(before, after);
+        // A slow request from before midnight, then fast ones after it.
+        assert_eq!(
+            sink.enrich(hit(at("2026-10-08T23:59:59.8Z"))).visitor_id,
+            before
+        );
+        assert_eq!(
+            sink.enrich(hit(at("2026-10-09T00:00:00.2Z"))).visitor_id,
+            after
+        );
+        assert_eq!(
+            sink.enrich(hit(at("2026-10-08T23:59:59.7Z"))).visitor_id,
+            before
+        );
+
+        // Two days on, the oldest salt is gone.
+        let later = sink.enrich(hit(at("2026-10-10T00:00:00Z"))).visitor_id;
+        assert_ne!(later, after);
+        assert_eq!(
+            sink.enrich(hit(at("2026-10-09T23:59:59Z"))).visitor_id,
+            after
+        );
+        assert_eq!(sink.salt.days.len(), 2);
+        assert_ne!(
+            sink.enrich(hit(at("2026-10-08T12:00:00Z"))).visitor_id,
+            before
+        );
     }
 
     #[test]
@@ -614,6 +824,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stops_and_writes_when_told_although_handles_remain() {
+        let mock = Mock::new();
+        mock.add(handlers::record_ddl());
+        let recording = mock.add(handlers::record::<PageView>());
+        let (tx, rx) = mpsc::channel(16);
+        let stop = CancellationToken::new();
+        let sink = Sink::new(
+            clickhouse::Client::default().with_mock(&mock),
+            "https://site.example",
+            Geo::default(),
+            rx,
+            Arc::default(),
+            stop.clone(),
+        );
+        let task = tokio::spawn(sink.run());
+
+        tx.send(hit(Utc::now())).await.unwrap();
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("stopped")
+            .unwrap();
+        let rows: Vec<PageView> = recording.collect().await;
+        assert_eq!(rows.len(), 1, "wrote what was queued");
+        assert!(tx.send(hit(Utc::now())).await.is_err(), "takes no more");
+    }
+
+    #[tokio::test]
     async fn writes_page_views() {
         let mock = Mock::new();
         mock.add(handlers::record_ddl());
@@ -655,5 +893,67 @@ mod tests {
         assert!(sink.buffer.is_empty());
         let rows: Vec<PageView> = recording.collect().await;
         assert_eq!(rows, vec![view]);
+    }
+
+    #[tokio::test]
+    async fn retries_the_same_rows_and_writes_newer_ones_separately() {
+        let mock = Mock::new();
+        mock.add(handlers::record_ddl());
+        mock.add(handlers::failure(
+            clickhouse::test::status::INTERNAL_SERVER_ERROR,
+        ));
+        let retried = mock.add(handlers::record::<PageView>());
+        let newer = mock.add(handlers::record::<PageView>());
+        let (mut sink, _tx) = sink(clickhouse::Client::default().with_mock(&mock));
+
+        let time = DateTime::parse_from_rfc3339("2026-10-08T10:00:00.123Z")
+            .unwrap()
+            .to_utc();
+        let mut first = sink.enrich(hit(time));
+        first.path = "/first".into();
+        sink.push(first.clone());
+        assert!(!sink.flush().await);
+        let token = sink.attempt.as_ref().unwrap().token.clone();
+
+        let mut second = sink.enrich(hit(time));
+        second.path = "/second".into();
+        sink.push(second.clone());
+        assert_eq!(sink.attempt.as_ref().unwrap().token, token, "kept");
+        assert_eq!(sink.attempt.as_ref().unwrap().rows, 1);
+
+        assert!(sink.flush().await);
+        assert!(sink.buffer.is_empty());
+        assert_eq!(sink.buffer_bytes, 0);
+        assert!(sink.attempt.is_none());
+        assert_eq!(retried.collect::<Vec<PageView>>().await, vec![first]);
+        assert_eq!(newer.collect::<Vec<PageView>>().await, vec![second]);
+    }
+
+    #[tokio::test]
+    async fn real_clickhouse_ignores_a_repeated_insert() {
+        let Some((_container, db)) = real_clickhouse().await else {
+            return;
+        };
+        let (mut sink, _tx) = sink(db.clone());
+        for _ in 0..2 {
+            let view = sink.enrich(hit(Utc::now()));
+            sink.push(view);
+        }
+        sink.ensure_table().await.unwrap();
+        let attempt = Attempt {
+            token: "retry".into(),
+            rows: 2,
+            bytes: sink.buffer_bytes,
+        };
+        // As if the first answer had timed out.
+        sink.insert(&attempt).await.unwrap();
+        sink.insert(&attempt).await.unwrap();
+
+        let count = db
+            .query("SELECT count() FROM page_views")
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
     }
 }

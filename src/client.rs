@@ -1,7 +1,11 @@
 //! `wordmaker client`: a command line MCP client for a running `WordMaker`
 //! server, so agents without MCP support can drive the CMS from a shell.
 
-use std::path::PathBuf;
+use std::{
+    io::Write,
+    path::PathBuf,
+    time::Duration,
+};
 
 use anyhow::{
     Context,
@@ -38,6 +42,15 @@ pub struct ClientArgs {
 
     #[command(flatten)]
     token: TokenArgs,
+
+    /// Seconds to wait for the server before giving up.
+    #[arg(
+        long,
+        env = "WORDMAKER_CLIENT_TIMEOUT",
+        value_name = "SECONDS",
+        default_value_t = 300
+    )]
+    timeout: u64,
 
     #[command(subcommand)]
     command: ClientCommand,
@@ -99,35 +112,79 @@ pub async fn run(config: &Config, args: ClientArgs) -> anyhow::Result<()> {
     };
 
     let token = args.token.require(" to the server's token")?;
-    let client = connect(config, args.url, token).await?;
-    let result = match args.command {
-        ClientCommand::Info => {
-            info(&client);
+    let url = args
+        .url
+        .unwrap_or_else(|| format!("{}/mcp", config.base_url.trim_end_matches('/')));
+    if let Some(host) = insecure_host(&url) {
+        tracing::warn!(
+            "sending the token unencrypted to {host}; use an https:// URL for a server on another \
+             machine"
+        );
+    }
+    let timeout = Duration::from_secs(args.timeout);
+    let mut out = std::io::stdout();
+    let session = async {
+        let client = connect(&url, token).await?;
+        let result = match args.command {
+            ClientCommand::Info => info(&client, &mut out),
+            ClientCommand::Tools { name, json } => {
+                tools(&client, name.as_deref(), json, &mut out).await
+            }
+            ClientCommand::Call(CallArgs { tool, .. }) => {
+                call_tool(&client, tool, call.unwrap_or_default(), &mut out).await
+            }
+        };
+        let _ = client.cancel().await;
+        result
+    };
+    let result = match tokio::time::timeout(timeout, session).await {
+        Ok(result) => result.and_then(|()| Ok(out.flush()?)),
+        Err(_) => Err(anyhow::anyhow!(
+            "no answer from {url} within {}s; see --timeout",
+            args.timeout
+        )),
+    };
+    // Whoever reads the output stopped early, e.g. `| head`; not an error.
+    match result {
+        Err(err)
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|err| err.kind() == std::io::ErrorKind::BrokenPipe) =>
+        {
             Ok(())
         }
-        ClientCommand::Tools { name, json } => tools(&client, name.as_deref(), json).await,
-        ClientCommand::Call(CallArgs { tool, .. }) => {
-            call_tool(&client, tool, call.unwrap_or_default()).await
-        }
-    };
-    let _ = client.cancel().await;
-    result
+        result => result,
+    }
 }
 
-async fn connect(
-    config: &Config,
-    url: Option<String>,
-    token: String,
-) -> anyhow::Result<RunningService<RoleClient, ()>> {
-    let url = url.unwrap_or_else(|| format!("{}/mcp", config.base_url.trim_end_matches('/')));
-    let transport = StreamableHttpClientTransport::from_config(
-        StreamableHttpClientTransportConfig::with_uri(url.clone()).auth_header(token.clone()),
+/// The host of a plain `http://` URL that is not this machine, which the
+/// token would cross the network to unencrypted.
+fn insecure_host(url: &str) -> Option<String> {
+    let url = url::Url::parse(url).ok()?;
+    let local = match url.host()? {
+        url::Host::Domain(domain) => {
+            // Already lowercase in a parsed http(s) URL.
+            domain == "localhost" || domain.ends_with(".localhost")
+        }
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+    };
+    (url.scheme() == "http" && !local).then(|| url.host_str().unwrap_or_default().to_owned())
+}
+
+async fn connect(url: &str, token: String) -> anyhow::Result<RunningService<RoleClient, ()>> {
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()?;
+    let transport = StreamableHttpClientTransport::with_client(
+        http,
+        StreamableHttpClientTransportConfig::with_uri(url.to_owned()).auth_header(token.clone()),
     );
     match ().serve(transport).await {
         Ok(client) => Ok(client),
         // rmcp's worker logs the HTTP failure and hands back only "transport
         // channel closed", so ask the endpoint again to say what went wrong.
-        Err(err) => match diagnose(&url, &token).await {
+        Err(err) => match diagnose(url, &token).await {
             Some(cause) => bail!("could not connect to the MCP server at {url}: {cause}"),
             None => Err(anyhow::Error::new(err)
                 .context(format!("could not connect to the MCP server at {url}"))),
@@ -202,22 +259,24 @@ fn describe_failure(status: reqwest::StatusCode, body: &str) -> String {
     format!("HTTP {status}{detail}{hint}")
 }
 
-fn info(client: &RunningService<RoleClient, ()>) {
+fn info(client: &RunningService<RoleClient, ()>, out: &mut impl Write) -> anyhow::Result<()> {
     let Some(server) = client.peer_info() else {
-        return;
+        return Ok(());
     };
     if let Some(implementation) = &server.server_info {
-        println!("{} {}", implementation.name, implementation.version);
+        writeln!(out, "{} {}", implementation.name, implementation.version)?;
     }
     if let Some(instructions) = &server.instructions {
-        println!("\n{instructions}");
+        writeln!(out, "\n{instructions}")?;
     }
+    Ok(())
 }
 
 async fn tools(
     client: &RunningService<RoleClient, ()>,
     name: Option<&str>,
     json: bool,
+    out: &mut impl Write,
 ) -> anyhow::Result<()> {
     let mut tools = client.list_all_tools().await?;
     if let Some(name) = name {
@@ -228,32 +287,35 @@ async fn tools(
     }
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&tools)?);
+        writeln!(out, "{}", serde_json::to_string_pretty(&tools)?)?;
         return Ok(());
     }
     for (i, tool) in tools.iter().enumerate() {
         if i > 0 {
-            println!();
+            writeln!(out)?;
         }
-        print_tool(tool);
+        print_tool(tool, out)?;
     }
     if name.is_none() {
-        println!("\nCall a tool with `wordmaker client call <TOOL> [JSON] [--arg KEY=VALUE]...`.");
+        writeln!(
+            out,
+            "\nCall a tool with `wordmaker client call <TOOL> [JSON] [--arg KEY=VALUE]...`."
+        )?;
     }
     Ok(())
 }
 
-fn print_tool(tool: &Tool) {
-    println!("{}", tool.name);
+fn print_tool(tool: &Tool, out: &mut impl Write) -> std::io::Result<()> {
+    writeln!(out, "{}", tool.name)?;
     if let Some(description) = &tool.description {
-        println!("  {description}");
+        writeln!(out, "  {description}")?;
     }
     let schema = Value::Object((*tool.input_schema).clone());
     let required: Vec<&str> = schema["required"]
         .as_array()
         .map_or_else(Vec::new, |r| r.iter().filter_map(Value::as_str).collect());
     let Some(properties) = schema["properties"].as_object() else {
-        return;
+        return Ok(());
     };
     for (key, property) in properties {
         let kind = type_name(&schema, property);
@@ -262,17 +324,30 @@ fn print_tool(tool: &Tool) {
         } else {
             ""
         };
-        print!("    {key} ({kind}{flag})");
+        write!(out, "    {key} ({kind}{flag})")?;
         match property["description"].as_str() {
-            Some(description) => println!(": {}", description.replace('\n', " ")),
-            None => println!(),
+            Some(description) => writeln!(out, ": {}", description.replace('\n', " "))?,
+            None => writeln!(out)?,
         }
     }
+    Ok(())
 }
+
+/// How deep [`type_name`] follows nested and referenced schemas; a schema
+/// that refers to itself would otherwise never end.
+const MAX_SCHEMA_DEPTH: usize = 16;
 
 /// A short type name for a property schema, following `$ref`s and
 /// `anyOf`/`oneOf` (as schemars emits for `Option` and enums).
 fn type_name(root: &Value, property: &Value) -> String {
+    type_name_within(root, property, MAX_SCHEMA_DEPTH)
+}
+
+fn type_name_within(root: &Value, property: &Value, depth: usize) -> String {
+    let Some(depth) = depth.checked_sub(1) else {
+        return "any".to_owned();
+    };
+    let type_name = |root, property| type_name_within(root, property, depth);
     if let Some(reference) = property["$ref"].as_str() {
         let target = reference
             .strip_prefix("#/")
@@ -319,6 +394,7 @@ async fn call_tool(
     client: &RunningService<RoleClient, ()>,
     tool: String,
     arguments: JsonObject,
+    out: &mut impl Write,
 ) -> anyhow::Result<()> {
     let result = client
         .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments))
@@ -343,7 +419,7 @@ async fn call_tool(
     if result.is_error == Some(true) {
         bail!("{output}");
     }
-    println!("{output}");
+    writeln!(out, "{output}")?;
     Ok(())
 }
 
@@ -470,6 +546,54 @@ mod tests {
         assert_eq!(
             name(json!({ "anyOf": [{ "$ref": "#/$defs/Status" }, { "type": "null" }] })),
             "draft|published"
+        );
+    }
+
+    #[test]
+    fn self_referential_schemas_end() {
+        let root = json!({
+            "$defs": {
+                "Loop": { "$ref": "#/$defs/Loop" },
+                "List": { "type": "array", "items": { "$ref": "#/$defs/List" } },
+            },
+        });
+        assert_eq!(type_name(&root, &json!({ "$ref": "#/$defs/Loop" })), "any");
+        assert!(type_name(&root, &json!({ "$ref": "#/$defs/List" })).starts_with("any[]"));
+    }
+
+    #[test]
+    fn warns_about_plain_http_to_other_hosts() {
+        assert_eq!(
+            insecure_host("http://cms.example/mcp").as_deref(),
+            Some("cms.example")
+        );
+        assert_eq!(
+            insecure_host("http://192.168.1.5:3000/mcp").as_deref(),
+            Some("192.168.1.5")
+        );
+        assert_eq!(insecure_host("https://cms.example/mcp"), None);
+        assert_eq!(insecure_host("http://localhost:3000/mcp"), None);
+        assert_eq!(insecure_host("http://127.0.0.1:3000/mcp"), None);
+        assert_eq!(insecure_host("http://[::1]:3000/mcp"), None);
+    }
+
+    #[test]
+    fn tools_print_to_the_given_output() {
+        let tool: Tool = serde_json::from_value(json!({
+            "name": "get_page",
+            "description": "Get a page.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "slug": { "type": "string", "description": "The slug." } },
+                "required": ["slug"],
+            },
+        }))
+        .unwrap();
+        let mut out = Vec::new();
+        print_tool(&tool, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "get_page\n  Get a page.\n    slug (string, required): The slug.\n"
         );
     }
 }

@@ -1037,7 +1037,11 @@ mod tests {
             guesses,
             analytics: None,
         };
-        crate::app::router(state, vec!["site.example".into()])
+        crate::app::router(
+            state,
+            vec!["site.example".into()],
+            tokio_util::sync::CancellationToken::new(),
+        )
     }
 
     struct Reply {

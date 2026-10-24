@@ -1,5 +1,6 @@
 use std::{
     net::IpAddr,
+    os::unix::fs::MetadataExt,
     path::{
         Path,
         PathBuf,
@@ -34,8 +35,8 @@ struct Source {
     path: Option<PathBuf>,
     what: &'static str,
     reader: Option<Reader<Mmap>>,
-    /// The file's modification time and size when last opened (or tried).
-    seen: Option<(SystemTime, u64)>,
+    /// The file's [`Stamp`] when last opened (or tried).
+    seen: Option<Stamp>,
 }
 
 impl std::fmt::Debug for Source {
@@ -87,9 +88,25 @@ impl Source {
     }
 }
 
-fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
+/// What tells one version of a database file from another: updates rename
+/// a new file over the old one, which gives it a new inode even when
+/// modification time and size happen to match.
+#[derive(Debug, PartialEq, Eq)]
+struct Stamp {
+    device: u64,
+    inode: u64,
+    modified: SystemTime,
+    len: u64,
+}
+
+fn stamp(path: &Path) -> Option<Stamp> {
     let metadata = std::fs::metadata(path).ok()?;
-    Some((metadata.modified().ok()?, metadata.len()))
+    Some(Stamp {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        modified: metadata.modified().ok()?,
+        len: metadata.len(),
+    })
 }
 
 /// Where a visitor is, as far as `GeoIP` knows.
@@ -233,6 +250,32 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         geo.reload_if_changed().await;
         assert!(geo.city.reader.is_some(), "a missing file keeps it too");
+    }
+
+    #[tokio::test]
+    async fn reloads_a_replacement_with_the_same_time_and_size() {
+        let path = std::env::temp_dir().join(format!(
+            "wordmaker-geo-{}.mmdb",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let broken = vec![b'x'; test_database().len()];
+        replace(&path, &broken);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut geo = Geo::open(Some(&path), None);
+        assert!(geo.city.reader.is_none());
+
+        let new = path.with_extension("new");
+        std::fs::write(&new, test_database()).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&new)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        std::fs::rename(&new, &path).unwrap();
+        geo.reload_if_changed().await;
+        std::fs::remove_file(&path).unwrap();
+        assert!(geo.city.reader.is_some(), "loaded the new file");
     }
 
     /// Puts `contents` at `path` the way updaters must: a new file renamed

@@ -52,15 +52,17 @@
         "current": {}
       },
       {
-        "type": "textbox",
+        "type": "constant",
         "name": "database",
         "label": "Database",
+        "description": "ClickHouse database with the page_views table. A constant, not a field, because it is placed into the SQL as is: viewers must not be able to change it, also not with ?var-database=.",
         "query": "wordmaker",
         "current": {
           "text": "wordmaker",
           "value": "wordmaker"
         },
-        "hide": 0
+        "hide": 2,
+        "skipUrlSync": true
       },
       {
         "type": "query",
@@ -470,7 +472,7 @@
                 "value": [
                   {
                     "title": "Show only this site",
-                    "url": "/d/${__dashboard.uid}?var-site=${__value.raw}&${__url_time_range}&${database:queryparam}&${datasource:queryparam}"
+                    "url": "/d/${__dashboard.uid}?var-site=${__value.raw}&${__url_time_range}&${datasource:queryparam}"
                   }
                 ]
               }

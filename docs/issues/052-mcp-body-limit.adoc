@@ -1,13 +1,13 @@
 = 052: MCP accepts bodies of twice the upload limit for every tool; base64 strictness
 :severity: Low
 :area: MCP
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: MCP
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -31,3 +31,19 @@ post-decode size check is correct.
 
 * Apply the large limit only to `upload_media`, or validate sizes per tool.
 * Accept whitespace and URL-safe base64.
+
+== Resolution
+
+* rmcp 3.5.1 has one `max_request_body_bytes` for the whole endpoint and
+  no per-tool limit, so the HTTP limit stays at twice the upload size and
+  `WordMakerMcp` now implements `call_tool` itself: any tool but
+  `upload_media` whose arguments are over 2 MiB as JSON (axum's default,
+  as for the REST API) gets a tool error before dispatch. The size is
+  counted while serialising and stops at the limit. This also applies to
+  `wordmaker mcp` over stdio.
+* `upload_media` accepts standard and URL-safe base64, with or without
+  padding, and ignores whitespace such as line breaks.
+* Origin validation stays off, as the summary notes it is safe with
+  header-based auth.
+* Checked by hand: a 3 MB `create_page` body is refused, a line-wrapped
+  URL-safe upload is stored.

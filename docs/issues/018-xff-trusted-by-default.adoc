@@ -1,13 +1,13 @@
 = 018: Client IP is spoofable through X-Forwarded-For by default
 :severity: Low
 :area: Analytics
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Analytics
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -30,3 +30,18 @@ unique visitors. This affects analytics integrity only.
 * Default to 0 hops, or only honour the header when the peer is a trusted
   proxy address.
 * Warn at startup when hops > 0 and the bind address is not loopback.
+
+== Resolution
+
+The default stays at 1 hop, so existing deployments behind a proxy keep
+working, but `X-Forwarded-For` is now only read when the TCP peer is a
+loopback, RFC 1918, IPv6 unique-local or link-local address (IPv4-mapped
+IPv6 peers are canonicalised first), as a reverse proxy is. Visitors
+connecting directly from a public address are counted by the connection's
+address whatever header they send. `serve` warns at startup when analytics
+is on, hops > 0 and it listens on a non-loopback address. The README
+documents both.
+
+Left as is: without a proxy and with the default of 1, a client on the same
+private network can still choose its address; the startup warning points at
+`WORDMAKER_PROXY_HOPS=0` for that setup.

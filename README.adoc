@@ -36,6 +36,7 @@ Behind a reverse proxy all clients share the proxy's address and so share this a
 |`WORDMAKER_TOKEN` |– |Bearer token for `/api` and `/mcp` (required by `serve`, `client` and `wordmaker-admin`); `serve` needs at least 32 characters
 |`WORDMAKER_TOKEN_FILE` |– |File holding the token instead, e.g. a systemd credential (`$CREDENTIALS_DIRECTORY/token`) or Docker secret; surrounding whitespace is ignored
 |`WORDMAKER_MCP_URL` |`$WORDMAKER_BASE_URL/mcp` |MCP endpoint (`client` only)
+|`WORDMAKER_CLIENT_TIMEOUT` |`300` |Seconds `client` waits for the server before giving up
 |`WORDMAKER_ALLOWED_HOSTS` |– |Extra comma-separated `Host` values accepted by `/mcp`
 |`WORDMAKER_CLICKHOUSE_URL` |– |ClickHouse HTTP endpoint for page-view analytics, e.g. `http://127.0.0.1:8123`; analytics is off without it
 |`WORDMAKER_CLICKHOUSE_DATABASE` |`wordmaker` |ClickHouse database; must exist, the `page_views` table is created on start
@@ -44,7 +45,7 @@ Behind a reverse proxy all clients share the proxy's address and so share this a
 |`WORDMAKER_CLICKHOUSE_PASSWORD_FILE` |– |File holding the ClickHouse password instead
 |`WORDMAKER_GEOIP_CITY_DB` |– |MaxMind GeoLite2-City `.mmdb` for country, region and city
 |`WORDMAKER_GEOIP_ASN_DB` |– |MaxMind GeoLite2-ASN `.mmdb` for the visitor's network
-|`WORDMAKER_PROXY_HOPS` |`1` |Reverse proxies appending to `X-Forwarded-For`; `0` uses the connection's address
+|`WORDMAKER_PROXY_HOPS` |`1` |Reverse proxies appending to `X-Forwarded-For`, which is only read from loopback and private-network connections; `0` uses the connection's address
 |`WORDMAKER_GEOIP_DIR` |`geoip` |Where `wordmaker geoip` saves the DB-IP databases
 |===
 
@@ -61,7 +62,7 @@ Any number of instances can share one database: the `site` column holds each ins
 CREATE DATABASE wordmaker;
 ----
 
-Each row has the path and slug, status and render time, referrer and its host, `utm_source`/`utm_medium`/`utm_campaign`, the user agent with browser, OS, device type and a bot flag (crawlers the parser knows, plus anything calling itself a bot, crawler or spider, headless browsers included), the preferred language, and, with the GeoIP databases, country, region, city and network (ASN).
+Each row has the path and slug, status and render time, referrer (scheme, host and path only, without query string) and its host, `utm_source`/`utm_medium`/`utm_campaign`, the user agent with browser, OS, device type and a bot flag (crawlers the parser knows, plus anything calling itself a bot, crawler or spider, headless browsers included), the preferred language, and, with the GeoIP databases, country, region, city and network (ASN).
 `wordmaker geoip` downloads the free https://db-ip.com/db/lite.php[DB-IP Lite] city and ASN databases (no account needed) into `WORDMAKER_GEOIP_DIR` and prints the settings that point at them; DB-IP publishes a new edition every month.
 MaxMind's GeoLite2 files work as well, kept current with https://github.com/maxmind/geoipupdate[geoipupdate].
 A running `serve` checks the files every minute and loads new versions by itself; if a new file cannot be opened, it keeps using the old one.
@@ -78,9 +79,19 @@ No IP address is stored.
 The address is used for the GeoIP lookup and for `visitor_id`, a hash of address and user agent with a random salt that only lives in memory and changes every UTC day.
 It counts unique visitors per day, but cannot be traced back to an address or followed across days.
 
+The visitor's address is taken from `X-Forwarded-For` (`WORDMAKER_PROXY_HOPS` entries from the right) only when the connection comes from a loopback or private address (`10/8`, `172.16/12`, `192.168/16`, `fc00::/7`, link-local), as from a reverse proxy; anyone connecting directly from elsewhere is counted by the connection's address.
+Without a proxy, set `WORDMAKER_PROXY_HOPS=0`, so visitors on the local network cannot choose their address either; `serve` warns when it listens on a non-loopback address with hops above 0.
+
 Analytics never slows the site down: requests only queue a page view, without waiting.
-When ClickHouse is unreachable, page views are buffered (up to 50,000) and written once it is back.
-On shutdown (Ctrl-C or SIGTERM) the buffer is written before the process exits.
+When ClickHouse is unreachable, page views are buffered (up to 50,000, or 64 MiB) and written once it is back.
+On shutdown (Ctrl-C or SIGTERM) open requests get 5 seconds to finish (MCP event streams are closed right away), then the buffer is written before the process exits.
+A failed insert is retried with the same deduplication token, so an insert that timed out but did reach ClickHouse is not written twice.
+That needs the `non_replicated_deduplication_window` setting, which tables created by older versions lack:
+
+[source,sql]
+----
+ALTER TABLE page_views MODIFY SETTING non_replicated_deduplication_window = 1000;
+----
 
 [source,sql]
 ----
@@ -104,7 +115,8 @@ The _Site_ selector shows all instances or the ones you pick; clicking a site in
 
 It needs Grafana 11 or newer with the https://grafana.com/grafana/plugins/grafana-clickhouse-datasource/[ClickHouse data source] plugin.
 Add a ClickHouse data source for the server (HTTP, port 8123), then import the file under _Dashboards → New → Import_ and pick the data source.
-If the database is not called `wordmaker`, change the _Database_ field at the top.
+If the database is not called `wordmaker`, change the hidden `database` constant under _Dashboard settings → Variables_ (or in the file before importing); it is a constant so viewers cannot change it, since it goes into the SQL as is.
+
 To provision it instead, point a dashboard provider at the `grafana` directory:
 
 [source,yaml]
@@ -115,6 +127,15 @@ providers:
     type: file
     options:
       path: /path/to/wordmaker/grafana
+----
+
+Give the data source a ClickHouse user that can only read `page_views`, not the user `serve` writes with.
+Dashboard viewers can set variables such as _Site_ through the URL, and Grafana's quoting of them does not rule out SQL injection, so the data source's rights are what viewers can reach:
+
+[source,sql]
+----
+CREATE USER grafana IDENTIFIED BY 'change me' SETTINGS readonly = 2;
+GRANT SELECT ON wordmaker.page_views TO grafana;
 ----
 
 == Admin interface
@@ -212,6 +233,8 @@ When the server is not reached through `localhost`, set `WORDMAKER_BASE_URL` (or
 `upload_media`, `list_media`, `delete_media`, `get_settings`, `set_settings`,
 `list_themes`, `get_theme`, `read_theme_file`, `write_theme_file`, `install_theme`, `activate_theme`, `delete_theme`.
 
+A tool call's arguments may be up to 2 MiB, like a REST API request; only `upload_media` takes up to `WORDMAKER_MAX_UPLOAD`, as base64 (standard or URL-safe, padding and line breaks optional).
+
 === Command line client
 
 Agents that can run shell commands but have no MCP support can use `wordmaker client`, which talks to the `/mcp` endpoint of a running server.
@@ -232,6 +255,7 @@ echo '{"slug": "about"}' | wordmaker client call get_page -
 Arguments come from an optional JSON object (`-` reads it from stdin), overridden by
 `--arg KEY=VALUE` (string), `--json KEY=JSON`, `--file KEY=PATH` (file contents as a string) and `--base64 KEY=PATH`.
 The result goes to stdout; a failed tool call prints the error to stderr and exits with status 1.
+The client gives up after `--timeout` seconds (default 300), and warns when the token would cross the network over plain `http://`.
 
 == REST API
 

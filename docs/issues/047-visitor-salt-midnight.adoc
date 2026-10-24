@@ -1,13 +1,13 @@
 = 047: Visitor salt is regenerated repeatedly around midnight
 :severity: Low
 :area: Analytics
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Analytics
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -28,3 +28,10 @@ overcounted.
 == Suggested fix
 
 * Keep today's and yesterday's salts and never regenerate a day's salt.
+
+== Resolution
+
+`DailySalt` keeps the salts of the two latest days and never makes a day's
+salt twice, so hits arriving out of order around midnight keep their
+visitor IDs. A hit older than both days (only possible for a request
+lasting a day) gets a one-off salt.

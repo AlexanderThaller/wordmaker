@@ -1,17 +1,31 @@
 use std::sync::Arc;
 
-use base64::Engine;
+use base64::{
+    Engine,
+    engine::{
+        GeneralPurpose,
+        general_purpose,
+    },
+};
 use rmcp::{
     ErrorData,
+    RoleServer,
     ServerHandler,
-    handler::server::wrapper::Parameters,
+    handler::server::{
+        tool::ToolCallContext,
+        wrapper::Parameters,
+    },
     model::{
+        CallToolRequestParams,
+        CallToolResponse,
         CallToolResult,
         ContentBlock,
         Implementation,
+        JsonObject,
         ServerCapabilities,
         ServerConfig,
     },
+    service::RequestContext,
     tool,
     tool_handler,
     tool_router,
@@ -87,6 +101,14 @@ Theme styling in AsciiDoc, via roles:
      section-1 to section-5). Inside such a block use `[discrete]` before a heading, since \
      AsciiDoc does not allow section titles in delimited blocks.
 - Centered text: `[.has-text-align-center]`.";
+
+/// Largest arguments, as JSON, of any tool but `upload_media`: the same as
+/// the REST API's request bodies (axum's default limit). The HTTP body limit
+/// is set for uploads, so it is far higher.
+const MAX_ARGUMENTS_BYTES: usize = 2 * 1024 * 1024;
+
+/// The one tool whose arguments may be as large as an upload.
+const UPLOAD_TOOL: &str = "upload_media";
 
 #[derive(Clone)]
 pub struct WordMakerMcp {
@@ -414,15 +436,14 @@ impl WordMakerMcp {
         &self,
         Parameters(args): Parameters<UploadMediaArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let bytes =
-            match base64::engine::general_purpose::STANDARD.decode(args.content_base64.trim()) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    return Ok(error_result(format!(
-                        "content_base64 is not valid base64: {err}"
-                    )));
-                }
-            };
+        let bytes = match decode_base64(&args.content_base64) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return Ok(error_result(format!(
+                    "content_base64 is not valid base64: {err}"
+                )));
+            }
+        };
         respond(
             media::store(
                 &self.pool,
@@ -579,6 +600,19 @@ impl WordMakerMcp {
 )]
 #[tool_handler]
 impl ServerHandler for WordMakerMcp {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        if let Some(refused) = check_size(&request) {
+            return Ok(refused.into());
+        }
+        Self::tool_router()
+            .call(ToolCallContext::new(self, request, context))
+            .await
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("wordmaker", env!("CARGO_PKG_VERSION")))
@@ -609,4 +643,99 @@ fn respond<T: Serialize>(result: AppResult<T>) -> Result<CallToolResult, ErrorDa
 
 fn error_result(message: String) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
+}
+
+/// A tool error if the call's arguments are larger than its tool takes.
+fn check_size(request: &CallToolRequestParams) -> Option<CallToolResult> {
+    let arguments = request.arguments.as_ref()?;
+    (request.name != UPLOAD_TOOL && exceeds(arguments, MAX_ARGUMENTS_BYTES)).then(|| {
+        error_result(format!(
+            "the arguments of {} exceed {MAX_ARGUMENTS_BYTES} bytes",
+            request.name
+        ))
+    })
+}
+
+/// Whether `value` is longer than `limit` bytes as JSON; stops counting
+/// there.
+fn exceeds(value: &JsonObject, limit: usize) -> bool {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(buf.len())
+                .ok_or_else(|| std::io::Error::other("limit reached"))?;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Counter(limit), value).is_err()
+}
+
+/// Standard or URL-safe base64, padded or not, and with line breaks or other
+/// whitespace, as encoders write it.
+fn decode_base64(text: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    const LENIENT: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        general_purpose::PAD_INDIFFERENT,
+    );
+    let standard: Vec<u8> = text
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .map(|byte| match byte {
+            b'-' => b'+',
+            b'_' => b'/',
+            byte => byte,
+        })
+        .collect();
+    LENIENT.decode(standard)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn call(name: &'static str, arguments: serde_json::Value) -> CallToolRequestParams {
+        let serde_json::Value::Object(arguments) = arguments else {
+            unreachable!()
+        };
+        CallToolRequestParams::new(name).with_arguments(arguments)
+    }
+
+    #[test]
+    fn large_arguments_are_for_uploads_only() {
+        let big = "x".repeat(MAX_ARGUMENTS_BYTES);
+        let refused = check_size(&call("create_page", json!({ "title": "T", "body": big })));
+        assert_eq!(refused.unwrap().is_error, Some(true));
+        assert!(check_size(&call("write_theme_file", json!({ "content": big }))).is_some());
+        assert!(check_size(&call(UPLOAD_TOOL, json!({ "content_base64": big }))).is_none());
+
+        let small = "x".repeat(MAX_ARGUMENTS_BYTES - 100);
+        assert!(check_size(&call("create_page", json!({ "body": small }))).is_none());
+        assert!(check_size(&CallToolRequestParams::new("list_pages")).is_none());
+    }
+
+    #[test]
+    fn base64_variants() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        let standard = general_purpose::STANDARD.encode(&bytes);
+        let url_safe = general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
+        assert_ne!(standard, url_safe);
+        assert_eq!(decode_base64(&standard).unwrap(), bytes);
+        assert_eq!(decode_base64(&url_safe).unwrap(), bytes);
+        let wrapped = standard
+            .as_bytes()
+            .chunks(76)
+            .map(|line| std::str::from_utf8(line).unwrap())
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        assert_eq!(decode_base64(&format!(" {wrapped}\n")).unwrap(), bytes);
+        assert!(decode_base64("not base64!").is_err());
+    }
 }
