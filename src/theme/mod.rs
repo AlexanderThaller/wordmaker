@@ -11,6 +11,10 @@ use std::{
         Hasher,
     },
     io::Read,
+    net::{
+        IpAddr,
+        SocketAddr,
+    },
     path::{
         Component,
         Path,
@@ -22,6 +26,7 @@ use std::{
         PoisonError,
     },
     time::{
+        Duration,
         SystemTime,
         UNIX_EPOCH,
     },
@@ -31,6 +36,10 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::SqlitePool;
+use url::{
+    Host,
+    Url,
+};
 
 use crate::{
     domain::settings::{
@@ -48,6 +57,9 @@ const DEFAULT_THEME: &str = include_str!("default.json");
 const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 250 * 1024 * 1024;
 const MAX_FILES: usize = 10_000;
+const MAX_REDIRECTS: usize = 5;
+const DNS_TIMEOUT: Duration = Duration::from_secs(10);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Held while themes are installed, deleted, written to or activated, so
 /// that, say, a delete cannot remove a theme that is being activated.
@@ -428,31 +440,54 @@ pub async fn install_from_url(
     url: &str,
     slug: Option<&str>,
 ) -> AppResult<ThemeInfo> {
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err(AppError::BadRequest(
-            "theme URL must be http or https".into(),
-        ));
-    }
     let bytes = download(url).await?;
     install_zip(themes_dir, bytes, slug).await
 }
 
+/// Download a theme zip from the public internet, following up to
+/// `MAX_REDIRECTS` redirects. Each URL on the way is checked by
+/// `connect`. Failures all read the same, so the answers say nothing about
+/// what is listening where.
 async fn download(url: &str) -> AppResult<Vec<u8>> {
-    let failed =
-        |err: reqwest::Error| AppError::BadRequest(format!("downloading {url} failed: {err}"));
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("wordmaker/", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|err| AppError::Internal(err.to_string()))?;
-    let mut response = client
-        .get(url)
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(failed)?;
+    let failed = || AppError::BadRequest(format!("downloading a theme from {url} failed"));
+    let mut current =
+        Url::parse(url).map_err(|_| AppError::BadRequest(format!("invalid theme URL '{url}'")))?;
+    let mut redirects = 0;
+    let mut response = loop {
+        let response = match connect(&current).await {
+            Ok(response) => response,
+            Err(Hop::Refused(message)) => return Err(AppError::BadRequest(message)),
+            Err(Hop::Failed(err)) => {
+                tracing::warn!(url = %current, error = %err, "theme download failed");
+                return Err(failed());
+            }
+        };
+        let status = response.status();
+        if status.is_redirection() && redirects < MAX_REDIRECTS {
+            let next = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|location| location.to_str().ok())
+                .and_then(|location| current.join(location).ok());
+            let Some(next) = next else {
+                tracing::warn!(url = %current, %status, "theme download redirects nowhere");
+                return Err(failed());
+            };
+            redirects += 1;
+            current = next;
+            continue;
+        }
+        if !status.is_success() {
+            tracing::warn!(url = %current, %status, "theme download failed");
+            return Err(failed());
+        }
+        break response;
+    };
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(failed)? {
+    while let Some(chunk) = response.chunk().await.map_err(|err| {
+        tracing::warn!(url = %current, error = %err, "theme download failed");
+        failed()
+    })? {
         bytes.extend_from_slice(&chunk);
         if bytes.len() > MAX_DOWNLOAD_BYTES {
             return Err(AppError::BadRequest(format!(
@@ -461,6 +496,65 @@ async fn download(url: &str) -> AppResult<Vec<u8>> {
         }
     }
     Ok(bytes)
+}
+
+/// Why one request of a download got no response.
+enum Hop {
+    /// The URL is not one to fetch; the message says why.
+    Refused(String),
+    /// Anything else, which is only logged.
+    Failed(String),
+}
+
+/// Request `url` without following redirects. The host is resolved once,
+/// refused unless every address is on the public internet, and connected to
+/// at exactly the address that was checked, without a proxy, so a theme URL
+/// (or a redirect, or a DNS answer that changes) cannot reach the server
+/// itself or its local network.
+async fn connect(url: &Url) -> Result<reqwest::Response, Hop> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(Hop::Refused(format!(
+            "theme URL must be http or https: {url}"
+        )));
+    }
+    let not_public = || Hop::Refused(format!("{url} is not on the public internet"));
+    let port = url.port_or_known_default().unwrap_or(443);
+    let address = match url.host() {
+        Some(Host::Ipv4(ip)) => SocketAddr::new(IpAddr::V4(ip), port),
+        Some(Host::Ipv6(ip)) => SocketAddr::new(IpAddr::V6(ip), port),
+        Some(Host::Domain(domain)) => {
+            let addresses: Vec<SocketAddr> =
+                tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host((domain, port)))
+                    .await
+                    .map_err(|_| Hop::Failed(format!("resolving {domain} timed out")))?
+                    .map_err(|err| Hop::Failed(format!("could not resolve {domain}: {err}")))?
+                    .collect();
+            if addresses.iter().any(|a| !crate::oauth::is_public(a.ip())) {
+                return Err(not_public());
+            }
+            *addresses
+                .first()
+                .ok_or_else(|| Hop::Failed(format!("{domain} has no addresses")))?
+        }
+        None => return Err(Hop::Refused(format!("theme URL has no host: {url}"))),
+    };
+    if !crate::oauth::is_public(address.ip()) {
+        return Err(not_public());
+    }
+    let mut client = reqwest::Client::builder()
+        .user_agent(concat!("wordmaker/", env!("CARGO_PKG_VERSION")))
+        .timeout(DOWNLOAD_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    if let Some(Host::Domain(domain)) = url.host() {
+        client = client.resolve(domain, address);
+    }
+    let client = client.build().map_err(|err| Hop::Failed(err.to_string()))?;
+    client
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(|err| Hop::Failed(err.to_string()))
 }
 
 /// Unpack a theme zip into `themes_dir/<slug>`, replacing an existing theme
@@ -1018,6 +1112,26 @@ mod tests {
         assert!(extract(&themes, &broken, None).is_err());
         assert!(themes.join("t/new.css").is_file());
         std::fs::remove_dir_all(&themes).unwrap();
+    }
+
+    #[tokio::test]
+    async fn downloads_stay_on_the_public_internet() {
+        for url in [
+            "http://127.0.0.1:1/theme.zip",
+            "HTTPS://localhost/theme.zip",
+            "http://[::1]/theme.zip",
+            "http://10.0.0.5:8080/theme.zip",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::ffff:192.168.0.1]/theme.zip",
+        ] {
+            let err = download(url).await.unwrap_err().to_string();
+            assert!(err.contains("not on the public internet"), "{url}: {err}");
+        }
+        for url in ["ftp://example.com/theme.zip", "file:///etc/passwd"] {
+            let err = download(url).await.unwrap_err().to_string();
+            assert!(err.contains("http or https"), "{url}: {err}");
+        }
+        assert!(download("not a url").await.is_err());
     }
 
     #[test]
