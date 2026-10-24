@@ -730,14 +730,28 @@ fn build(
 
 /// Where the stylesheet finds the theme's fonts and images:
 /// `/_wm/theme/{slug}@{stamp}`. The stamp changes when the theme is
-/// installed again, so the files can be cached for good.
+/// installed again or one of its files is written, so the files can be
+/// cached for good.
 fn asset_base(dir: &Path, slug: &str) -> String {
-    let stamp = std::fs::metadata(dir.join("theme.json"))
+    format!("/_wm/theme/{slug}@{}", stamp(dir))
+}
+
+/// Whether `stamp` names the theme's files as they are now, so they may be
+/// cached for good under it. An old or made-up stamp may not: it would keep
+/// whatever is served now once the theme changes.
+pub fn is_current_stamp(themes_dir: &Path, slug: &str, stamp: &str) -> bool {
+    stamp == self::stamp(&themes_dir.join(slug))
+}
+
+/// `theme.json`'s modification time in nanoseconds, which every install and
+/// file write updates.
+fn stamp(dir: &Path) -> String {
+    let nanos = std::fs::metadata(dir.join("theme.json"))
         .and_then(|meta| meta.modified())
         .ok()
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |since| since.as_secs());
-    format!("/_wm/theme/{slug}@{stamp:x}")
+        .map_or(0, |since| since.as_nanos());
+    format!("{nanos:x}")
 }
 
 /// The content and wide sizes from `settings.layout`, where they are given

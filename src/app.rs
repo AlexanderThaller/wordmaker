@@ -708,6 +708,19 @@ mod tests {
         );
         let font = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(font, "font-bytes");
+
+        // Any other stamp, such as a guess at the next one, is not cached.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/_wm/theme/mytheme@1/assets/fonts/body.woff2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
     }
 
     async fn send_bytes(app: &Router, uri: &str, body: Vec<u8>) -> (StatusCode, String) {

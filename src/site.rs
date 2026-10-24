@@ -587,25 +587,29 @@ async fn theme_asset(
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| THEME_ASSET_EXTENSIONS.contains(&ext.to_lowercase().as_str()));
-    // `{slug}@{stamp}`, as the stylesheet links them, names one install of
-    // the theme, which never changes; a bare slug is whatever is there now.
-    let (theme, stamped) = match theme.split_once('@') {
-        Some((slug, _)) => (slug, true),
-        None => (theme.as_str(), false),
+    // `{slug}@{stamp}`, as the stylesheet links them, names one version of
+    // the theme's files, which never changes; a bare slug is whatever is
+    // there now. Any other stamp is not cached at all.
+    let (theme, stamp) = match theme.split_once('@') {
+        Some((slug, stamp)) => (slug, Some(stamp)),
+        None => (theme.as_str(), None),
     };
     if crate::theme::validate_slug(theme).is_err() || !safe_path || !allowed {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let cache_control = match stamp {
+        Some(stamp) if crate::theme::is_current_stamp(&state.config.themes_dir, theme, stamp) => {
+            IMMUTABLE
+        }
+        Some(_) => "no-cache",
+        None => "public, max-age=86400",
+    };
     let file = state.config.themes_dir.join(theme).join(&path);
     match ServeFile::new(file).oneshot(request).await {
         Ok(mut response) => {
             response.headers_mut().insert(
                 header::CACHE_CONTROL,
-                HeaderValue::from_static(if stamped {
-                    IMMUTABLE
-                } else {
-                    "public, max-age=86400"
-                }),
+                HeaderValue::from_static(cache_control),
             );
             response.into_response()
         }

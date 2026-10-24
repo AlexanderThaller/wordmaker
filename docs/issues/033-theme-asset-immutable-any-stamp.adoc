@@ -1,13 +1,13 @@
 = 033: Theme assets are cached as immutable for any stamp, and stamps are predictable
 :severity: Low
 :area: Themes
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Themes
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -31,3 +31,12 @@ The stamp is `theme.json`'s mtime in whole seconds.
 * Send `immutable` only when the stamp matches the current one; otherwise
   `no-cache` or redirect.
 * Use a content hash or nanosecond stamp.
+
+== Resolution
+
+* The stamp is now `theme.json`'s modification time in nanoseconds (hex),
+  so two writes in the same second get different stamps.
+* `+/_wm/theme/{slug}@{stamp}/...+` is sent with the one-year `immutable`
+  header only when the stamp is the theme's current one. Any other stamp,
+  old or guessed, is served with `no-cache`, so a shared cache cannot be
+  primed with a future URL. Unstamped URLs keep their one-day cache.
