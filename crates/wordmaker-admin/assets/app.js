@@ -859,8 +859,10 @@ async function loadRevisions() {
 }
 
 async function openRevision(number) {
-  const revision = await attempt(() => api("GET", `${pagePath(state.current.slug)}/revisions/${number}`));
-  if (!revision) return;
+  const page = state.current;
+  const revision = await attempt(() => api("GET", `${pagePath(page.slug)}/revisions/${number}`));
+  // Shown on another page, Restore would put this page's text into that one.
+  if (!revision || !stillOpen(page)) return;
   state.revision = revision;
   $("#revision-label").textContent = `Revision ${revision.revision}, ${new Date(revision.created_at).toLocaleString()}`;
   $("#revision-banner").hidden = false;
