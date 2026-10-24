@@ -143,25 +143,46 @@ struct Size {
 }
 
 impl Images {
-    /// The displayed size of a stored image, if it is one.
-    fn size(&self, media_dir: &Path, filename: &str) -> Option<Size> {
-        let cached = self
-            .sizes
+    fn sizes(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<Size>>> {
+        self.sizes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(filename)
-            .copied();
+    }
+
+    /// The displayed size of a stored image, if it is one.
+    fn size(&self, media_dir: &Path, filename: &str) -> Option<Size> {
+        let cached = self.sizes().get(filename).copied();
         if let Some(size) = cached {
             return size;
         }
         // Looked up without holding the lock; at worst two pages read the
         // same header.
         let size = read_size(&media_dir.join(filename));
-        self.sizes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(filename.to_owned(), size);
+        self.sizes().insert(filename.to_owned(), size);
         size
+    }
+
+    /// [`Images::size`], reading the header on the blocking pool.
+    async fn size_async(&self, media_dir: &Path, filename: &str) -> Option<Size> {
+        let cached = self.sizes().get(filename).copied();
+        if let Some(size) = cached {
+            return size;
+        }
+        let path = media_dir.join(filename);
+        let size = tokio::task::spawn_blocking(move || read_size(&path))
+            .await
+            .ok()
+            .flatten();
+        self.sizes().insert(filename.to_owned(), size);
+        size
+    }
+
+    /// Stops offering and attempting scaled copies of an image that could
+    /// not be decoded.
+    fn mark_unscalable(&self, filename: &str) {
+        if let Some(Some(size)) = self.sizes().get_mut(filename) {
+            size.scalable = false;
+        }
     }
 
     /// Add size, `srcset` and loading hints to the `<img>` elements of a
@@ -236,6 +257,8 @@ impl Images {
 
     /// The file to serve for `filename` scaled to `width`, creating it on
     /// first use. Images narrower than `width` are served as they are.
+    /// Only a copy that is actually made waits for one of the scaling
+    /// permits; everything else is settled from the image's header.
     pub async fn variant(&self, media_dir: &Path, width: u32, filename: &str) -> Option<PathBuf> {
         if !WIDTHS.contains(&width) || media_filename(&format!("/media/{filename}")).is_none() {
             return None;
@@ -247,6 +270,18 @@ impl Images {
             .join(filename);
         if tokio::fs::try_exists(&target).await.unwrap_or(false) {
             return Some(target);
+        }
+        // Checked first so that names nobody uploaded are not remembered:
+        // anyone can ask for them.
+        if !tokio::fs::try_exists(&source).await.unwrap_or(false) {
+            return None;
+        }
+        let size = self.size_async(media_dir, filename).await?;
+        if !size.scalable {
+            return None;
+        }
+        if size.width <= width {
+            return Some(source);
         }
 
         let _permit = self.scaling.acquire().await.ok()?;
@@ -264,6 +299,7 @@ impl Images {
             Ok(Err(err)) => {
                 if source.is_file() {
                     tracing::warn!(error = %err, filename, width, "could not scale image");
+                    self.mark_unscalable(filename);
                 }
                 None
             }
@@ -496,6 +532,58 @@ mod tests {
 
         delete_variants(&dir, "photo.jpg").await;
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn only_real_scaling_waits_for_a_permit() {
+        let dir = temp_dir();
+        write_jpeg(&dir, "photo.jpg", 1000, 500);
+        std::fs::write(dir.join("notes.txt"), "not an image").unwrap();
+        let images = Images::default();
+        let busy = images.scaling.acquire_many(2).await.unwrap();
+
+        let settled = async {
+            assert_eq!(
+                images.variant(&dir, 1200, "photo.jpg").await,
+                Some(dir.join("photo.jpg"))
+            );
+            assert_eq!(images.variant(&dir, 480, "missing.jpg").await, None);
+            assert_eq!(images.variant(&dir, 480, "notes.txt").await, None);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), settled)
+            .await
+            .expect("answered without a permit");
+        // Unknown names are not remembered.
+        assert!(!images.sizes().contains_key("missing.jpg"));
+        drop(busy);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn undecodable_images_are_not_scaled_again() {
+        let dir = temp_dir();
+        // The header survives, the image data does not.
+        let mut png = std::io::Cursor::new(Vec::new());
+        DynamicImage::new_rgb8(1000, 500)
+            .write_to(&mut png, ImageFormat::Png)
+            .unwrap();
+        let png = png.into_inner();
+        std::fs::write(dir.join("broken.png"), &png[..png.len() / 3]).unwrap();
+        let images = Images::default();
+
+        assert_eq!(images.variant(&dir, 480, "broken.png").await, None);
+        assert_eq!(
+            images
+                .sizes()
+                .get("broken.png")
+                .copied()
+                .flatten()
+                .map(|s| s.scalable),
+            Some(false)
+        );
+        let html = images.rewrite(r#"<img src="/media/broken.png">"#, &dir, Layout::default());
+        assert!(!html.contains("srcset"), "{html}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

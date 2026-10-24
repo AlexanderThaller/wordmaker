@@ -1,13 +1,13 @@
 = 011: Image variants wider than the original re-decode the full image every time
 :severity: Medium
 :area: Media
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Medium
 Area:: Media
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -39,3 +39,19 @@ again.
   serve `/media/<file>`.
 * Remember failures, and return 404 before taking a permit when the source
   file does not exist.
+
+== Resolution
+
+`Images::variant` now settles everything it can from the image header
+before taking a scaling permit:
+
+* A source file that does not exist answers 404 at once, and its name is
+  not remembered, since anyone can ask for any name.
+* A file that is not a scalable image answers 404 from the cached size.
+* A width at or above the image's (oriented) width serves the original
+  without decoding it.
+
+Only a copy that is actually made waits for a permit and decodes the
+image, and its result is stored on disk. When decoding fails, the image is
+marked unscalable in the size cache, so it is neither attempted again nor
+offered in `srcset`.
