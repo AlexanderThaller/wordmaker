@@ -1,0 +1,27 @@
+= 056: base_url_hosts parses the base URL by hand
+:severity: Info
+:area: Config
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Info
+Area:: Config
+Status:: Open
+
+== Summary
+
+The host list for the MCP Host check is derived by manual string
+handling.
+
+== Location
+
+* `src/main.rs:199-211`
+
+== Impact
+
+IPv6 or userinfo base URLs produce junk entries. Not exploitable.
+
+== Suggested fix
+
+* Parse with `url::Url` and use `host_str()` and `port()`.

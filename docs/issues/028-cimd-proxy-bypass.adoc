@@ -1,0 +1,29 @@
+= 028: Client metadata fetches honour HTTPS_PROXY, bypassing DNS pinning
+:severity: Low
+:area: OAuth
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: OAuth
+Status:: Open
+
+== Summary
+
+The reqwest client does not call `.no_proxy()`. If `HTTPS_PROXY` is set,
+the proxy resolves the host itself, defeating the `.resolve()` pin and the
+private-address check.
+
+== Location
+
+* `src/oauth/client_metadata.rs:122-127`
+
+== Impact
+
+Only in deployments with a proxy environment variable set (uncertain).
+
+== Suggested fix
+
+* Add `.no_proxy()` to the client builder. The same applies to the theme
+  downloader once it gets address checks.

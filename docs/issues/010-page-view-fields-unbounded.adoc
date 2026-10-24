@@ -1,0 +1,43 @@
+= 010: Page-view fields have no length limit, allowing memory exhaustion
+:severity: Medium
+:area: Analytics
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Medium
+Area:: Analytics
+Status:: Open
+
+== Summary
+
+Path, slug (a second copy of the path), query, User-Agent, Referer and
+Accept-Language are copied into each `Hit` at full size. The queue (10,000)
+and the sink buffer (`MAX_BUFFER`, 50,000) are capped by rows, not bytes.
+
+== Location
+
+* `src/site.rs:120-138`
+* `src/analytics/mod.rs:43`
+* `src/analytics/sink.rs:46`
+* `src/analytics/sink.rs:48`
+* `src/analytics/sink.rs:271`
+
+== Impact
+
+* hyper accepts about 408 KB of headers and URIs up to about 64 KB.
+  Repeated `GET /<random>` with ~350 KB User-Agent and Referer can fill
+  60,000 × ~400 KB, over 20 GB of heap, with no authentication.
+* Each 1,000-row batch becomes ~400 MB, so `insert()` hits its 10 s
+  timeout. The sink then treats ClickHouse as down and keeps buffering:
+  OOM even while ClickHouse is healthy.
+* Behind nginx's default 8 KB header limit it is still about 2 GB.
+* The same values fill ClickHouse's disk, and land in `LowCardinality`
+  columns (`utm_*`, `language`, versions), slowing queries.
+
+== Suggested fix
+
+* Truncate every field when building the `Hit` (e.g. path 1 KB, UA 512 B,
+  referrer 1 KB, utm/language 64–128 B).
+* Cap the buffer by bytes as well as rows.
+* Scale the insert timeout with batch size.

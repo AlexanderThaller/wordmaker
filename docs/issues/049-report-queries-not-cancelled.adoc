@@ -1,0 +1,29 @@
+= 049: Timed-out report queries keep running in ClickHouse
+:severity: Low
+:area: Analytics
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Analytics
+Status:: Open
+
+== Summary
+
+The 10 s report timeout drops the client future, but ClickHouse only
+cancels HTTP read queries on disconnect when
+`cancel_http_readonly_queries_on_client_close` is enabled (off by default).
+
+== Location
+
+* `src/analytics/mod.rs:188`
+
+== Impact
+
+A dashboard on 10 s auto-refresh over 366 days, with 11 parallel queries,
+piles up long-running queries.
+
+== Suggested fix
+
+* Set `max_execution_time` on each report query.

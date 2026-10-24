@@ -1,0 +1,32 @@
+= 053: Minor theme robustness issues
+:severity: Low
+:area: Themes
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Themes
+Status:: Open
+
+== Summary
+
+Small correctness gaps in the theme code.
+
+== Location
+
+* `src/theme/mod.rs:294-299`
+* `src/theme/mod.rs:412`
+* `src/theme/site_css.rs:72-81`
+
+== Impact
+
+* `read_file` on a directory returns 500 instead of 400.
+* The URL scheme check in `install_from_url` is case-sensitive
+  (`HTTPS://` is rejected).
+* `luminance` accepts a `+` sign through `from_str_radix` (`#+f+f+f`).
+
+== Suggested fix
+
+* Return 400 for directories, compare schemes case-insensitively, and
+  validate hex digits (see link:004-luminance-panic-crash-loop.adoc[issue 4]).

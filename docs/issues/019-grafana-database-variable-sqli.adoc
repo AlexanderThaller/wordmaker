@@ -1,0 +1,29 @@
+= 019: Grafana dashboard variable allows SQL injection by viewers
+:severity: Low
+:area: Grafana
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Grafana
+Status:: Open
+
+== Summary
+
+`+${database}+` is a free-text variable placed raw into every query
+(`+FROM ${database}.page_views+`).
+
+== Location
+
+* `grafana/wordmaker.json:54-63`
+
+== Impact
+
+A dashboard Viewer sets `+?var-database=...+` and runs arbitrary SQL with
+the data source's credentials.
+
+== Suggested fix
+
+* Make the variable a constant or hidden.
+* Recommend a read-only ClickHouse user for Grafana in the README.

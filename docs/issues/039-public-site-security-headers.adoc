@@ -1,0 +1,33 @@
+= 039: Public site sends no security headers
+:severity: Low
+:area: Site
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Site
+Status:: Open
+
+== Summary
+
+Public pages have no `X-Frame-Options`/`frame-ancestors`,
+`Referrer-Policy` or `X-Content-Type-Options`. Only the OAuth pages set a
+CSP.
+
+== Location
+
+* `src/app.rs`
+* `src/site.rs`
+
+== Impact
+
+Pages can be framed for clickjacking, full URLs leak in referrers, and
+browsers may sniff content types (see
+link:005-media-active-content-site-origin.adoc[issue 5]).
+
+== Suggested fix
+
+* Add `X-Content-Type-Options: nosniff`, `Referrer-Policy:
+  strict-origin-when-cross-origin` and `frame-ancestors 'self'` to all
+  responses.

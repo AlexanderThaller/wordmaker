@@ -1,0 +1,35 @@
+= 034: Theme install, delete and write are not atomic and race each other
+:severity: Low
+:area: Themes
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Themes
+Status:: Open
+
+== Summary
+
+Reinstalling does `remove_dir_all` then `rename`. Theme mutations are not
+serialised.
+
+== Location
+
+* `src/theme/mod.rs:136-148`
+* `src/theme/mod.rs:543-547`
+
+== Impact
+
+* Between remove and rename the active theme is missing; a failed rename
+  leaves no theme at all.
+* Two concurrent installs of the same slug race.
+* `delete` checks "not active" then deletes; a concurrent `activate` can
+  leave a deleted theme active.
+* `write_file` racing `delete` can recreate an orphan directory.
+
+== Suggested fix
+
+* Rename the old directory aside, swap in the new one, then remove the old
+  one.
+* Serialise theme mutations with a mutex.

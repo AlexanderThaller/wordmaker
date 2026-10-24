@@ -1,0 +1,30 @@
+= 047: Visitor salt is regenerated repeatedly around midnight
+:severity: Low
+:area: Analytics
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Analytics
+Status:: Open
+
+== Summary
+
+`Hit.time` is the request start, but hits are queued at response end, so
+they can arrive out of order across midnight. The salt is regenerated each
+time the day changes back.
+
+== Location
+
+* `src/analytics/sink.rs:361-368`
+
+== Impact
+
+A slow request at 23:59:59.9 and a fast one at 00:00:00.1 flip the salt
+back and forth; one visitor gets several IDs and unique visitors are
+overcounted.
+
+== Suggested fix
+
+* Keep today's and yesterday's salts and never regenerate a day's salt.

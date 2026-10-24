@@ -1,0 +1,36 @@
+= 004: Non-ASCII colour value panics and, under panic=abort, crash-loops the server
+:severity: Medium
+:area: Themes
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Medium
+Area:: Themes
+Status:: Open
+
+== Summary
+
+`luminance` checks the byte length of the hex string and then slices it
+by byte offsets (`+&hex[i..=i]+`, `+&hex[0..2]+`). A multi-byte character
+puts an offset inside a code point and the slice panics.
+
+== Location
+
+* `src/theme/site_css.rs:72-81`
+* `Cargo.toml:34`
+
+== Impact
+
+. A theme (or `write_theme_file`) sets
+  `+"styles":{"color":{"background":"#é1"}}+`, directly or through a palette
+  entry. Confirmed: panics with "not a char boundary".
+. In a normal build the panic becomes a `JoinError` and the built-in theme
+  is used.
+. The `deploy` profile sets `panic = "abort"`, so the whole server dies on
+  the first page view after activation, and again after every restart.
+
+== Suggested fix
+
+* Require `+hex.bytes().all(|b| b.is_ascii_hexdigit())+` before slicing.
+  This also rejects the `+` sign that `from_str_radix` currently accepts.

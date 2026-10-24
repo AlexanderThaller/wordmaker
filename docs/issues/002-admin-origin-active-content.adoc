@@ -1,0 +1,47 @@
+= 002: Admin proxy serves script-capable upstream files on the admin origin
+:severity: High
+:area: wordmaker-admin
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: High
+Area:: wordmaker-admin
+Status:: Open
+
+== Summary
+
+The admin forwards `/_wm/{*path}` and `/media/{*path}` to the server and
+passes the upstream `Content-Type` through. Theme assets may be `.svg` and
+media uploads may have any extension, so SVG and HTML are served on the
+admin origin with no CSP and no sandbox. Any CSP the server might send is
+dropped, because only allow-listed headers are copied.
+
+== Location
+
+* `crates/wordmaker-admin/src/app.rs:111-112`
+* `crates/wordmaker-admin/src/proxy.rs:228-234`
+* `crates/wordmaker-admin/src/app.rs:180-195`
+* `crates/wordmaker-admin/assets/app.js:886`
+
+== Impact
+
+. An attacker gets an `evil.svg` onto the server: through a theme the
+  operator installs, `write_theme_file`, or `upload_media` from a
+  prompt-injected MCP client.
+. The admin opens `https://admin.example/_wm/theme/evil/evil.svg`, or clicks
+  the media card (which links to `item.path` with `target=_blank`).
+. The SameSite=Lax session cookie is sent on top-level navigation. The
+  script is same-origin, so it can add the `x-wordmaker-admin` guard header
+  and call `/api/v1/*` with the full API token: change settings, rewrite
+  pages, install themes.
+. Without OIDC (loopback mode) no cookie is needed at all.
+
+== Suggested fix
+
+* Add `+Content-Security-Policy: default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'; sandbox+`
+  and `X-Content-Type-Options: nosniff` to every response from `public()`.
+* Or allow only image, font and CSS content types there and force
+  `Content-Disposition: attachment` for everything else.
+* Give the admin app itself a CSP
+  (`+script-src 'self' 'wasm-unsafe-eval'; object-src 'none'; frame-ancestors 'self'+`).

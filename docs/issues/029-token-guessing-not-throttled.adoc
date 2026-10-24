@@ -1,0 +1,32 @@
+= 029: Wrong-token delay does not limit guessing; /api and /mcp have no delay
+:severity: Low
+:area: Auth
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Auth
+Status:: Open
+
+== Summary
+
+The OAuth sign-in sleeps 1 s per failed attempt, but per request, so
+parallel attempts are not throttled. `/api` and `/mcp` check the same token
+with no delay at all.
+
+== Location
+
+* `src/oauth/mod.rs:408-410`
+* `src/app.rs:108-121`
+* `src/app.rs:125-143`
+
+== Impact
+
+Tokens from `wordmaker token` have about 244 bits of randomness and are
+safe. A weak, hand-chosen `WORDMAKER_TOKEN` can be brute-forced.
+
+== Suggested fix
+
+* Add a global or per-IP failure limiter on all three endpoints.
+* Enforce a minimum token length at startup.

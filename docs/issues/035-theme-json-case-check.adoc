@@ -1,0 +1,29 @@
+= 035: theme.json object check is a raw string comparison
+:severity: Low
+:area: Themes
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Themes
+Status:: Open
+
+== Summary
+
+`write_file` validates that `theme.json` is a JSON object by comparing the
+path string exactly.
+
+== Location
+
+* `src/theme/mod.rs:332`
+
+== Impact
+
+On case-insensitive filesystems (macOS, Windows) `THEME.JSON` bypasses the
+check and can be written as a non-object. On Linux `theme.json/` fails with
+ENOTDIR (tested), so it is not exploitable there.
+
+== Suggested fix
+
+* Compare the normalised path case-insensitively.

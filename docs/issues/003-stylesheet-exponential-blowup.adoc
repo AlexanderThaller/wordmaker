@@ -1,0 +1,42 @@
+= 003: Nested block styles make the stylesheet grow exponentially
+:severity: High
+:area: Themes
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: High
+Area:: Themes
+Status:: Open
+
+== Summary
+
+`descend()` takes the cross product of the scope selectors and the inner
+selectors. `core/heading` and the `heading`/`caption` elements expand to six
+selectors each, so every level of nesting multiplies the output by about 7.
+The cache has no in-flight deduplication, so each concurrent request starts
+its own build.
+
+== Location
+
+* `src/theme/css.rs:533-573`
+* `src/theme/css.rs:748-755`
+* `src/theme/mod.rs:619-638`
+
+== Impact
+
+* Nesting `+{"blocks":{"core/heading":{"blocks":{"core/heading":...}}}}+`:
+  depth 6 gave 0.9 MB, depth 7 gave 6 MB, depth 8 gave 42 MB (measured).
+  Depth 12, a `theme.json` of about 300 bytes, is around 100 GB.
+* The stylesheet is built on page requests until cached. Concurrent
+  requests each spawn a blocking build, leading to OOM or a saturated
+  blocking pool: the public site stops serving.
+* Second, quadratic variant: `+{"ref":"styles"}+` serialises the whole
+  `styles` object at each use. 200 refs turned 8.9 KB of input into 1.8 MB.
+
+== Suggested fix
+
+* Cap nesting depth (WordPress only nests one level), selector count and
+  total output size; fail the build with an error when exceeded.
+* Reject a `ref` whose target is an object.
+* Make builds single-flight per cache key.

@@ -1,0 +1,28 @@
+= 046: Page views can be written twice after an insert timeout
+:severity: Low
+:area: Analytics
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Analytics
+Status:: Open
+
+== Summary
+
+If `insert.end()` commits on the server but the 10 s client timeout
+fires, the whole buffer is kept and sent again.
+
+== Location
+
+* `src/analytics/sink.rs:271`
+
+== Impact
+
+Duplicate page views in ClickHouse after a slow insert.
+
+== Suggested fix
+
+* Use an insert deduplication token (`insert_deduplication_token`), or
+  accept and document it.

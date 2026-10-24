@@ -1,0 +1,33 @@
+= 052: MCP accepts bodies of twice the upload limit for every tool; base64 strictness
+:severity: Low
+:area: MCP
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: MCP
+Status:: Open
+
+== Summary
+
+`max_request_body_bytes = max_upload * 2` applies to every MCP call, so
+`create_page` or `write_theme_file` accept about 50 MB, far above the REST
+API's 2 MB default. `upload_media` decodes with the STANDARD base64 engine.
+Origin validation is off, acceptable only because auth is header-based. The
+post-decode size check is correct.
+
+== Location
+
+* `src/app.rs:65`
+* `src/mcp.rs:412`
+
+== Impact
+
+* Large non-upload requests are accepted over MCP.
+* Line-wrapped or URL-safe base64 uploads are rejected (usability).
+
+== Suggested fix
+
+* Apply the large limit only to `upload_media`, or validate sizes per tool.
+* Accept whitespace and URL-safe base64.

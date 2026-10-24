@@ -1,0 +1,31 @@
+= 017: 5xx responses expose raw database, IO and ClickHouse error text
+:severity: Low
+:area: API
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: API
+Status:: Open
+
+== Summary
+
+`Database`, `Io` and `Internal` errors send their message to the client
+(`+"database error: ..."+`). The analytics API returns the full ClickHouse
+error chain. All of these endpoints need authentication.
+
+== Location
+
+* `src/error.rs:152`
+* `src/error.rs:200`
+* `src/api/analytics.rs:56`
+
+== Impact
+
+An API or MCP client sees file paths, SQL details or ClickHouse
+internals in error responses.
+
+== Suggested fix
+
+* Log the details and return a generic message for 5xx responses.

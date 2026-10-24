@@ -1,0 +1,32 @@
+= 021: A colliding upload name overwrites and then deletes the existing file
+:severity: Low
+:area: Media
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Media
+Status:: Open
+
+== Summary
+
+Stored names are a 32-bit random prefix plus the sanitised name.
+`tokio::fs::write` truncates an existing file; when the `UNIQUE` insert then
+fails, the cleanup `remove_file` deletes it.
+
+== Location
+
+* `src/domain/media.rs:229`
+* `src/domain/media.rs:243`
+* `src/domain/media.rs:258-262`
+
+== Impact
+
+When prefix and name collide, the existing media file is overwritten and
+then removed, while its database row remains. Unlikely, but real.
+
+== Suggested fix
+
+* Open with `create_new(true)` and retry with a new prefix, or use the full
+  UUID.

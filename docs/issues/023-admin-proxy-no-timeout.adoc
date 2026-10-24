@@ -1,0 +1,27 @@
+= 023: Admin proxy's upstream client has no timeout
+:severity: Low
+:area: wordmaker-admin
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: wordmaker-admin
+Status:: Open
+
+== Summary
+
+The reqwest client used to forward requests has no connect or request
+timeout.
+
+== Location
+
+* `crates/wordmaker-admin/src/proxy.rs:38-41`
+
+== Impact
+
+A hung upstream ties up admin connections indefinitely.
+
+== Suggested fix
+
+* Set a connect timeout and a request timeout (longer for uploads).

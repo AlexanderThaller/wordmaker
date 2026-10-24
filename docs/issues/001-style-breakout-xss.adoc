@@ -1,0 +1,42 @@
+= 001: Theme CSS can break out of the inline <style> element
+:severity: High
+:area: Site rendering / themes
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: High
+Area:: Site rendering / themes
+Status:: Open
+
+== Summary
+
+The generated stylesheet is inlined into every public page. The only
+protection against ending the `<style>` element early is
+`+css.replace("</style", "<\/style")+`, which is case-sensitive. HTML end
+tags are not, so `+</STYLE>+`, `+</Style>+` and so on close the element.
+
+== Location
+
+* `src/site.rs:381`
+* `src/theme/css.rs:67-74`
+
+== Impact
+
+. A theme's `style.css` (from a zip installed from wordpress.org or any
+  URL, or written with `write_theme_file`), or a `styles.css` value in
+  `theme.json`, contains `+</STYLE><script>...</script>+`.
+. The CSS is appended verbatim and survives minification.
+. The script runs on every public page, on the same origin as
+  `/oauth/authorize`, where it can open the sign-in page and read its DOM
+  while the admin types the token (plausible, not tested).
+
+Theme authors are otherwise only expected to control the design, so this
+turns installing a third-party theme into code execution on the site.
+
+== Suggested fix
+
+* Escape every `<` in the CSS as `+\3c +` (valid in CSS strings and
+  selectors), or match `</style` case-insensitively.
+* Optionally serve the stylesheet as an external file and add a CSP to
+  public pages.

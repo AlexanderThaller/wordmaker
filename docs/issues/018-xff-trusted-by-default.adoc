@@ -1,0 +1,32 @@
+= 018: Client IP is spoofable through X-Forwarded-For by default
+:severity: Low
+:area: Analytics
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Analytics
+Status:: Open
+
+== Summary
+
+`proxy_hops` defaults to 1, so the last `X-Forwarded-For` entry is
+trusted even when no proxy is in front.
+
+== Location
+
+* `src/analytics/mod.rs:92`
+* `src/analytics/mod.rs:227-237`
+
+== Impact
+
+With `+WORDMAKER_BIND=0.0.0.0:...+` and no proxy (or a proxy that does not
+set the header), visitors choose their own IP: fake geo/ASN data and inflated
+unique visitors. This affects analytics integrity only.
+
+== Suggested fix
+
+* Default to 0 hops, or only honour the header when the peer is a trusted
+  proxy address.
+* Warn at startup when hops > 0 and the bind address is not loopback.

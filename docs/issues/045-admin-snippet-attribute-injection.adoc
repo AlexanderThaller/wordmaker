@@ -1,0 +1,29 @@
+= 045: Copied image snippets can carry attributes from the uploaded filename
+:severity: Low
+:area: wordmaker-admin UI
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: wordmaker-admin UI
+Status:: Open
+
+== Summary
+
+Only `[` and `]` are stripped from `original_name` when building the
+`image::` snippet. The uploader controls `original_name`.
+
+== Location
+
+* `crates/wordmaker-admin/assets/app.js:872-877`
+
+== Impact
+
+A file named `+a,link=https://evil.example/x.png+` produces a snippet with
+an extra `link=` attribute; the admin pastes it and the image links
+elsewhere.
+
+== Suggested fix
+
+* Also strip `,`, `=` and `"`, or quote the alt text.

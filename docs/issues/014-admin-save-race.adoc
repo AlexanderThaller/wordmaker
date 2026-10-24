@@ -1,0 +1,45 @@
+= 014: Switching pages during a save can write one page's content into another
+:severity: Medium
+:area: wordmaker-admin UI
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Medium
+Area:: wordmaker-admin UI
+Status:: Open
+
+== Summary
+
+`save()` does not remember which page it started on. After its awaits it
+calls `show(A)` and restores the typed title, even if the user has since
+navigated elsewhere.
+
+== Location
+
+* `crates/wordmaker-admin/assets/app.js:492-526`
+* `crates/wordmaker-admin/assets/app.js:199-212`
+
+== Impact
+
+. Edit page A and press Save. While it is in flight, navigate to page B
+  and confirm "Discard changes?".
+. `openPage(B)` returns first. Then `save()` runs `show(A)`: `state.current`
+  becomes A, the slug field shows A, the title is reset to the typed value
+  (now B's) and the editor still holds B's body.
+. The hash says B and the form is dirty. The next Ctrl+S saves B's title and
+  body as page A; A's content is lost.
+
+Related: `state.saving` is never checked, so a double Ctrl+S or Save then
+Publish sends the same PATCH twice. After a slug rename the second goes to
+the old slug, gets a 404 and aborts the publish; duplicate draft PUTs create
+extra revisions. `show(page)` also overwrites slug, nav and order edits typed
+during the save.
+
+== Suggested fix
+
+* Capture `const target = state.current` at the start of `save()`; after
+  each await, stop if `state.current !== target` (or update only
+  `state.current` without touching the fields).
+* Return early when `state.saving` is set, and disable Save/Publish while
+  saving.

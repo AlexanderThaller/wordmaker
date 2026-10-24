@@ -1,0 +1,31 @@
+= 040: panic = "abort" turns any request-path panic into an outage
+:severity: Low
+:area: Build
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Build
+Status:: Open
+
+== Summary
+
+`spawn_blocking` only turns a panic into a 500 when panics unwind. With
+the `deploy` profile's `panic = "abort"`, a panic in `image`, `lol_html`,
+the renderer or theme CSS takes down the server.
+
+== Location
+
+* `Cargo.toml:34`
+
+== Impact
+
+See link:004-luminance-panic-crash-loop.adoc[issue 4] for a concrete
+case. Fuzzing the renderer found no panics.
+
+== Suggested fix
+
+* Consider `panic = "unwind"` for the server binary, or make sure the
+  service manager restarts it and that no persisted input can panic on
+  every request.

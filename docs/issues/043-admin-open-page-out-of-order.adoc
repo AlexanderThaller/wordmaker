@@ -1,0 +1,28 @@
+= 043: Two quick page clicks can show the wrong page
+:severity: Low
+:area: wordmaker-admin UI
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: wordmaker-admin UI
+Status:: Open
+
+== Summary
+
+`openPage` responses can arrive out of order.
+
+== Location
+
+* `crates/wordmaker-admin/assets/app.js:325-342`
+
+== Impact
+
+Click A then B; A's response arrives last, so the editor shows A while the
+hash says B, and anything typed into B meanwhile is overwritten without a
+prompt.
+
+== Suggested fix
+
+* Use a request counter, as `previewRequest` already does.

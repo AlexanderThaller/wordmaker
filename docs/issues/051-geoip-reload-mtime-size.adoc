@@ -1,0 +1,27 @@
+= 051: GeoIP reload only compares mtime and size
+:severity: Low
+:area: Analytics
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: Analytics
+Status:: Open
+
+== Summary
+
+A changed database is detected by mtime and size only.
+
+== Location
+
+* `src/analytics/geo.rs:69`
+* `src/analytics/geo.rs:90-93`
+
+== Impact
+
+A replacement with the same mtime and size is never loaded.
+
+== Suggested fix
+
+* Also compare the inode (`MetadataExt::ino`).

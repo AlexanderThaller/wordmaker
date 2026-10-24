@@ -1,0 +1,36 @@
+= 055: Token endpoint details
+:severity: Info
+:area: OAuth
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Info
+Area:: OAuth
+Status:: Open
+
+== Summary
+
+Minor deviations, mostly mitigated by mandatory PKCE.
+
+== Location
+
+* `src/oauth/mod.rs:626`
+* `src/oauth/mod.rs:697-704`
+* `src/app.rs:100`
+
+== Impact
+
+* `redirect_uri` is optional at the token endpoint.
+* `code_verifier` characters are not checked against the allowed set.
+* `Bearer` is matched case-sensitively.
+* `/oauth/token` and `/oauth/revoke` without a form content type get axum's
+  plain-text 415 instead of an OAuth JSON error.
+* `purge_expired` runs on every anonymous `/oauth/token` call, an
+  unnecessary write per request.
+
+== Suggested fix
+
+* Require `redirect_uri` when it was sent at authorize, validate the
+  verifier charset, match the scheme case-insensitively, return OAuth JSON
+  errors, and purge on a timer.

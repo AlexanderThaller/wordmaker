@@ -1,0 +1,31 @@
+= 030: Anonymous client metadata fetches: no negative cache, full cache stops caching
+:severity: Low
+:area: OAuth
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: OAuth
+Status:: Open
+
+== Summary
+
+Every `GET /oauth/authorize?client_id=https://anyhost/x` makes an
+outbound HTTPS request (up to 5 s). Failures are not cached, and once 64
+valid entries fill the cache nothing new is cached.
+
+== Location
+
+* `src/oauth/client_metadata.rs:56-69`
+
+== Impact
+
+* The server can be used to reflect requests to arbitrary public hosts.
+* Legitimate clients refetch on every request once the cache is full.
+* "resolves to a non-public address" acts as a small DNS oracle.
+
+== Suggested fix
+
+* Add a negative cache, per-IP limits and LRU eviction.
+* Use a generic error message.

@@ -1,0 +1,29 @@
+= 022: OAuth sign-in page shows a stray backslash and "n"
+:severity: Low
+:area: OAuth
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: OAuth
+Status:: Open
+
+== Summary
+
+The format string contains `+<main>\\+` followed by a line break. That
+is an escaped backslash, not a line continuation; the output is
+`+<main>\+`, a newline, indentation and `+n{body}+`.
+
+== Location
+
+* `src/oauth/mod.rs:573-574`
+
+== Impact
+
+Every OAuth page renders a visible `\` and `n` before the content
+(confirmed with rustc).
+
+== Suggested fix
+
+* Write `+<main>\n{body}+`.

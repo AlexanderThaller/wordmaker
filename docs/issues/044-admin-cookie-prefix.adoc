@@ -1,0 +1,30 @@
+= 044: Admin cookies lack the __Host- prefix
+:severity: Low
+:area: wordmaker-admin
+:status: open
+:found: 2026-10-24
+
+[horizontal]
+Severity:: Low
+Area:: wordmaker-admin
+Status:: Open
+
+== Summary
+
+Cookies have no `__Host-` prefix, and `Secure` is set only when the public
+URL is HTTPS. No HSTS is sent.
+
+== Location
+
+* `crates/wordmaker-admin/src/auth.rs:379-387`
+
+== Impact
+
+If the admin runs on a subdomain of the public site, script on the site
+origin (e.g. via link:005-media-active-content-site-origin.adoc[issue 5])
+can set `Domain=` cookies with the same names to force a logout or plant a
+login cookie.
+
+== Suggested fix
+
+* Use the `__Host-` prefix on HTTPS and send HSTS.
