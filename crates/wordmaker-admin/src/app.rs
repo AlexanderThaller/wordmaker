@@ -47,6 +47,33 @@ use crate::{
 /// using the token this server holds.
 pub const API_GUARD_HEADER: &str = "x-wordmaker-admin";
 
+/// What the interface's own pages may load. Script only from here (and
+/// the editor's wasm); styles, images, fonts and media more widely, since
+/// the preview shows pages as the site would, and its frame inherits this.
+const ADMIN_CSP: &str = "default-src 'self'; \
+    script-src 'self' 'wasm-unsafe-eval'; \
+    style-src 'self' 'unsafe-inline' https:; \
+    img-src * data: blob:; \
+    font-src * data:; \
+    media-src * data: blob:; \
+    frame-src 'self' https:; \
+    connect-src 'self'; \
+    object-src 'none'; \
+    base-uri 'self'; \
+    form-action 'self'; \
+    frame-ancestors 'self'";
+
+/// Files passed on from the site's `/_wm` and `/media` may be anything a
+/// theme or an upload holds, SVG and HTML included. Opened on their own on
+/// this origin they could script the API with the token, so they are shown
+/// sandboxed, without script. Loading them into the interface's pages as
+/// images, styles or fonts is not affected.
+const PUBLIC_CSP: &str = "default-src 'none'; \
+    img-src 'self' data:; \
+    style-src 'self' 'unsafe-inline'; \
+    font-src 'self'; \
+    sandbox";
+
 #[derive(Debug, Clone)]
 pub struct Admin {
     pub upstream: Upstream,
@@ -162,7 +189,21 @@ async fn public(State(admin): State<Admin>, request: Request) -> Response {
     } else {
         "/media/"
     };
-    admin.upstream.forward(request, prefix, false).await
+    let mut response = admin.upstream.forward(request, prefix, false).await;
+    // A sandbox keeps browsers from showing PDFs at all, and their viewers
+    // run no script of this origin.
+    let pdf = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim_start().starts_with("application/pdf"));
+    if !pdf {
+        response.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(PUBLIC_CSP),
+        );
+    }
+    response
 }
 
 async fn check_host(State(admin): State<Admin>, request: Request, next: Next) -> Response {
@@ -184,6 +225,12 @@ async fn check_host(State(admin): State<Admin>, request: Request, next: Next) ->
 
 async fn security_headers(mut response: Response) -> Response {
     let headers = response.headers_mut();
+    if !headers.contains_key(header::CONTENT_SECURITY_POLICY) {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(ADMIN_CSP),
+        );
+    }
     headers.insert(
         header::X_FRAME_OPTIONS,
         HeaderValue::from_static("SAMEORIGIN"),
@@ -288,6 +335,12 @@ mod tests {
             "{body}"
         );
         assert_eq!(headers[header::X_FRAME_OPTIONS], "SAMEORIGIN");
+        let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        assert!(
+            csp.contains("script-src 'self' 'wasm-unsafe-eval';"),
+            "{csp}"
+        );
+        assert!(!csp.contains("sandbox"), "{csp}");
 
         let (status, headers, _) = send(
             &app,
@@ -368,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn public_files_go_without_the_token() {
         let app = admin(&fake_server().await);
-        let (status, _, body) = send(
+        let (status, headers, body) = send(
             &app,
             request(Method::GET, "/media/logo.png")
                 .body(Body::empty())
@@ -378,6 +431,11 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let seen: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(seen["authorization"], serde_json::Value::Null);
+        // Opened on their own, the site's files cannot script this origin.
+        let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        assert!(csp.starts_with("default-src 'none';"), "{csp}");
+        assert!(csp.ends_with("sandbox"), "{csp}");
+        assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
 
         // Only reading is passed on.
         let (status, ..) = send(
