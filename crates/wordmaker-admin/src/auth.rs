@@ -5,7 +5,9 @@
 //! the provider, `/auth/callback` takes the code back, has the provider's ID
 //! token checked by `openidconnect` and, if its verified email address is on
 //! the allowlist, starts a session. Sessions live in memory, so a restart
-//! signs everyone out.
+//! signs everyone out. A sign-in under way keeps nothing here: its PKCE
+//! verifier and nonce wait in a signed cookie of the browser that started
+//! it, so anonymous visitors cannot fill a table and lock others out.
 
 use std::{
     collections::HashMap,
@@ -19,6 +21,8 @@ use std::{
     time::{
         Duration,
         Instant,
+        SystemTime,
+        UNIX_EPOCH,
     },
 };
 
@@ -52,6 +56,10 @@ use axum_extra::extract::cookie::{
     CookieJar,
     SameSite,
 };
+use hmac::{
+    Hmac,
+    Mac,
+};
 use openidconnect::{
     AccessToken,
     AuthorizationCode,
@@ -80,6 +88,7 @@ use openidconnect::{
     },
 };
 use serde::Deserialize;
+use sha2::Sha256;
 
 use crate::{
     app::{
@@ -92,15 +101,14 @@ use crate::{
 
 const SESSION_COOKIE: &str = "wordmaker_admin_session";
 /// Ties a callback to the browser that started the sign-in, so nobody can
-/// sign someone else in to their own account.
+/// sign someone else in to their own account. One per sign-in, named
+/// `<LOGIN_COOKIE>_<state>`, so sign-ins started in two tabs both work.
 const LOGIN_COOKIE: &str = "wordmaker_admin_login";
 const SESSION_TTL: Duration = Duration::from_hours(12);
 const LOGIN_TTL: Duration = Duration::from_mins(10);
 /// How long the provider's metadata and keys are trusted before they are
 /// fetched again, which picks up rotated keys without a restart.
 const DISCOVERY_TTL: Duration = Duration::from_mins(5);
-/// Starting a sign-in needs no credentials; this bounds what it can fill.
-const MAX_PENDING_LOGINS: usize = 1000;
 
 /// How to sign in through an OIDC provider. Without an issuer,
 /// nobody is asked to sign in.
@@ -248,18 +256,19 @@ struct Inner {
     http: reqwest::Client,
     /// The provider as last discovered, and when.
     provider: Mutex<Option<(Instant, Arc<Provider>)>>,
-    /// Sign-ins under way, by their `state`.
-    logins: Mutex<HashMap<String, PendingLogin>>,
+    /// Signs the login cookies; made at start, so a restart also drops the
+    /// sign-ins under way.
+    login_key: String,
     sessions: Mutex<HashMap<String, Session>>,
 }
 
+/// A sign-in under way, as its cookie carries it.
+#[derive(Debug, PartialEq)]
 struct PendingLogin {
-    /// The provider as discovered when the sign-in started, so the callback
-    /// checks the ID token against the same keys.
-    provider: Arc<Provider>,
-    pkce_verifier: PkceCodeVerifier,
-    nonce: Nonce,
-    started: Instant,
+    pkce_verifier: String,
+    nonce: String,
+    /// Seconds since the Unix epoch.
+    started: u64,
 }
 
 struct Session {
@@ -289,7 +298,7 @@ impl Auth {
                 .timeout(Duration::from_secs(15))
                 .build()?,
             provider: Mutex::default(),
-            logins: Mutex::default(),
+            login_key: CsrfToken::new_random_len(32).secret().clone(),
             sessions: Mutex::default(),
         }));
         auth.provider().await.with_context(|| {
@@ -376,8 +385,8 @@ impl Auth {
         id
     }
 
-    fn cookie(&self, name: &'static str, value: String, max_age: Duration) -> Cookie<'static> {
-        Cookie::build((name, value))
+    fn cookie(&self, name: impl Into<String>, value: String, max_age: Duration) -> Cookie<'static> {
+        Cookie::build((name.into(), value))
             .path("/")
             .http_only(true)
             .secure(self.secure_cookies())
@@ -386,9 +395,94 @@ impl Auth {
             .build()
     }
 
-    fn removal(name: &'static str) -> Cookie<'static> {
-        Cookie::build((name, "")).path("/").build()
+    fn removal(name: impl Into<String>) -> Cookie<'static> {
+        Cookie::build((name.into(), "")).path("/").build()
     }
+
+    fn login_mac(&self, state: &str, login: &PendingLogin) -> Hmac<Sha256> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.0.login_key.as_bytes())
+            .expect("HMAC takes keys of any length");
+        mac.update(
+            format!(
+                "{state}.{}.{}.{}",
+                login.pkce_verifier, login.nonce, login.started
+            )
+            .as_bytes(),
+        );
+        mac
+    }
+
+    /// The login cookie's value: the sign-in and a MAC over it and `state`.
+    fn seal_login(&self, state: &str, login: &PendingLogin) -> String {
+        let tag = self.login_mac(state, login).finalize().into_bytes();
+        format!(
+            "{}.{}.{}.{}",
+            login.pkce_verifier,
+            login.nonce,
+            login.started,
+            hex(&tag)
+        )
+    }
+
+    /// The sign-in a login cookie carries, if this server made it for
+    /// `state` and it has not expired.
+    fn open_login(&self, state: &str, value: &str) -> Option<PendingLogin> {
+        let mut parts = value.split('.');
+        let (Some(pkce_verifier), Some(nonce), Some(started), Some(tag), None) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            return None;
+        };
+        let login = PendingLogin {
+            pkce_verifier: pkce_verifier.to_owned(),
+            nonce: nonce.to_owned(),
+            started: started.parse().ok()?,
+        };
+        self.login_mac(state, &login)
+            .verify_slice(&unhex(tag)?)
+            .ok()?;
+        let age = unix_now().checked_sub(login.started)?;
+        (age < LOGIN_TTL.as_secs()).then_some(login)
+    }
+}
+
+/// The login cookie's name for the sign-in `state`; `None` for a state
+/// this interface would not have made.
+fn login_cookie(state: &str) -> Option<String> {
+    let made_here = !state.is_empty()
+        && state.len() <= 64
+        && state
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+    made_here.then(|| format!("{LOGIN_COOKIE}_{state}"))
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
+}
+
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 type HttpFuture =
@@ -475,29 +569,20 @@ async fn login(State(admin): State<Admin>, jar: CookieJar) -> Response {
         .set_pkce_challenge(pkce_challenge)
         .url();
 
-    {
-        let now = Instant::now();
-        let mut logins = lock(&auth.0.logins);
-        logins.retain(|_, login| now.duration_since(login.started) < LOGIN_TTL);
-        if logins.len() >= MAX_PENDING_LOGINS {
-            return page(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Sign-in unavailable",
-                "Too many sign-ins are under way; try again in a few minutes.",
-            );
-        }
-        logins.insert(
-            state.secret().clone(),
-            PendingLogin {
-                provider,
-                pkce_verifier,
-                nonce,
-                started: now,
-            },
+    let Some(name) = login_cookie(state.secret()) else {
+        return page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Sign-in unavailable",
+            "The sign-in could not be started.",
         );
-    }
-
-    let jar = jar.add(auth.cookie(LOGIN_COOKIE, state.secret().clone(), LOGIN_TTL));
+    };
+    let login = PendingLogin {
+        pkce_verifier: pkce_verifier.secret().clone(),
+        nonce: nonce.secret().clone(),
+        started: unix_now(),
+    };
+    let value = auth.seal_login(state.secret(), &login);
+    let jar = jar.add(auth.cookie(name, value, LOGIN_TTL));
     (jar, Redirect::to(url.as_str())).into_response()
 }
 
@@ -517,9 +602,13 @@ async fn callback(
     let Some(auth) = &admin.auth else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let finished = finish_login(auth, &jar, params).await;
+    let name = params.state.as_deref().and_then(login_cookie);
+    let finished = finish_login(auth, &jar, name.as_deref(), params).await;
     // The sign-in is over either way.
-    let jar = jar.remove(Auth::removal(LOGIN_COOKIE));
+    let jar = match name {
+        Some(name) if jar.get(&name).is_some() => jar.remove(Auth::removal(name)),
+        _ => jar,
+    };
     match finished {
         Ok(user) => {
             tracing::info!(user = %user.0, "signed in");
@@ -553,18 +642,15 @@ fn provider_failed(err: &dyn fmt::Display) -> Refusal {
 async fn finish_login(
     auth: &Auth,
     jar: &CookieJar,
+    cookie: Option<&str>,
     params: CallbackParams,
 ) -> Result<User, Refusal> {
     // The state names the sign-in, and only the browser that started it
-    // holds it in a cookie.
+    // holds its cookie.
     let state = params.state.unwrap_or_default();
-    let started_here = jar
-        .get(LOGIN_COOKIE)
-        .is_some_and(|cookie| !state.is_empty() && cookie.value() == state);
-    let login = started_here
-        .then(|| lock(&auth.0.logins).remove(&state))
-        .flatten()
-        .filter(|login| login.started.elapsed() < LOGIN_TTL)
+    let login = cookie
+        .and_then(|name| jar.get(name))
+        .and_then(|cookie| auth.open_login(&state, cookie.value()))
         .ok_or_else(|| {
             refused(
                 StatusCode::BAD_REQUEST,
@@ -584,11 +670,11 @@ async fn finish_login(
         .ok_or_else(|| refused(StatusCode::BAD_REQUEST, "The provider sent no code."))?;
 
     let http = auth.http_client();
-    let provider = &login.provider;
+    let provider = auth.provider().await.map_err(|err| provider_failed(&err))?;
     let tokens = provider
         .exchange_code(AuthorizationCode::new(code))
         .map_err(|err| provider_failed(&err))?
-        .set_pkce_verifier(login.pkce_verifier)
+        .set_pkce_verifier(PkceCodeVerifier::new(login.pkce_verifier))
         .request_async(&http)
         .await
         .map_err(|err| provider_failed(&err))?;
@@ -599,13 +685,13 @@ async fn finish_login(
     // The access token came straight from the token endpoint, so its
     // `at_hash` need not be checked (OIDC Core 3.1.3.8).
     let claims = id_token
-        .claims(&provider.id_token_verifier(), &login.nonce)
+        .claims(&provider.id_token_verifier(), &Nonce::new(login.nonce))
         .map_err(|err| provider_failed(&err))?;
 
     let email = match claims.email() {
         Some(email) => Some((email.to_string(), claims.email_verified())),
         // Some providers keep the address out of the ID token.
-        None => user_info(provider, &http, tokens.access_token(), claims.subject())
+        None => user_info(&provider, &http, tokens.access_token(), claims.subject())
             .await
             .map_err(|err| provider_failed(&err))?,
     };
@@ -856,6 +942,17 @@ mod tests {
                 .find(|pair| pair.starts_with(&format!("{name}=")))
                 .map(str::to_owned)
         }
+
+        /// The `name=value` part of the login cookie this reply sets.
+        fn login_cookie(&self) -> Option<String> {
+            self.headers
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .filter_map(|value| value.split(';').next())
+                .find(|pair| pair.starts_with(&format!("{LOGIN_COOKIE}_")))
+                .map(str::to_owned)
+        }
     }
 
     async fn call(app: &Router, method: Method, uri: &str, cookie: Option<&str>) -> Reply {
@@ -886,6 +983,25 @@ mod tests {
     /// the callback's answer.
     async fn sign_in_as(app: &Router, email: &str, verified: bool) -> Reply {
         let login = call(app, Method::GET, "/auth/login", None).await;
+        come_back_as(
+            app,
+            &login,
+            email,
+            verified,
+            login.login_cookie().as_deref(),
+        )
+        .await
+    }
+
+    /// Comes back from the provider to the sign-in `login` started, with
+    /// `cookie`.
+    async fn come_back_as(
+        app: &Router,
+        login: &Reply,
+        email: &str,
+        verified: bool,
+        cookie: Option<&str>,
+    ) -> Reply {
         assert_eq!(login.status, StatusCode::SEE_OTHER, "{}", login.body);
         let url = openidconnect::url::Url::parse(login.location()).unwrap();
         let param = |name: &str| {
@@ -908,7 +1024,7 @@ mod tests {
             app,
             Method::GET,
             &format!("/auth/callback?{callback}"),
-            login.cookie(LOGIN_COOKIE).as_deref(),
+            cookie,
         )
         .await
     }
@@ -982,6 +1098,97 @@ mod tests {
         .await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
         assert!(reply.cookie(SESSION_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn sign_ins_keep_no_state_here() {
+        let app = admin().await;
+        // Far more sign-ins than any table would have held.
+        for _ in 0..1500 {
+            let login = call(&app, Method::GET, "/auth/login", None).await;
+            assert_eq!(login.status, StatusCode::SEE_OTHER, "{}", login.body);
+        }
+        let reply = sign_in_as(&app, "alice@example.com", true).await;
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+        assert!(reply.cookie(SESSION_COOKIE).is_some());
+        let removed = reply.login_cookie().unwrap();
+        assert!(
+            removed.ends_with('='),
+            "the login cookie is cleared: {removed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_sign_ins_both_work() {
+        let app = admin().await;
+        let first = call(&app, Method::GET, "/auth/login", None).await;
+        let second = call(&app, Method::GET, "/auth/login", None).await;
+        let cookies = format!(
+            "{}; {}",
+            first.login_cookie().unwrap(),
+            second.login_cookie().unwrap()
+        );
+        for login in [&second, &first] {
+            let reply = come_back_as(&app, login, "alice@example.com", true, Some(&cookies)).await;
+            assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+        }
+    }
+
+    #[tokio::test]
+    async fn login_cookies_cannot_be_altered_or_moved() {
+        let app = admin().await;
+        let first = call(&app, Method::GET, "/auth/login", None).await;
+        let second = call(&app, Method::GET, "/auth/login", None).await;
+        let cookie = first.login_cookie().unwrap();
+
+        // Another sign-in's cookie under this one's name.
+        let (name, _) = cookie.split_once('=').unwrap();
+        let other = second.login_cookie().unwrap();
+        let (_, other) = other.split_once('=').unwrap();
+        let moved = format!("{name}={other}");
+        // A changed verifier.
+        let altered = cookie.replacen('=', "=x", 1);
+        for cookie in [moved, altered] {
+            let reply = come_back_as(&app, &first, "alice@example.com", true, Some(&cookie)).await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{cookie}");
+            assert!(reply.cookie(SESSION_COOKIE).is_none());
+        }
+    }
+
+    #[test]
+    fn login_cookies_expire() {
+        let auth = Auth(Arc::new(Inner {
+            config: args("https://id.example").resolve().unwrap().unwrap(),
+            http: reqwest::Client::new(),
+            provider: Mutex::default(),
+            login_key: "key".into(),
+            sessions: Mutex::default(),
+        }));
+        let fresh = PendingLogin {
+            pkce_verifier: "verifier".into(),
+            nonce: "nonce".into(),
+            started: unix_now(),
+        };
+        let sealed = auth.seal_login("state", &fresh);
+        assert_eq!(auth.open_login("state", &sealed), Some(fresh));
+        assert_eq!(auth.open_login("other", &sealed), None);
+
+        let old = PendingLogin {
+            started: unix_now() - LOGIN_TTL.as_secs(),
+            pkce_verifier: "verifier".into(),
+            nonce: "nonce".into(),
+        };
+        assert_eq!(
+            auth.open_login("state", &auth.seal_login("state", &old)),
+            None
+        );
+
+        assert_eq!(
+            login_cookie("abc-_9").as_deref(),
+            Some("wordmaker_admin_login_abc-_9")
+        );
+        assert_eq!(login_cookie(""), None);
+        assert_eq!(login_cookie("a=b"), None);
     }
 
     #[tokio::test]
