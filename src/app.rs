@@ -216,7 +216,10 @@ mod tests {
     }
 
     async fn get_page(app: &Router, uri: &str) -> StatusCode {
+        // As from a reverse proxy on the same host.
+        let proxy = std::net::SocketAddr::from(([127, 0, 0, 1], 4000));
         let request = Request::get(uri)
+            .extension(axum::extract::ConnectInfo(proxy))
             .header("x-forwarded-for", "198.51.100.9, 203.0.113.7")
             .header("user-agent", "Mozilla/5.0 (compatible; Googlebot/2.1)")
             .header("referer", "https://search.example/")

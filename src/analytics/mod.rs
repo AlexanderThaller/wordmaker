@@ -96,12 +96,28 @@ pub struct AnalyticsArgs {
 
     /// Reverse proxies in front of the server that append to
     /// `X-Forwarded-For`; the client address is that many entries from the
-    /// right. 0 ignores the header and uses the connection's address.
+    /// right. The header is only read from loopback and private-network
+    /// connections, where a proxy is. 0 ignores the header and uses the
+    /// connection's address.
     #[arg(long, env = "WORDMAKER_PROXY_HOPS", default_value_t = 1)]
     proxy_hops: usize,
 }
 
 impl AnalyticsArgs {
+    /// Warns when the server can be reached without the proxy that
+    /// `proxy_hops` assumes, since then visitors on the local network could
+    /// pick their own address.
+    pub fn check_bind(&self, bind: SocketAddr) {
+        if self.clickhouse_url.is_some() && self.proxy_hops > 0 && !bind.ip().is_loopback() {
+            tracing::warn!(
+                "analytics: listening on {bind} with WORDMAKER_PROXY_HOPS={}: X-Forwarded-For \
+                 from loopback and private-network clients is trusted; set WORDMAKER_PROXY_HOPS=0 \
+                 if no reverse proxy is in front",
+                self.proxy_hops
+            );
+        }
+    }
+
     /// Starts the sink if analytics is configured. `site` tags every page
     /// view, so instances sharing a database can be told apart.
     pub fn start(&self, site: &str) -> anyhow::Result<Option<(Analytics, JoinHandle<()>)>> {
@@ -224,7 +240,7 @@ impl Analytics {
     }
 
     /// The client's address: `proxy_hops` entries from the right of
-    /// `X-Forwarded-For`, or the connection's peer.
+    /// `X-Forwarded-For` if the connection's peer is a proxy, else the peer.
     pub fn client_ip(
         &self,
         forwarded_for: Option<&str>,
@@ -278,11 +294,22 @@ fn client_ip(
     peer: Option<SocketAddr>,
     proxy_hops: usize,
 ) -> Option<IpAddr> {
+    let peer = peer.map(|peer| peer.ip().to_canonical());
+    // Anyone can send the header; only a proxy's is believed.
     let forwarded = forwarded_for
-        .filter(|_| proxy_hops > 0)
+        .filter(|_| proxy_hops > 0 && peer.is_some_and(is_proxy_address))
         .and_then(|header| header.rsplit(',').nth(proxy_hops - 1))
         .and_then(|entry| parse_forwarded_ip(entry.trim()));
-    forwarded.or(peer.map(|peer| peer.ip()))
+    forwarded.or(peer)
+}
+
+/// Whether a reverse proxy may connect from `ip`: this host, or a private
+/// network such as a container network or LAN.
+fn is_proxy_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
+    }
 }
 
 /// An address as proxies write it: bare, or with a port (`1.2.3.4:5`,
@@ -325,12 +352,42 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_for_only_from_proxies() {
+        let ip = |peer: &str| {
+            let peer = SocketAddr::new(peer.parse().unwrap(), 4000);
+            client_ip(Some("203.0.113.7"), Some(peer), 1)
+                .unwrap()
+                .to_string()
+        };
+        for proxy in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.17.0.1",
+            "192.168.1.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "fd00::1",
+            "fe80::1",
+        ] {
+            assert_eq!(ip(proxy), "203.0.113.7", "{proxy}");
+        }
+        // A visitor connecting directly cannot choose their address.
+        assert_eq!(ip("198.51.100.1"), "198.51.100.1");
+        assert_eq!(ip("2001:db8::1"), "2001:db8::1");
+        assert_eq!(ip("::ffff:198.51.100.1"), "198.51.100.1");
+        assert_eq!(client_ip(Some("203.0.113.7"), None, 1), None);
+    }
+
+    #[test]
     fn logged_urls_lose_credentials() {
         assert_eq!(
             redact("http://user:hunter2@clickhouse:8123/"),
             "http://***@clickhouse:8123/"
         );
-        assert_eq!(redact("http://:hunter2@clickhouse"), "http://***@clickhouse/");
+        assert_eq!(
+            redact("http://:hunter2@clickhouse"),
+            "http://***@clickhouse/"
+        );
         assert_eq!(redact("http://127.0.0.1:8123"), "http://127.0.0.1:8123/");
         assert_eq!(redact("user:hunter2@clickhouse"), "an unparsable URL");
     }

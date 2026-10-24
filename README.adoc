@@ -39,7 +39,7 @@ The site is now at http://127.0.0.1:3000.
 |`WORDMAKER_CLICKHOUSE_PASSWORD_FILE` |– |File holding the ClickHouse password instead
 |`WORDMAKER_GEOIP_CITY_DB` |– |MaxMind GeoLite2-City `.mmdb` for country, region and city
 |`WORDMAKER_GEOIP_ASN_DB` |– |MaxMind GeoLite2-ASN `.mmdb` for the visitor's network
-|`WORDMAKER_PROXY_HOPS` |`1` |Reverse proxies appending to `X-Forwarded-For`; `0` uses the connection's address
+|`WORDMAKER_PROXY_HOPS` |`1` |Reverse proxies appending to `X-Forwarded-For`, which is only read from loopback and private-network connections; `0` uses the connection's address
 |`WORDMAKER_GEOIP_DIR` |`geoip` |Where `wordmaker geoip` saves the DB-IP databases
 |===
 
@@ -72,6 +72,9 @@ wordmaker geoip --dir /var/lib/wordmaker/geoip   # e.g. monthly from a systemd t
 No IP address is stored.
 The address is used for the GeoIP lookup and for `visitor_id`, a hash of address and user agent with a random salt that only lives in memory and changes every UTC day.
 It counts unique visitors per day, but cannot be traced back to an address or followed across days.
+
+The visitor's address is taken from `X-Forwarded-For` (`WORDMAKER_PROXY_HOPS` entries from the right) only when the connection comes from a loopback or private address (`10/8`, `172.16/12`, `192.168/16`, `fc00::/7`, link-local), as from a reverse proxy; anyone connecting directly from elsewhere is counted by the connection's address.
+Without a proxy, set `WORDMAKER_PROXY_HOPS=0`, so visitors on the local network cannot choose their address either; `serve` warns when it listens on a non-loopback address with hops above 0.
 
 Analytics never slows the site down: requests only queue a page view, without waiting.
 When ClickHouse is unreachable, page views are buffered (up to 50,000, or 64 MiB) and written once it is back.

@@ -132,6 +132,7 @@ async fn serve(config: Config, args: ServeArgs) -> anyhow::Result<()> {
         .collect();
     allowed_hosts.extend(base_url_hosts(&config.base_url));
     allowed_hosts.extend(args.allowed_hosts);
+    args.analytics.check_bind(bind);
     let (analytics, sink) = args.analytics.start(&config.base_url)?.unzip();
 
     let state = AppState {
