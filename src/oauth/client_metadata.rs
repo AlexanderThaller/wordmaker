@@ -18,6 +18,7 @@ use std::{
 };
 
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 use url::{
     Host,
     Url,
@@ -25,10 +26,20 @@ use url::{
 
 /// How long a fetched metadata document is trusted.
 const CACHE_TTL: Duration = Duration::from_mins(10);
-const CACHE_ENTRIES: usize = 64;
+/// How long a failed fetch is remembered, so that repeating a request does
+/// not repeat the fetch.
+const FAILURE_TTL: Duration = Duration::from_mins(1);
+const CACHE_ENTRIES: usize = 256;
+/// Fetches are started by anonymous requests; this bounds how many run at
+/// once.
+const CONCURRENT_FETCHES: usize = 4;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Metadata documents are small; anything larger is not one.
 const MAX_DOCUMENT_BYTES: usize = 16 * 1024;
+/// What the user is told when the document cannot be fetched. The details
+/// are only logged: they would tell anyone how names resolve and which
+/// hosts answer from here.
+const FETCH_FAILED: &str = "the client metadata document could not be fetched";
 
 /// A client as far as the authorization flow is concerned.
 #[derive(Debug, Clone)]
@@ -41,10 +52,22 @@ pub struct ClientInfo {
     pub verified: bool,
 }
 
-/// Recently fetched metadata documents.
-#[derive(Debug, Default)]
+type Fetched = Result<Arc<ClientInfo>, String>;
+
+/// Recently fetched metadata documents, and recent failures.
+#[derive(Debug)]
 pub struct ClientCache {
-    entries: Mutex<HashMap<String, (Instant, Arc<ClientInfo>)>>,
+    entries: Mutex<HashMap<String, (Instant, Fetched)>>,
+    fetching: Semaphore,
+}
+
+impl Default for ClientCache {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::default(),
+            fetching: Semaphore::new(CONCURRENT_FETCHES),
+        }
+    }
 }
 
 /// `client_id` values that name a metadata document.
@@ -52,23 +75,48 @@ pub fn is_metadata_url(client_id: &str) -> bool {
     client_id.starts_with("https://")
 }
 
+fn still_valid(fetched: Instant, result: &Fetched) -> bool {
+    let ttl = if result.is_ok() {
+        CACHE_TTL
+    } else {
+        FAILURE_TTL
+    };
+    fetched.elapsed() < ttl
+}
+
 impl ClientCache {
-    pub async fn fetch(&self, client_id: &str) -> Result<Arc<ClientInfo>, String> {
-        if let Some((fetched, info)) = self.lock().get(client_id)
-            && fetched.elapsed() < CACHE_TTL
+    pub async fn fetch(&self, client_id: &str) -> Fetched {
+        if let Some((fetched, result)) = self.lock().get(client_id)
+            && still_valid(*fetched, result)
         {
-            return Ok(info.clone());
+            return result.clone();
         }
-        let info = Arc::new(fetch(client_id).await?);
-        let mut entries = self.lock();
-        entries.retain(|_, (fetched, _)| fetched.elapsed() < CACHE_TTL);
-        if entries.len() < CACHE_ENTRIES {
-            entries.insert(client_id.to_owned(), (Instant::now(), info.clone()));
-        }
-        Ok(info)
+        let Ok(_permit) = self.fetching.try_acquire() else {
+            return Err("too many clients are being verified right now; try again".into());
+        };
+        let result = fetch(client_id).await.map(Arc::new);
+        self.insert(client_id, result.clone());
+        result
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (Instant, Arc<ClientInfo>)>> {
+    /// Remember `result`, making room by dropping expired entries and then
+    /// the oldest one.
+    fn insert(&self, client_id: &str, result: Fetched) {
+        let mut entries = self.lock();
+        entries.retain(|_, (fetched, result)| still_valid(*fetched, result));
+        if entries.len() >= CACHE_ENTRIES
+            && !entries.contains_key(client_id)
+            && let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, (fetched, _))| *fetched)
+                .map(|(id, _)| id.clone())
+        {
+            entries.remove(&oldest);
+        }
+        entries.insert(client_id.to_owned(), (Instant::now(), result));
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (Instant, Fetched)>> {
         self.entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -93,6 +141,14 @@ async fn fetch(client_id: &str) -> Result<ClientInfo, String> {
     {
         return Err("client_id must be an https URL with a path".into());
     }
+    let body = download(&url).await.map_err(|err| {
+        tracing::info!(client_id, error = %err, "could not fetch client metadata");
+        FETCH_FAILED.to_owned()
+    })?;
+    parse_document(client_id, &body)
+}
+
+async fn download(url: &Url) -> Result<Vec<u8>, String> {
     let host = url.host_str().ok_or("client_id has no host")?.to_owned();
     let port = url.port_or_known_default().unwrap_or(443);
 
@@ -150,7 +206,7 @@ async fn fetch(client_id: &str) -> Result<ClientInfo, String> {
             return Err("client metadata document is too large".into());
         }
     }
-    parse_document(client_id, &body)
+    Ok(body)
 }
 
 fn parse_document(client_id: &str, body: &[u8]) -> Result<ClientInfo, String> {
@@ -396,5 +452,26 @@ mod tests {
         ] {
             assert!(cache.fetch(id).await.is_err(), "{id}");
         }
+        // Local addresses get the same answer as unreachable hosts.
+        let err = cache
+            .fetch("https://127.0.0.1/client.json")
+            .await
+            .unwrap_err();
+        assert_eq!(err, FETCH_FAILED);
+        // Failures are remembered, so repeating the request costs nothing.
+        assert!(cache.lock().contains_key("https://127.0.0.1/client.json"));
+    }
+
+    #[test]
+    fn full_cache_drops_the_oldest_entry() {
+        let cache = ClientCache::default();
+        for i in 0..CACHE_ENTRIES {
+            cache.insert(&format!("https://c{i}.example/c.json"), Err("x".into()));
+        }
+        cache.insert("https://new.example/c.json", Err("x".into()));
+        let entries = cache.lock();
+        assert_eq!(entries.len(), CACHE_ENTRIES);
+        assert!(entries.contains_key("https://new.example/c.json"));
+        assert!(!entries.contains_key("https://c0.example/c.json"));
     }
 }
