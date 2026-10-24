@@ -487,6 +487,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unpublished_home_page_falls_back_to_the_list() {
+        let app = app().await;
+        for (title, publish) in [("Welcome", true), ("About", true)] {
+            send(
+                &app,
+                Method::POST,
+                "/api/v1/pages",
+                Some(json!({ "title": title, "body": "Welcome text.", "publish": publish })),
+            )
+            .await;
+        }
+        send(
+            &app,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(json!({ "home_slug": "welcome" })),
+        )
+        .await;
+        send(&app, Method::POST, "/api/v1/pages/welcome/unpublish", None).await;
+
+        let (status, html) = send(&app, Method::GET, "/", None).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(html.contains("wm-page-list"), "{html}");
+        assert!(html.contains("href=\"/about\""), "{html}");
+        let (_, xml) = send(&app, Method::GET, "/sitemap.xml", None).await;
+        assert!(
+            xml.contains("<loc>http://localhost:3000/about</loc>"),
+            "{xml}"
+        );
+    }
+
+    #[tokio::test]
     async fn sitemap_lists_published_pages() {
         let app = app().await;
         for (title, publish) in [("Welcome", true), ("About", true), ("Secret", false)] {

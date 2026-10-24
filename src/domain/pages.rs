@@ -263,6 +263,9 @@ pub async fn update(pool: &SqlitePool, slug: &str, update: PageUpdate) -> AppRes
     if changes_content {
         record_revision(&mut tx, page.id, &title, &body, now).await?;
     }
+    if new_slug != page.slug {
+        crate::domain::settings::move_home(&mut tx, &page.slug, Some(&new_slug)).await?;
+    }
 
     let page = fetch(&mut tx, &new_slug).await?;
     tx.commit().await?;
@@ -270,13 +273,16 @@ pub async fn update(pool: &SqlitePool, slug: &str, update: PageUpdate) -> AppRes
 }
 
 pub async fn delete(pool: &SqlitePool, slug: &str) -> AppResult<()> {
+    let mut tx = crate::db::begin_write(pool).await?;
     let result = sqlx::query("DELETE FROM pages WHERE slug = ?")
         .bind(slug)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound(format!("page '{slug}'")));
     }
+    crate::domain::settings::move_home(&mut tx, slug, None).await?;
+    tx.commit().await?;
     Ok(())
 }
 

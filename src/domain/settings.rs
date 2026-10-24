@@ -93,7 +93,7 @@ pub async fn get(pool: &SqlitePool) -> AppResult<Settings> {
 }
 
 pub async fn update(pool: &SqlitePool, update: SettingsUpdate) -> AppResult<Settings> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     if let Some(title) = update.site_title {
         set(&mut tx, SITE_TITLE, Some(title.trim())).await?;
     }
@@ -121,6 +121,19 @@ pub async fn update(pool: &SqlitePool, update: SettingsUpdate) -> AppResult<Sett
             Some(slug) => Some(pages::validate_slug(slug)?),
             None => None,
         };
+        if let Some(slug) = &slug {
+            // A draft may be chosen ahead of publishing it; `/` lists the
+            // published pages until then.
+            let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM pages WHERE slug = ?")
+                .bind(slug)
+                .fetch_optional(&mut *tx)
+                .await?;
+            if exists.is_none() {
+                return Err(AppError::BadRequest(format!(
+                    "home_slug: there is no page '{slug}'"
+                )));
+            }
+        }
         set(&mut tx, HOME_SLUG, slug.as_deref()).await?;
     }
     tx.commit().await?;
@@ -144,6 +157,29 @@ pub async fn set_theme(
     .await?;
     tx.commit().await?;
     get(pool).await
+}
+
+/// Keeps the home page setting on the page when its slug changes to `new`,
+/// or clears the setting when the page is deleted (`new` is `None`).
+pub async fn move_home(conn: &mut SqliteConnection, old: &str, new: Option<&str>) -> AppResult<()> {
+    match new {
+        Some(new) => {
+            sqlx::query("UPDATE settings SET value = ? WHERE key = ? AND value = ?")
+                .bind(new)
+                .bind(HOME_SLUG)
+                .bind(old)
+                .execute(conn)
+                .await?;
+        }
+        None => {
+            sqlx::query("DELETE FROM settings WHERE key = ? AND value = ?")
+                .bind(HOME_SLUG)
+                .bind(old)
+                .execute(conn)
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 fn non_empty(value: &str) -> Option<&str> {
@@ -171,4 +207,58 @@ async fn set(conn: &mut SqliteConnection, key: &str, value: Option<&str>) -> App
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        db::connect_memory,
+        domain::pages::{
+            NewPage,
+            PageUpdate,
+        },
+    };
+
+    fn home(slug: &str) -> SettingsUpdate {
+        SettingsUpdate {
+            home_slug: Some(slug.into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn home_page_follows_renames_and_deletes() {
+        let pool = connect_memory().await;
+        let new = NewPage {
+            title: "Welcome".into(),
+            slug: None,
+            body: String::new(),
+            publish: false,
+            in_nav: None,
+            nav_order: None,
+        };
+        pages::create(&pool, new).await.unwrap();
+
+        assert!(matches!(
+            update(&pool, home("missing")).await,
+            Err(AppError::BadRequest(_))
+        ));
+        // A draft may be the home page.
+        let settings = update(&pool, home("welcome")).await.unwrap();
+        assert_eq!(settings.home_slug.as_deref(), Some("welcome"));
+
+        let rename = PageUpdate {
+            slug: Some("start".into()),
+            ..Default::default()
+        };
+        pages::update(&pool, "welcome", rename).await.unwrap();
+        assert_eq!(
+            get(&pool).await.unwrap().home_slug.as_deref(),
+            Some("start")
+        );
+
+        pages::delete(&pool, "start").await.unwrap();
+        assert_eq!(get(&pool).await.unwrap().home_slug, None);
+    }
 }

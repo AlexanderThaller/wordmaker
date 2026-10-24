@@ -182,7 +182,11 @@ async fn frame(state: &AppState) -> Result<Frame, AppError> {
 async fn home(State(state): State<AppState>) -> Result<Response, SiteError> {
     let frame = frame(&state).await?;
     if let Some(home) = frame.settings.home_slug.clone() {
-        return render_page(&state, &frame, &home, true).await;
+        match render_page(&state, &frame, &home, true).await {
+            // Not published (yet): `/` lists the pages that are.
+            Err(SiteError::NotFound) => {}
+            shown => return shown,
+        }
     }
 
     let published = pages::list(&state.pool, Some(Status::Published)).await?;
@@ -251,7 +255,11 @@ async fn render_page(
 async fn sitemap(State(state): State<AppState>) -> Result<Response, SiteError> {
     let settings = settings::get(&state.pool).await?;
     let published = pages::list(&state.pool, Some(Status::Published)).await?;
-    let home_slug = settings.home_slug.as_deref();
+    // `/` lists the pages while the home page is not published.
+    let home_slug = settings
+        .home_slug
+        .as_deref()
+        .filter(|&slug| published.iter().any(|page| page.slug == slug));
     let home_updated = match home_slug {
         Some(slug) => published
             .iter()
