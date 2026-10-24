@@ -211,7 +211,7 @@ impl Analytics {
     /// This site's page views over the last `days` days.
     pub async fn report(&self, days: u32) -> anyhow::Result<report::Report> {
         let mut report = tokio::time::timeout(
-            Duration::from_secs(10),
+            report::TIMEOUT,
             report::report(&self.client, &self.site, days),
         )
         .await
