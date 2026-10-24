@@ -5,7 +5,10 @@ use chrono::{
     DateTime,
     Utc,
 };
-use sqlx::SqlitePool;
+use sqlx::{
+    SqliteConnection,
+    SqlitePool,
+};
 
 use crate::error::AppResult;
 
@@ -115,16 +118,16 @@ impl Kind {
     }
 }
 
-/// Replace whatever tokens `grant` has with the given ones.
-pub async fn issue_tokens(
-    pool: &SqlitePool,
+/// Replace whatever live tokens `grant` has with the given ones. Used
+/// refresh tokens stay behind, to recognise their reuse.
+pub async fn replace_tokens(
+    conn: &mut SqliteConnection,
     grant: &TokenGrant,
     tokens: &[(Kind, &str, DateTime<Utc>)],
 ) -> AppResult<()> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM oauth_tokens WHERE grant_id = ?")
+    sqlx::query("DELETE FROM oauth_tokens WHERE grant_id = ? AND used = 0")
         .bind(&grant.grant_id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     for (kind, token_hash, expires_at) in tokens {
         sqlx::query(
@@ -138,14 +141,68 @@ pub async fn issue_tokens(
         .bind(&grant.client_id)
         .bind(&grant.resource)
         .bind(expires_at)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
-    tx.commit().await?;
     Ok(())
 }
 
-/// The grant behind an unexpired token of the given kind.
+/// What a refresh token turned out to be when it was presented.
+#[derive(Debug)]
+pub enum Refresh {
+    /// Unused and unexpired; it is now marked used.
+    Fresh(TokenGrant),
+    /// Used before: someone else has, or had, a copy of it.
+    Reused {
+        grant_id: String,
+    },
+    Unknown,
+}
+
+/// Use up a refresh token. Marking it used is a single statement, so of
+/// two requests with the same token only one gets `Fresh`.
+pub async fn use_refresh_token(
+    conn: &mut SqliteConnection,
+    token_hash: &str,
+) -> AppResult<Refresh> {
+    let now = Utc::now();
+    let fresh: Option<(String, String, String)> = sqlx::query_as(
+        "UPDATE oauth_tokens SET used = 1
+         WHERE token_hash = ? AND kind = 'refresh' AND used = 0 AND expires_at > ?
+         RETURNING grant_id, client_id, resource",
+    )
+    .bind(token_hash)
+    .bind(now)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some((grant_id, client_id, resource)) = fresh {
+        return Ok(Refresh::Fresh(TokenGrant {
+            grant_id,
+            client_id,
+            resource,
+        }));
+    }
+    let reused: Option<(String,)> = sqlx::query_as(
+        "SELECT grant_id FROM oauth_tokens
+         WHERE token_hash = ? AND kind = 'refresh' AND used = 1 AND expires_at > ?",
+    )
+    .bind(token_hash)
+    .bind(now)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(reused.map_or(Refresh::Unknown, |(grant_id,)| Refresh::Reused { grant_id }))
+}
+
+/// Revoke every token of a grant.
+pub async fn revoke_grant(conn: &mut SqliteConnection, grant_id: &str) -> AppResult<()> {
+    sqlx::query("DELETE FROM oauth_tokens WHERE grant_id = ?")
+        .bind(grant_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// The grant behind an unexpired, unused token of the given kind.
 pub async fn find_token(
     pool: &SqlitePool,
     kind: Kind,
@@ -153,7 +210,7 @@ pub async fn find_token(
 ) -> AppResult<Option<TokenGrant>> {
     let row: Option<(String, String, String, DateTime<Utc>)> = sqlx::query_as(
         "SELECT grant_id, client_id, resource, expires_at FROM oauth_tokens
-         WHERE token_hash = ? AND kind = ?",
+         WHERE token_hash = ? AND kind = ? AND used = 0",
     )
     .bind(token_hash)
     .bind(kind.as_str())

@@ -732,23 +732,39 @@ async fn redeem_code(state: &AppState, request: &TokenRequest) -> Result<Respons
         client_id: stored.client_id,
         resource: stored.resource,
     };
-    issue(state, &grant).await
+    let mut tx = state.pool.begin().await.map_err(AppError::from)?;
+    let response = issue(state, &mut tx, &grant).await?;
+    tx.commit().await.map_err(AppError::from)?;
+    Ok(response)
 }
 
 async fn refresh(state: &AppState, request: &TokenRequest) -> Result<Response, TokenError> {
     let refresh_token = required(request.refresh_token.as_ref(), "refresh_token")?;
     let client_id = required(request.client_id.as_ref(), "client_id")?;
-    let grant = store::find_token(
-        &state.pool,
-        store::Kind::Refresh,
-        &hash(state, refresh_token),
-    )
-    .await?
-    .filter(|grant| grant.client_id == client_id)
-    .ok_or_else(TokenError::invalid_grant)?;
+    // Using up the token and issuing its successors happen in one
+    // transaction; anything that fails before the commit leaves the token
+    // as it was.
+    let mut tx = state.pool.begin().await.map_err(AppError::from)?;
+    let grant = match store::use_refresh_token(&mut tx, &hash(state, refresh_token)).await? {
+        store::Refresh::Fresh(grant) if grant.client_id == client_id => grant,
+        store::Refresh::Fresh(_) | store::Refresh::Unknown => {
+            return Err(TokenError::invalid_grant());
+        }
+        store::Refresh::Reused { grant_id } => {
+            // Either the client or someone who stole the token already
+            // used it; there is no telling which, so the sign-in ends
+            // (RFC 9700, section 4.14.2).
+            store::revoke_grant(&mut tx, &grant_id).await?;
+            tx.commit().await.map_err(AppError::from)?;
+            tracing::warn!(grant_id, "refresh token reused; OAuth sign-in revoked");
+            return Err(TokenError::invalid_grant());
+        }
+    };
     check_resource(state, request, &grant.resource)?;
     // Refresh tokens are rotated: issuing new ones removes the old pair.
-    issue(state, &grant).await
+    let response = issue(state, &mut tx, &grant).await?;
+    tx.commit().await.map_err(AppError::from)?;
+    Ok(response)
 }
 
 fn check_resource(
@@ -769,12 +785,16 @@ fn check_resource(
     }
 }
 
-async fn issue(state: &AppState, grant: &store::TokenGrant) -> Result<Response, TokenError> {
+async fn issue(
+    state: &AppState,
+    conn: &mut sqlx::SqliteConnection,
+    grant: &store::TokenGrant,
+) -> Result<Response, TokenError> {
     let access_token = random_token();
     let refresh_token = random_token();
     let now = Utc::now();
-    store::issue_tokens(
-        &state.pool,
+    store::replace_tokens(
+        conn,
         grant,
         &[
             (
@@ -1162,17 +1182,6 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(mcp_status(&app, &new_access).await.status, StatusCode::OK);
-        let reply = post_form(
-            &app,
-            "/oauth/token",
-            &[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", &refresh),
-                ("client_id", &client_id),
-            ],
-        )
-        .await;
-        assert_eq!(reply.json()["error"], "invalid_grant");
 
         // Revoking the refresh token ends the sign-in.
         let reply = post_form(&app, "/oauth/revoke", &[("token", &new_refresh)]).await;
@@ -1181,6 +1190,76 @@ mod tests {
             mcp_status(&app, &new_access).await.status,
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    /// Exchange a fresh code for tokens; returns (access, refresh).
+    async fn tokens(app: &Router, client_id: &str) -> (String, String) {
+        let code = sign_in(app, client_id).await;
+        let reply = redeem(app, client_id, &code).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        let tokens = reply.json();
+        (
+            tokens["access_token"].as_str().unwrap().to_owned(),
+            tokens["refresh_token"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    async fn redeem(app: &Router, client_id: &str, code: &str) -> Reply {
+        post_form(
+            app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("client_id", client_id),
+                ("redirect_uri", REDIRECT),
+                ("code_verifier", VERIFIER),
+            ],
+        )
+        .await
+    }
+
+    async fn refresh_with(app: &Router, client_id: &str, refresh: &str) -> Reply {
+        post_form(
+            app,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh),
+                ("client_id", client_id),
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn refresh_token_reuse_revokes_the_sign_in() {
+        let app = app().await;
+        let client_id = register_client(&app).await;
+        let (_, refresh) = tokens(&app, &client_id).await;
+
+        let reply = refresh_with(&app, &client_id, &refresh).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        let access = reply.json()["access_token"].as_str().unwrap().to_owned();
+        let next_refresh = reply.json()["refresh_token"].as_str().unwrap().to_owned();
+        assert_eq!(mcp_status(&app, &access).await.status, StatusCode::OK);
+
+        // The old token again: whoever holds the new pair loses it too.
+        let reply = refresh_with(&app, &client_id, &refresh).await;
+        assert_eq!(reply.json()["error"], "invalid_grant");
+        assert_eq!(
+            mcp_status(&app, &access).await.status,
+            StatusCode::UNAUTHORIZED
+        );
+        let reply = refresh_with(&app, &client_id, &next_refresh).await;
+        assert_eq!(reply.json()["error"], "invalid_grant");
+
+        // A refresh token presented by another client is not used up.
+        let (_, refresh) = tokens(&app, &client_id).await;
+        let reply = refresh_with(&app, "someone-else", &refresh).await;
+        assert_eq!(reply.json()["error"], "invalid_grant");
+        let reply = refresh_with(&app, &client_id, &refresh).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     }
 
     #[tokio::test]
