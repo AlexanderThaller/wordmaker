@@ -56,7 +56,7 @@ Any number of instances can share one database: the `site` column holds each ins
 CREATE DATABASE wordmaker;
 ----
 
-Each row has the path and slug, status and render time, referrer and its host, `utm_source`/`utm_medium`/`utm_campaign`, the user agent with browser, OS, device type and a bot flag (crawlers the parser knows, plus anything calling itself a bot, crawler or spider, headless browsers included), the preferred language, and, with the GeoIP databases, country, region, city and network (ASN).
+Each row has the path and slug, status and render time, referrer (scheme, host and path only, without query string) and its host, `utm_source`/`utm_medium`/`utm_campaign`, the user agent with browser, OS, device type and a bot flag (crawlers the parser knows, plus anything calling itself a bot, crawler or spider, headless browsers included), the preferred language, and, with the GeoIP databases, country, region, city and network (ASN).
 `wordmaker geoip` downloads the free https://db-ip.com/db/lite.php[DB-IP Lite] city and ASN databases (no account needed) into `WORDMAKER_GEOIP_DIR` and prints the settings that point at them; DB-IP publishes a new edition every month.
 MaxMind's GeoLite2 files work as well, kept current with https://github.com/maxmind/geoipupdate[geoipupdate].
 A running `serve` checks the files every minute and loads new versions by itself; if a new file cannot be opened, it keeps using the old one.

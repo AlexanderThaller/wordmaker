@@ -348,6 +348,7 @@ impl Sink {
             super::truncate(&mut value, MAX_UTM);
             value
         };
+        let (referrer, referrer_host) = referrer(&hit.referrer);
         PageView {
             timestamp: hit.time,
             site: self.site.clone(),
@@ -355,10 +356,8 @@ impl Sink {
             slug: hit.slug.clone(),
             status: hit.status,
             duration_ms: u32::try_from(hit.duration.as_millis()).unwrap_or(u32::MAX),
-            referrer_host: url::Url::parse(&hit.referrer)
-                .ok()
-                .and_then(|url| url.host_str().map(str::to_owned))
-                .unwrap_or_default(),
+            referrer,
+            referrer_host,
             utm_source: utm("utm_source"),
             utm_medium: utm("utm_medium"),
             utm_campaign: utm("utm_campaign"),
@@ -376,10 +375,25 @@ impl Sink {
             asn: location.asn,
             as_org: location.as_org,
             visitor_id,
-            referrer: hit.referrer,
             user_agent: hit.user_agent,
         }
     }
+}
+
+/// The `Referer` as stored, and its host: only scheme, host and path, since
+/// the query string, fragment and user info can carry search terms, tokens
+/// or email addresses. Anything that is not a URL is dropped.
+fn referrer(referer: &str) -> (String, String) {
+    let Ok(mut url) = url::Url::parse(referer) else {
+        return (String::new(), String::new());
+    };
+    url.set_query(None);
+    url.set_fragment(None);
+    // Fails only for URLs that cannot have credentials in the first place.
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    let host = url.host_str().unwrap_or_default().to_owned();
+    (url.into(), host)
 }
 
 /// `de-DE,de;q=0.9,en;q=0.8` yields `de`.
@@ -461,6 +475,7 @@ mod tests {
         assert_eq!(view.browser, "Chrome");
         assert_eq!(view.device, "pc");
         assert!(!view.is_bot);
+        assert_eq!(view.referrer, "https://search.example/");
         assert_eq!(view.referrer_host, "search.example");
         assert_eq!(view.utm_source, "newsletter");
         assert_eq!(view.utm_medium, "");
@@ -517,6 +532,26 @@ mod tests {
         let mut long = hit(Utc::now());
         long.query = Some(format!("utm_campaign={}", "c".repeat(500)));
         assert_eq!(sink.enrich(long).utm_campaign.len(), MAX_UTM);
+    }
+
+    #[test]
+    fn referrers_lose_query_and_credentials() {
+        assert_eq!(
+            referrer("https://user:pw@mail.example/inbox/read?to=a%40b.example&t=secret#msg"),
+            (
+                "https://mail.example/inbox/read".to_owned(),
+                "mail.example".to_owned()
+            )
+        );
+        assert_eq!(
+            referrer("android-app://com.example.app/"),
+            (
+                "android-app://com.example.app/".to_owned(),
+                "com.example.app".to_owned()
+            )
+        );
+        assert_eq!(referrer(""), (String::new(), String::new()));
+        assert_eq!(referrer("not a url?q=x"), (String::new(), String::new()));
     }
 
     #[test]
