@@ -1,13 +1,13 @@
 = 029: Wrong-token delay does not limit guessing; /api and /mcp have no delay
 :severity: Low
 :area: Auth
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Auth
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -30,3 +30,28 @@ safe. A weak, hand-chosen `WORDMAKER_TOKEN` can be brute-forced.
 
 * Add a global or per-IP failure limiter on all three endpoints.
 * Enforce a minimum token length at startup.
+
+== Resolution
+
+* `token::Guesses`, shared through `AppState`, counts wrong admin tokens
+  per client address (the connection's peer; IPv6 by /64). After 20 in a
+  row, `/api`, `/mcp` and the OAuth sign-in stop checking tokens from that
+  address and answer 429 (the sign-in page says so). The allowance comes
+  back at one per second. Because the check is refused rather than delayed,
+  parallel requests do not help. Valid OAuth access tokens on `/mcp` are
+  still accepted while an address is throttled, so signed-in MCP clients
+  keep working while someone guesses. On `/mcp` a throttled request gets
+  the usual 401 with its `WWW-Authenticate` challenge (and `Retry-After`)
+  instead of 429, so an MCP client whose access token expired still signs
+  in again. Beyond 10,000 tracked addresses, new ones share one allowance;
+  addresses already tracked keep their own, so filling the shared one
+  locks out nobody else.
+* `serve` refuses tokens shorter than 32 characters (`wordmaker token`
+  prints 64). A test checks that generated tokens pass.
+
+Behind a reverse proxy every connection comes from the proxy, so counting
+by the connection's address would let one guesser lock everyone out with
+429s. The limiter therefore counts by the client address analytics uses:
+`WORDMAKER_PROXY_HOPS` entries from the right of `X-Forwarded-For`, read
+only from loopback and private-network peers, so a direct client cannot
+pick its own address to escape the limit.

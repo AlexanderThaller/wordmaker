@@ -36,11 +36,20 @@ use tokio::{
     sync::mpsc,
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::token::read_secret;
 
 /// Hits waiting for the sink; more are dropped rather than slowing requests.
 const QUEUE: usize = 10_000;
+
+/// Longest kept path (and slug), query and referrer, in bytes. Requests may
+/// carry far longer ones, and every hit is held in memory until written.
+const MAX_URL: usize = 1024;
+/// Longest kept user agent, in bytes.
+const MAX_USER_AGENT: usize = 512;
+/// Longest kept `Accept-Language`; only its first tag is used.
+const MAX_ACCEPT_LANGUAGE: usize = 128;
 
 /// Where to send page views; without a `ClickHouse` URL nothing is recorded.
 #[derive(clap::Args, Debug, Default)]
@@ -88,15 +97,42 @@ pub struct AnalyticsArgs {
 
     /// Reverse proxies in front of the server that append to
     /// `X-Forwarded-For`; the client address is that many entries from the
-    /// right. 0 ignores the header and uses the connection's address.
+    /// right. The header is only read from loopback and private-network
+    /// connections, where a proxy is. 0 ignores the header and uses the
+    /// connection's address.
     #[arg(long, env = "WORDMAKER_PROXY_HOPS", default_value_t = 1)]
     proxy_hops: usize,
 }
 
 impl AnalyticsArgs {
+    /// How many reverse proxies are in front, for finding client addresses.
+    pub fn proxy_hops(&self) -> usize {
+        self.proxy_hops
+    }
+
+    /// Warns when the server can be reached without the proxy that
+    /// `proxy_hops` assumes, since then visitors on the local network could
+    /// pick their own address.
+    pub fn check_bind(&self, bind: SocketAddr) {
+        if self.clickhouse_url.is_some() && self.proxy_hops > 0 && !bind.ip().is_loopback() {
+            tracing::warn!(
+                "analytics: listening on {bind} with WORDMAKER_PROXY_HOPS={}: X-Forwarded-For \
+                 from loopback and private-network clients is trusted; set WORDMAKER_PROXY_HOPS=0 \
+                 if no reverse proxy is in front",
+                self.proxy_hops
+            );
+        }
+    }
+
     /// Starts the sink if analytics is configured. `site` tags every page
-    /// view, so instances sharing a database can be told apart.
-    pub fn start(&self, site: &str) -> anyhow::Result<Option<(Analytics, JoinHandle<()>)>> {
+    /// view, so instances sharing a database can be told apart. The sink
+    /// stops once every [`Analytics`] handle is gone, or when `stop` is
+    /// cancelled, writing what it has either way.
+    pub fn start(
+        &self,
+        site: &str,
+        stop: CancellationToken,
+    ) -> anyhow::Result<Option<(Analytics, JoinHandle<()>)>> {
         let Some(url) = &self.clickhouse_url else {
             return Ok(None);
         };
@@ -112,10 +148,33 @@ impl AnalyticsArgs {
         }
         let geo = geo::Geo::open(self.geoip_city_db.as_deref(), self.geoip_asn_db.as_deref());
         tracing::info!(
-            "analytics: page views go to {url}, database {}",
+            "analytics: page views go to {}, database {}",
+            redact(url),
             self.clickhouse_database
         );
-        Ok(Some(Analytics::start(client, site, geo, self.proxy_hops)))
+        Ok(Some(Analytics::start(
+            client,
+            site,
+            geo,
+            self.proxy_hops,
+            stop,
+        )))
+    }
+}
+
+/// `url` for the log, without credentials someone may have put in it.
+fn redact(url: &str) -> String {
+    match url::Url::parse(url) {
+        // `user:password@host` parses too, as a path after `user:`.
+        Ok(mut url) if url.has_host() => {
+            if !url.username().is_empty() || url.password().is_some() {
+                // Cannot fail: a URL with credentials has a host.
+                let _ = url.set_username("***");
+                let _ = url.set_password(None);
+            }
+            url.into()
+        }
+        _ => "an unparsable URL".to_owned(),
     }
 }
 
@@ -138,12 +197,13 @@ impl Analytics {
         site: &str,
         geo: geo::Geo,
         proxy_hops: usize,
+        stop: CancellationToken,
     ) -> (Self, JoinHandle<()>) {
         let (queue, hits) = mpsc::channel(QUEUE);
         let dropped = Arc::default();
         let site = site.trim_end_matches('/');
         let geo_databases = geo.types();
-        let sink = sink::Sink::new(client.clone(), site, geo, hits, Arc::clone(&dropped));
+        let sink = sink::Sink::new(client.clone(), site, geo, hits, Arc::clone(&dropped), stop);
         let handle = tokio::spawn(sink.run());
         (
             Self {
@@ -178,7 +238,7 @@ impl Analytics {
     /// Queues a hit without waiting; when the queue is full it is dropped
     /// and counted, and the sink reports the count.
     pub fn record(&self, hit: Hit) {
-        if let Err(mpsc::error::TrySendError::Full(_)) = self.queue.try_send(hit) {
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.queue.try_send(hit.truncated()) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -186,7 +246,7 @@ impl Analytics {
     /// This site's page views over the last `days` days.
     pub async fn report(&self, days: u32) -> anyhow::Result<report::Report> {
         let mut report = tokio::time::timeout(
-            Duration::from_secs(10),
+            report::TIMEOUT,
             report::report(&self.client, &self.site, days),
         )
         .await
@@ -199,7 +259,7 @@ impl Analytics {
     }
 
     /// The client's address: `proxy_hops` entries from the right of
-    /// `X-Forwarded-For`, or the connection's peer.
+    /// `X-Forwarded-For` if the connection's peer is a proxy, else the peer.
     pub fn client_ip(
         &self,
         forwarded_for: Option<&str>,
@@ -224,16 +284,63 @@ pub struct Hit {
     pub accept_language: String,
 }
 
-fn client_ip(
+impl Hit {
+    /// The hit with every field cut to its limit, so neither the queue nor
+    /// the sink's buffer can be filled with huge headers.
+    fn truncated(mut self) -> Self {
+        truncate(&mut self.path, MAX_URL);
+        truncate(&mut self.slug, MAX_URL);
+        if let Some(query) = &mut self.query {
+            truncate(query, MAX_URL);
+        }
+        truncate(&mut self.referrer, MAX_URL);
+        truncate(&mut self.user_agent, MAX_USER_AGENT);
+        truncate(&mut self.accept_language, MAX_ACCEPT_LANGUAGE);
+        self
+    }
+}
+
+/// Cuts `text` to at most `max` bytes, at a character boundary.
+pub(crate) fn truncate(text: &mut String, max: usize) {
+    if text.len() > max {
+        text.truncate(text.floor_char_boundary(max));
+        text.shrink_to_fit();
+    }
+}
+
+/// The client's address: `proxy_hops` entries from the right of
+/// `X-Forwarded-For` if the connection's peer is a proxy, else the peer.
+pub fn client_ip(
     forwarded_for: Option<&str>,
     peer: Option<SocketAddr>,
     proxy_hops: usize,
 ) -> Option<IpAddr> {
+    let peer = peer.map(|peer| peer.ip().to_canonical());
+    // Anyone can send the header; only a proxy's is believed.
     let forwarded = forwarded_for
-        .filter(|_| proxy_hops > 0)
+        .filter(|_| proxy_hops > 0 && peer.is_some_and(is_proxy_address))
         .and_then(|header| header.rsplit(',').nth(proxy_hops - 1))
         .and_then(|entry| parse_forwarded_ip(entry.trim()));
-    forwarded.or(peer.map(|peer| peer.ip()))
+    forwarded.or(peer)
+}
+
+/// All `X-Forwarded-For` headers as one list, in order.
+pub fn forwarded_for(headers: &axum::http::HeaderMap) -> Option<String> {
+    let values: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    (!values.is_empty()).then(|| values.join(","))
+}
+
+/// Whether a reverse proxy may connect from `ip`: this host, or a private
+/// network such as a container network or LAN.
+fn is_proxy_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
+    }
 }
 
 /// An address as proxies write it: bare, or with a port (`1.2.3.4:5`,
@@ -273,6 +380,73 @@ mod tests {
         assert_eq!(ip(Some("203.0.113.7"), 2), "127.0.0.1");
         assert_eq!(ip(None, 1), "127.0.0.1");
         assert_eq!(client_ip(None, None, 1), None);
+    }
+
+    #[test]
+    fn forwarded_for_only_from_proxies() {
+        let ip = |peer: &str| {
+            let peer = SocketAddr::new(peer.parse().unwrap(), 4000);
+            client_ip(Some("203.0.113.7"), Some(peer), 1)
+                .unwrap()
+                .to_string()
+        };
+        for proxy in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.17.0.1",
+            "192.168.1.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "fd00::1",
+            "fe80::1",
+        ] {
+            assert_eq!(ip(proxy), "203.0.113.7", "{proxy}");
+        }
+        // A visitor connecting directly cannot choose their address.
+        assert_eq!(ip("198.51.100.1"), "198.51.100.1");
+        assert_eq!(ip("2001:db8::1"), "2001:db8::1");
+        assert_eq!(ip("::ffff:198.51.100.1"), "198.51.100.1");
+        assert_eq!(client_ip(Some("203.0.113.7"), None, 1), None);
+    }
+
+    #[test]
+    fn logged_urls_lose_credentials() {
+        assert_eq!(
+            redact("http://user:hunter2@clickhouse:8123/"),
+            "http://***@clickhouse:8123/"
+        );
+        assert_eq!(
+            redact("http://:hunter2@clickhouse"),
+            "http://***@clickhouse/"
+        );
+        assert_eq!(redact("http://127.0.0.1:8123"), "http://127.0.0.1:8123/");
+        assert_eq!(redact("user:hunter2@clickhouse"), "an unparsable URL");
+    }
+
+    #[test]
+    fn hits_are_truncated() {
+        let (analytics, mut hits) = Analytics::channel(1);
+        let long = "ä".repeat(100_000);
+        analytics.record(Hit {
+            time: Utc::now(),
+            ip: None,
+            path: format!("/{long}"),
+            query: Some(long.clone()),
+            slug: long.clone(),
+            status: 404,
+            duration: Duration::ZERO,
+            user_agent: long.clone(),
+            referrer: long.clone(),
+            accept_language: long,
+        });
+        let hit = hits.try_recv().unwrap();
+        assert_eq!(hit.path.len(), MAX_URL - 1, "cut before a split character");
+        assert!(hit.path.starts_with("/ä"));
+        assert_eq!(hit.slug.len(), MAX_URL);
+        assert_eq!(hit.query.unwrap().len(), MAX_URL);
+        assert_eq!(hit.referrer.len(), MAX_URL);
+        assert_eq!(hit.user_agent.len(), MAX_USER_AGENT);
+        assert_eq!(hit.accept_language.len(), MAX_ACCEPT_LANGUAGE);
     }
 
     #[test]

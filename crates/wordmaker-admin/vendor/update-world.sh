@@ -7,6 +7,8 @@
 #   ./update-world.sh v5.1.2     # a particular release
 #
 # Vendored like the editor, so building WordMaker needs no network access.
+# d3-geo and its dependencies run on this machine, so they are pinned to
+# exact versions and integrity hashes and unpacked without npm install.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -17,7 +19,25 @@ trap 'rm -rf "$work"' EXIT
 
 curl -fsSL -o "$work/countries.geojson" \
   "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/$release/geojson/ne_110m_admin_0_countries.geojson"
-npm install --silent --prefix "$work" d3-geo@3 >/dev/null
+
+# Downloads $1@$2 from npm into $work/node_modules/$1, after checking the
+# tarball against the sha512 integrity $3 pinned here. Nothing is installed
+# and no package script runs.
+fetch() {
+  local name=$1 version=$2 integrity=$3 tarball actual
+  tarball=$(npm pack --silent --ignore-scripts --pack-destination "$work" "$name@$version")
+  actual="sha512-$(openssl dgst -sha512 -binary "$work/$tarball" | openssl base64 -A)"
+  if [[ $actual != "$integrity" ]]; then
+    echo "error: $name@$version has integrity $actual, expected $integrity" >&2
+    exit 1
+  fi
+  mkdir -p "$work/node_modules/$name"
+  tar -xzf "$work/$tarball" -C "$work/node_modules/$name" --strip-components=1
+}
+
+fetch d3-geo 3.1.1 sha512-637ln3gXKXOwhalDzinUgY83KzNWZRKbYubaG+fGVuc/dxO64RRljtCTnf5ecMyE1RIdtqpkVcq0IbtU2S8j2Q==
+fetch d3-array 3.2.4 sha512-tdQAmyA18i4J7wprpYq8ClcxZy3SC31QMeByyCFyRt7BVHdREQZ5lpzoe5mFEYZUWe+oq8HBvk9JjpibyEV4Jg==
+fetch internmap 2.0.3 sha512-5Hh7Y1wQbvY5ooGgPbDaL5iYLAPzMTUrjMulskHLH6wnv/A+1q5rgEaiuqEjB+oxGXIVZs1FF+R/KPN3ZSQYYg==
 
 cat > "$work/generate.mjs" <<'JS'
 import { readFileSync, writeFileSync } from "node:fs";

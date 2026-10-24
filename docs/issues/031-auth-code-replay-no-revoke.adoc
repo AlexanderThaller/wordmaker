@@ -1,13 +1,13 @@
 = 031: Replayed authorization codes do not revoke tokens issued from them
 :severity: Low
 :area: OAuth
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: OAuth
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -28,3 +28,14 @@ the legitimate client tries it.
 
 * Keep a tombstone (code hash → grant id) until the code's expiry, and
   revoke the grant on replay.
+
+== Resolution
+
+Redeeming a code no longer deletes it: an atomic
+`+UPDATE ... SET grant_id = ? WHERE ... AND grant_id IS NULL RETURNING ...+`
+records the grant it was redeemed for (new `oauth_codes.grant_id`
+column in `0005_oauth_reuse.sql`), and the row stays until the code
+expires. A second redemption finds the tombstone and revokes every token
+of that grant. Tokens are issued in the same transaction as the
+redemption. A code is still spent when the rest of the request is wrong,
+as before.

@@ -1,13 +1,13 @@
 = 013: Graceful shutdown hangs while an MCP client is connected
 :severity: Medium
 :area: MCP / analytics
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Medium
 Area:: MCP / analytics
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -38,3 +38,18 @@ cancellation token is never cancelled. `axum::serve` with
 * Create a `CancellationToken`, pass it via `with_cancellation_token`,
   and cancel it in `shutdown_signal()`.
 * Bound the graceful shutdown with a timeout.
+
+== Resolution
+
+* `serve` creates a `CancellationToken`, hands it to the MCP service
+  (`StreamableHttpServerConfig::cancellation_token`) and cancels it on
+  SIGTERM or Ctrl-C, which ends MCP sessions and their event streams.
+* Graceful shutdown is bounded: open requests get 5 s (`GRACE_PERIOD`),
+  then `serve` stops waiting for them.
+* The analytics sink takes a stop token too, cancelled once serving has
+  ended. It then writes what is queued and buffered even if connections
+  that outlived the grace period still hold `Analytics` handles.
+* Tested: an open `GET /mcp` stream ends when the token is cancelled (it
+  stays open without the fix), and the sink stops and writes on cancel
+  while a sender is alive. Checked by hand: `serve` with an open MCP event
+  stream exits within milliseconds of SIGTERM.

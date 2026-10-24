@@ -30,7 +30,27 @@ pub struct Input<'a> {
     pub style_css: Option<&'a str>,
 }
 
-pub fn compile(input: &Input<'_>) -> String {
+/// How deep blocks and elements may nest inside each other. `WordPress`
+/// itself goes no deeper than a block style's blocks' elements (3).
+const MAX_DEPTH: usize = 4;
+/// Selectors in one rule. Each level of nesting multiplies them, by six for
+/// headings and captions.
+const MAX_SELECTORS: usize = 500;
+/// The whole stylesheet, which is inlined into every page.
+const MAX_CSS_BYTES: usize = 4 * 1024 * 1024;
+
+/// Why a theme's styles were not compiled.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("styles nest blocks and elements more than {MAX_DEPTH} levels deep")]
+    Nesting,
+    #[error("a style rule would have more than {MAX_SELECTORS} selectors")]
+    Selectors,
+    #[error("the stylesheet would be larger than {MAX_CSS_BYTES} bytes")]
+    Size,
+}
+
+pub fn compile(input: &Input<'_>) -> Result<String, Error> {
     let theme = input.theme;
     let settings = theme.get("settings").unwrap_or(&Value::Null);
     let styles = theme.get("styles").unwrap_or(&Value::Null);
@@ -50,17 +70,17 @@ pub fn compile(input: &Input<'_>) -> String {
         let body = declarations(styles, &ctx, Scope::Body);
         rule(&mut css, "body", &body);
         if let Some(elements) = styles.get("elements").and_then(Value::as_object) {
-            compile_elements(&mut css, &[], elements, &ctx);
+            compile_elements(&mut css, &[], elements, &ctx, 1)?;
         }
         if let Some(blocks) = styles.get("blocks").and_then(Value::as_object) {
-            compile_blocks(&mut css, &[], blocks, &ctx);
+            compile_blocks(&mut css, &[], blocks, &ctx, 1)?;
         }
     }
 
     for style in input.block_styles {
         let selector = vec![format!(".is-style-{}", style.slug)];
         if let Some(node) = style.styles.as_object() {
-            compile_node(&mut css, &selector, node, &ctx);
+            compile_node(&mut css, &selector, node, &ctx, 1)?;
         }
     }
 
@@ -72,7 +92,15 @@ pub fn compile(input: &Input<'_>) -> String {
         css.push_str(custom);
         css.push('\n');
     }
-    css
+    check_size(&css)?;
+    Ok(css)
+}
+
+fn check_size(css: &str) -> Result<(), Error> {
+    if css.len() > MAX_CSS_BYTES {
+        return Err(Error::Size);
+    }
+    Ok(())
 }
 
 struct Ctx<'a> {
@@ -505,12 +533,16 @@ fn compile_elements(
     scope: &[String],
     elements: &Map<String, Value>,
     ctx: &Ctx<'_>,
-) {
+    depth: usize,
+) -> Result<(), Error> {
+    if depth > MAX_DEPTH {
+        return Err(Error::Nesting);
+    }
     for (element, node) in elements {
         let (Some(selectors), Some(node)) = (element_selectors(element), node.as_object()) else {
             continue;
         };
-        let selectors: Vec<String> = descend(scope, selectors);
+        let selectors: Vec<String> = descend(scope, selectors)?;
         let decls = declarations(node, ctx, Scope::Other);
         rule(css, &where_root(&selectors), &decls);
         for pseudo in PSEUDO_CLASSES {
@@ -525,51 +557,75 @@ fn compile_elements(
             }
         }
         if let Some(custom) = node.get("css").and_then(Value::as_str) {
-            custom_css(css, &selectors, custom);
+            custom_css(css, &selectors, custom)?;
         }
+        check_size(css)?;
     }
+    Ok(())
 }
 
-fn compile_blocks(css: &mut String, scope: &[String], blocks: &Map<String, Value>, ctx: &Ctx<'_>) {
+fn compile_blocks(
+    css: &mut String,
+    scope: &[String],
+    blocks: &Map<String, Value>,
+    ctx: &Ctx<'_>,
+    depth: usize,
+) -> Result<(), Error> {
+    if depth > MAX_DEPTH {
+        return Err(Error::Nesting);
+    }
     for (block, node) in blocks {
         let Some(node) = node.as_object() else {
             continue;
         };
         let own = block_selectors(block);
         let own: Vec<&str> = own.iter().map(String::as_str).collect();
-        let selectors = descend(scope, &own);
-        compile_node(css, &selectors, node, ctx);
+        let selectors = descend(scope, &own)?;
+        compile_node(css, &selectors, node, ctx, depth)?;
     }
+    Ok(())
 }
 
 /// Styles for one selector: its declarations, nested elements, nested blocks
-/// and custom CSS.
-fn compile_node(css: &mut String, selectors: &[String], node: &Map<String, Value>, ctx: &Ctx<'_>) {
+/// and custom CSS. `depth` is how many levels of nesting `selectors` stand
+/// for.
+fn compile_node(
+    css: &mut String,
+    selectors: &[String],
+    node: &Map<String, Value>,
+    ctx: &Ctx<'_>,
+    depth: usize,
+) -> Result<(), Error> {
     rule(
         css,
         &where_root(selectors),
         &declarations(node, ctx, Scope::Other),
     );
+    check_size(css)?;
     if let Some(elements) = node.get("elements").and_then(Value::as_object) {
-        compile_elements(css, selectors, elements, ctx);
+        compile_elements(css, selectors, elements, ctx, depth + 1)?;
     }
     if let Some(blocks) = node.get("blocks").and_then(Value::as_object) {
-        compile_blocks(css, selectors, blocks, ctx);
+        compile_blocks(css, selectors, blocks, ctx, depth + 1)?;
     }
     if let Some(custom) = node.get("css").and_then(Value::as_str) {
-        custom_css(css, selectors, custom);
+        custom_css(css, selectors, custom)?;
     }
+    Ok(())
 }
 
 /// Each selector in `scope` combined with each in `inner` as a descendant.
-fn descend(scope: &[String], inner: &[&str]) -> Vec<String> {
-    if scope.is_empty() {
-        return inner.iter().map(|s| (*s).to_owned()).collect();
+fn descend(scope: &[String], inner: &[&str]) -> Result<Vec<String>, Error> {
+    if scope.len().max(1) * inner.len() > MAX_SELECTORS {
+        return Err(Error::Selectors);
     }
-    scope
+    if scope.is_empty() {
+        return Ok(inner.iter().map(|s| (*s).to_owned()).collect());
+    }
+    Ok(scope
         .iter()
         .flat_map(|outer| inner.iter().map(move |inner| format!("{outer} {inner}")))
-        .collect()
+        .collect())
 }
 
 fn where_root(selectors: &[String]) -> String {
@@ -578,8 +634,9 @@ fn where_root(selectors: &[String]) -> String {
 
 /// A block's `css` property, with `&` standing for the block's selector, as
 /// `WP_Theme_JSON::process_blocks_custom_css` interprets it.
-fn custom_css(css: &mut String, selectors: &[String], custom: &str) {
+fn custom_css(css: &mut String, selectors: &[String], custom: &str) -> Result<(), Error> {
     for part in custom.split('&') {
+        check_size(css)?;
         if !part.contains('{') {
             let part = part.trim();
             if !part.is_empty() {
@@ -612,6 +669,7 @@ fn custom_css(css: &mut String, selectors: &[String], custom: &str) {
         };
         let _ = writeln!(css, "{} {{ {} }}", where_root(&combined), body.trim());
     }
+    check_size(css)
 }
 
 fn rule(css: &mut String, selector: &str, decls: &[(String, String)]) {
@@ -745,11 +803,13 @@ fn box_property(
 
 /// Turn a theme.json value into CSS: `var:preset|color|base` becomes
 /// `var(--wp--preset--color--base)`, `{"ref": "styles.x"}` is looked up.
+/// A reference must name a single value, as in `WordPress`: one to an
+/// object or array (another reference included) would copy all of it.
 fn resolve(value: &Value, ctx: &Ctx<'_>) -> String {
     if let Some(reference) = value.get("ref").and_then(Value::as_str) {
         let path: Vec<&str> = reference.split('.').collect();
         return match lookup(ctx.root, &path) {
-            Some(target) if target.get("ref").is_none() => resolve(target, ctx),
+            Some(target) if !target.is_object() && !target.is_array() => resolve(target, ctx),
             _ => "initial".into(),
         };
     }
@@ -932,6 +992,10 @@ mod tests {
     use super::*;
 
     fn compile_json(theme: &Value) -> String {
+        try_compile(theme).unwrap()
+    }
+
+    fn try_compile(theme: &Value) -> Result<String, Error> {
         compile(&Input {
             theme,
             block_styles: &[],
@@ -1067,6 +1131,69 @@ mod tests {
                 ":root :where(.wp-block-list li, .ulist > ul li, .olist > ol li) { margin-top: \
                  0.5rem; }"
             ),
+            "{css}"
+        );
+    }
+
+    #[test]
+    fn deep_nesting_is_refused() {
+        let nested = |depth: usize, block: &str| {
+            let mut node = json!({ "color": { "text": "red" } });
+            for _ in 0..depth {
+                node = json!({ "blocks": { block: node } });
+            }
+            json!({ "styles": node })
+        };
+        // Headings multiply the selectors by six per level.
+        assert!(try_compile(&nested(3, "core/heading")).is_ok());
+        assert!(matches!(
+            try_compile(&nested(4, "core/heading")),
+            Err(Error::Selectors)
+        ));
+        assert!(try_compile(&nested(4, "core/group")).is_ok());
+        assert!(matches!(
+            try_compile(&nested(5, "core/group")),
+            Err(Error::Nesting)
+        ));
+    }
+
+    #[test]
+    fn large_output_is_refused() {
+        // Many sibling blocks, each with the most selectors allowed.
+        let blocks: Map<String, Value> = (0..10_000)
+            .map(|i| {
+                (
+                    format!("core/b{i}"),
+                    json!({ "elements": { "heading": { "color": { "text": "red" } } } }),
+                )
+            })
+            .collect();
+        let theme = json!({ "styles": { "blocks": { "core/heading": { "blocks": blocks } } } });
+        assert!(matches!(try_compile(&theme), Err(Error::Size)));
+    }
+
+    #[test]
+    fn references_name_single_values() {
+        let css = compile_json(&json!({
+            "styles": {
+                "typography": { "fontSize": "2rem" },
+                "elements": {
+                    "h1": { "typography": { "fontSize": { "ref": "styles.typography.fontSize" } } },
+                    "h2": { "typography": { "fontSize": { "ref": "styles" } } },
+                    "h3": { "typography": { "fontSize": { "ref": "styles.elements.h1.typography.fontSize" } } }
+                }
+            }
+        }));
+        assert!(
+            css.contains(":root :where(h1) { font-size: 2rem; }"),
+            "{css}"
+        );
+        assert!(
+            css.contains(":root :where(h2) { font-size: initial; }"),
+            "{css}"
+        );
+        assert!(
+            css.contains(":root :where(h3) { font-size: initial; }"),
             "{css}"
         );
     }

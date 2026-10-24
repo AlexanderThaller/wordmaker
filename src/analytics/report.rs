@@ -1,5 +1,7 @@
 //! The numbers behind the admin dashboard, read back from `page_views`.
 
+use std::time::Duration;
+
 use chrono::{
     Days,
     NaiveDate,
@@ -13,6 +15,9 @@ use serde::{
 
 /// Entries in each top list.
 const TOP: u32 = 10;
+
+/// Longest a report may take, both waiting for it and in `ClickHouse`.
+pub const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Page views of one site over the last `days` UTC days, today included.
 #[derive(Debug, Serialize)]
@@ -85,6 +90,11 @@ pub async fn report(client: &clickhouse::Client, site: &str, days: u32) -> anyho
     let to = Utc::now().date_naive();
     let from = to - Days::new(u64::from(days.max(1) - 1));
     let since = from.to_string();
+    // A query whose client gave up keeps running in ClickHouse by default,
+    // so a dashboard refreshing over a long period would pile them up.
+    let client = &client
+        .clone()
+        .with_setting("max_execution_time", TIMEOUT.as_secs().to_string());
 
     let totals = client
         .query(&format!(

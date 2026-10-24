@@ -21,6 +21,11 @@ use chrono::{
 };
 
 const BASE_URL: &str = "https://download.db-ip.com/free";
+/// Longest a download may take, and may stall without a byte arriving.
+const TIMEOUT: Duration = Duration::from_mins(30);
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// Largest unpacked database accepted; the city database is about 130 MB.
+const MAX_SIZE: u64 = 1 << 30;
 
 /// A DB-IP Lite database and the file it is saved as.
 struct Database {
@@ -55,6 +60,8 @@ pub async fn run(args: &GeoipArgs) -> anyhow::Result<()> {
         .with_context(|| format!("cannot create {}", args.dir.display()))?;
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
+        .read_timeout(READ_TIMEOUT)
+        .timeout(TIMEOUT)
         .user_agent(concat!("wordmaker/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let today = Utc::now().date_naive();
@@ -102,20 +109,34 @@ async fn download(
         }
 
         // Written next to the target and renamed once it checks out, so a
-        // running server or a failed download never sees half a file.
-        let partial = path.with_extension("mmdb.partial");
-        let file = std::fs::File::create(&partial)
+        // running server or a failed download never sees half a file. The
+        // name is unique, so runs that overlap do not write the same file.
+        let partial =
+            path.with_extension(format!("mmdb.{}.partial", uuid::Uuid::new_v4().simple()));
+        let file = std::fs::File::create_new(&partial)
             .with_context(|| format!("cannot write {}", partial.display()))?;
-        let mut gunzip = flate2::write::GzDecoder::new(std::io::BufWriter::new(file));
+        let mut gunzip =
+            flate2::write::GzDecoder::new(Limited::new(std::io::BufWriter::new(file), MAX_SIZE));
         let saved = async {
             while let Some(chunk) = response
                 .chunk()
                 .await
                 .with_context(|| format!("download of {url} failed"))?
             {
-                gunzip.write_all(&chunk)?;
+                gunzip
+                    .write_all(&chunk)
+                    .with_context(|| format!("cannot unpack {url}"))?;
             }
-            gunzip.finish()?.flush()?;
+            let file = gunzip
+                .finish()
+                .with_context(|| format!("cannot unpack {url}"))?
+                .into_inner()
+                .into_inner()
+                .map_err(std::io::IntoInnerError::into_error)?;
+            // On disk before it replaces the old one, so a crash cannot
+            // leave a truncated database behind.
+            file.sync_all()?;
+            drop(file);
             let reader = maxminddb::Reader::open_readfile(&partial)
                 .with_context(|| format!("{url} is not a valid database"))?;
             if !reader
@@ -130,8 +151,18 @@ async fn download(
                     database.kind
                 );
             }
+            drop(reader);
             std::fs::rename(&partial, path)
                 .with_context(|| format!("cannot replace {}", path.display()))?;
+            // And the rename too.
+            if let Some(dir) = path.parent() {
+                let dir = if dir.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    dir
+                };
+                std::fs::File::open(dir).and_then(|dir| dir.sync_all())?;
+            }
             anyhow::Ok(())
         }
         .await;
@@ -145,6 +176,40 @@ async fn download(
         database.kind,
         month(today)
     )
+}
+
+/// Passes writes on to `inner` until `limit` bytes, then fails, so a
+/// decompression bomb cannot fill the disk.
+struct Limited<W> {
+    inner: W,
+    left: u64,
+}
+
+impl<W> Limited<W> {
+    fn new(inner: W, limit: u64) -> Self {
+        Self { inner, left: limit }
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for Limited<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if u64::try_from(buf.len()).unwrap_or(u64::MAX) > self.left {
+            return Err(std::io::Error::other(format!(
+                "database is larger than {MAX_SIZE} bytes"
+            )));
+        }
+        let written = self.inner.write(buf)?;
+        self.left -= u64::try_from(written).unwrap_or(u64::MAX);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn month(day: NaiveDate) -> String {
@@ -167,5 +232,20 @@ mod tests {
         assert_eq!(month(day("2026-10-08")), "2026-10");
         assert_eq!(month(previous_month(day("2026-10-08"))), "2026-09");
         assert_eq!(month(previous_month(day("2026-01-01"))), "2025-12");
+    }
+
+    #[test]
+    fn unpacking_stops_at_the_limit() {
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gzip.write_all(&vec![0; 10_000]).unwrap();
+        let packed = gzip.finish().unwrap();
+
+        let unpack = |limit| {
+            let mut gunzip = flate2::write::GzDecoder::new(Limited::new(Vec::new(), limit));
+            gunzip.write_all(&packed)?;
+            gunzip.finish().map(Limited::into_inner)
+        };
+        assert_eq!(unpack(10_000).unwrap().len(), 10_000);
+        assert!(unpack(9_999).is_err());
     }
 }

@@ -1,13 +1,13 @@
 = 006: install_theme from a URL allows SSRF into the internal network
 :severity: Medium
 :area: Themes
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Medium
 Area:: Themes
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -37,3 +37,23 @@ against DNS rebinding.
 * Re-check on every redirect (`redirect::Policy::custom`), or only allow
   redirects to `downloads.wordpress.org`.
 * Return a generic error message.
+
+== Resolution
+
+* Theme downloads use the same address check as client metadata fetches:
+  `is_public` from `src/oauth/client_metadata.rs` is now exported from the
+  `oauth` module and shared, not copied. The host is resolved once (with a
+  10 s timeout), refused if any address is not public, and the request
+  goes to exactly that address (`resolve`), with `no_proxy()`.
+* reqwest no longer follows redirects. `download` follows up to five
+  itself, and each `Location` goes through the same scheme, resolve and
+  public-address check before it is requested.
+* The URL is parsed with `url::Url`, so the scheme check is
+  case-insensitive (`HTTPS://` works) and only `http` and `https` pass.
+* A refused URL says so ("is not on the public internet", which only
+  reflects DNS). Every other failure (connect error, HTTP status, broken
+  body, bad redirect) returns the same "downloading a theme from <url>
+  failed" and logs the detail, so responses no longer reveal what listens
+  on which port.
+* `is_public` itself is unchanged here; the IPv6 gaps are
+  link:027-is-public-ipv6-gaps.adoc[issue 27].

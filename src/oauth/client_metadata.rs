@@ -18,6 +18,7 @@ use std::{
 };
 
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 use url::{
     Host,
     Url,
@@ -25,10 +26,22 @@ use url::{
 
 /// How long a fetched metadata document is trusted.
 const CACHE_TTL: Duration = Duration::from_mins(10);
-const CACHE_ENTRIES: usize = 64;
+/// How long a failed fetch is remembered, so that repeating a request does
+/// not repeat the fetch.
+const FAILURE_TTL: Duration = Duration::from_mins(1);
+const CACHE_ENTRIES: usize = 256;
+/// Fetches are started by anonymous requests; this bounds how many run at
+/// once. Others wait their turn, first come first served, for as long as
+/// one fetch may take: someone holding every slot with slow fetches then
+/// delays a real client by one fetch, rather than turning it away.
+const CONCURRENT_FETCHES: usize = 8;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Metadata documents are small; anything larger is not one.
 const MAX_DOCUMENT_BYTES: usize = 16 * 1024;
+/// What the user is told when the document cannot be fetched. The details
+/// are only logged: they would tell anyone how names resolve and which
+/// hosts answer from here.
+const FETCH_FAILED: &str = "the client metadata document could not be fetched";
 
 /// A client as far as the authorization flow is concerned.
 #[derive(Debug, Clone)]
@@ -41,10 +54,22 @@ pub struct ClientInfo {
     pub verified: bool,
 }
 
-/// Recently fetched metadata documents.
-#[derive(Debug, Default)]
+type Fetched = Result<Arc<ClientInfo>, String>;
+
+/// Recently fetched metadata documents, and recent failures.
+#[derive(Debug)]
 pub struct ClientCache {
-    entries: Mutex<HashMap<String, (Instant, Arc<ClientInfo>)>>,
+    entries: Mutex<HashMap<String, (Instant, Fetched)>>,
+    fetching: Semaphore,
+}
+
+impl Default for ClientCache {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::default(),
+            fetching: Semaphore::new(CONCURRENT_FETCHES),
+        }
+    }
 }
 
 /// `client_id` values that name a metadata document.
@@ -52,23 +77,50 @@ pub fn is_metadata_url(client_id: &str) -> bool {
     client_id.starts_with("https://")
 }
 
+fn still_valid(fetched: Instant, result: &Fetched) -> bool {
+    let ttl = if result.is_ok() {
+        CACHE_TTL
+    } else {
+        FAILURE_TTL
+    };
+    fetched.elapsed() < ttl
+}
+
 impl ClientCache {
-    pub async fn fetch(&self, client_id: &str) -> Result<Arc<ClientInfo>, String> {
-        if let Some((fetched, info)) = self.lock().get(client_id)
-            && fetched.elapsed() < CACHE_TTL
+    pub async fn fetch(&self, client_id: &str) -> Fetched {
+        if let Some((fetched, result)) = self.lock().get(client_id)
+            && still_valid(*fetched, result)
         {
-            return Ok(info.clone());
+            return result.clone();
         }
-        let info = Arc::new(fetch(client_id).await?);
-        let mut entries = self.lock();
-        entries.retain(|_, (fetched, _)| fetched.elapsed() < CACHE_TTL);
-        if entries.len() < CACHE_ENTRIES {
-            entries.insert(client_id.to_owned(), (Instant::now(), info.clone()));
-        }
-        Ok(info)
+        let Ok(Ok(_permit)) = tokio::time::timeout(FETCH_TIMEOUT, self.fetching.acquire()).await
+        else {
+            return Err("too many clients are being verified right now; try again".into());
+        };
+        let result = fetch(client_id).await.map(Arc::new);
+        self.insert(client_id, result.clone());
+        result
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (Instant, Arc<ClientInfo>)>> {
+    /// Remember `result`, making room by dropping expired entries and then
+    /// the oldest one, failures first: anyone can add those, by naming
+    /// documents that do not exist, and they must not push out real clients.
+    fn insert(&self, client_id: &str, result: Fetched) {
+        let mut entries = self.lock();
+        entries.retain(|_, (fetched, result)| still_valid(*fetched, result));
+        if entries.len() >= CACHE_ENTRIES
+            && !entries.contains_key(client_id)
+            && let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, (fetched, result))| (result.is_ok(), *fetched))
+                .map(|(id, _)| id.clone())
+        {
+            entries.remove(&oldest);
+        }
+        entries.insert(client_id.to_owned(), (Instant::now(), result));
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (Instant, Fetched)>> {
         self.entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -93,6 +145,14 @@ async fn fetch(client_id: &str) -> Result<ClientInfo, String> {
     {
         return Err("client_id must be an https URL with a path".into());
     }
+    let body = download(&url).await.map_err(|err| {
+        tracing::info!(client_id, error = %err, "could not fetch client metadata");
+        FETCH_FAILED.to_owned()
+    })?;
+    parse_document(client_id, &body)
+}
+
+async fn download(url: &Url) -> Result<Vec<u8>, String> {
     let host = url.host_str().ok_or("client_id has no host")?.to_owned();
     let port = url.port_or_known_default().unwrap_or(443);
 
@@ -119,7 +179,9 @@ async fn fetch(client_id: &str) -> Result<ClientInfo, String> {
         return Err(format!("{host} is not a public address"));
     }
 
+    // No proxy: a proxy would resolve the host itself, past the check.
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(FETCH_TIMEOUT)
         .resolve(&host, address)
@@ -148,7 +210,7 @@ async fn fetch(client_id: &str) -> Result<ClientInfo, String> {
             return Err("client metadata document is too large".into());
         }
     }
-    parse_document(client_id, &body)
+    Ok(body)
 }
 
 fn parse_document(client_id: &str, body: &[u8]) -> Result<ClientInfo, String> {
@@ -182,8 +244,14 @@ fn parse_document(client_id: &str, body: &[u8]) -> Result<ClientInfo, String> {
     })
 }
 
+/// Private-use schemes of well-known clients that do not follow the
+/// reverse domain name convention.
+const APP_SCHEMES: &[&str] = &["cursor", "vscode", "vscode-insiders"];
+
 /// Redirect URIs we hand codes to: HTTPS, HTTP on the loopback interface,
-/// or an app's own scheme. Never one that runs code in the browser.
+/// or an app's own scheme named after a reverse domain name, such as
+/// `com.example.app:` (RFC 8252, section 7.1). Other schemes could open
+/// any protocol handler of the operating system.
 pub fn valid_redirect_uri(uri: &str) -> bool {
     let Ok(url) = Url::parse(uri) else {
         return false;
@@ -194,10 +262,7 @@ pub fn valid_redirect_uri(uri: &str) -> bool {
     match url.scheme() {
         "https" => url.host().is_some(),
         "http" => is_loopback(&url),
-        "javascript" | "data" | "file" | "vbscript" | "about" | "blob" | "ftp" | "ws" | "wss" => {
-            false
-        }
-        _ => true,
+        scheme => scheme.contains('.') || APP_SCHEMES.contains(&scheme),
     }
 }
 
@@ -233,8 +298,10 @@ fn is_loopback(url: &Url) -> bool {
 }
 
 /// Addresses on the public internet: not loopback, private, link-local,
-/// shared, documentation, multicast or otherwise reserved.
-fn is_public(ip: IpAddr) -> bool {
+/// shared, documentation, multicast or otherwise reserved. IPv6 tunnel
+/// ranges (6to4, Teredo) are refused, since they lead to IPv4 addresses
+/// that cannot be checked.
+pub fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let [a, b, ..] = ip.octets();
@@ -252,17 +319,24 @@ fn is_public(ip: IpAddr) -> bool {
                 || (a == 192 && b == 0))
         }
         IpAddr::V6(ip) => {
-            if let Some(v4) = ip.to_ipv4_mapped() {
+            // IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible
+            // (`::a.b.c.d`, which includes `::` and `::1`) addresses are
+            // judged by the IPv4 address they carry.
+            if let Some(v4) = ip.to_ipv4() {
                 return is_public(IpAddr::V4(v4));
             }
-            let first = ip.segments()[0];
-            !(ip.is_unspecified()
-                || ip.is_loopback()
-                || ip.is_multicast()
-                || (first & 0xfe00) == 0xfc00
-                || (first & 0xffc0) == 0xfe80
-                || first == 0x2001 && ip.segments()[1] == 0x0db8
-                || first == 0x0064)
+            let segments = ip.segments();
+            let first = segments[0];
+            !(ip.is_multicast()
+                || (first & 0xfe00) == 0xfc00 // unique local
+                || (first & 0xffc0) == 0xfe80 // link-local
+                || (first & 0xffc0) == 0xfec0 // site-local
+                || first == 0x0064 // NAT64
+                || (first == 0x0100 && segments[1..4] == [0, 0, 0]) // discard
+                || (first == 0x2001 && segments[1] < 0x0200) // Teredo, benchmarking, ORCHID
+                || (first == 0x2001 && segments[1] == 0x0db8) // documentation
+                || first == 0x2002 // 6to4, which embeds an IPv4 address
+                || (first == 0x3fff && segments[1] < 0x1000)) // documentation
         }
     }
 }
@@ -273,7 +347,13 @@ mod tests {
 
     #[test]
     fn public_addresses() {
-        for ip in ["1.1.1.1", "2a00:1450:4001::1"] {
+        for ip in [
+            "1.1.1.1",
+            "2a00:1450:4001::1",
+            "2606:4700:4700::1111",
+            "100:1::1",
+            "2001:4860::1",
+        ] {
             assert!(is_public(ip.parse().unwrap()), "{ip}");
         }
         for ip in [
@@ -289,6 +369,17 @@ mod tests {
             "fe80::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
+            "::",
+            "::7f00:1",
+            "::10.0.0.1",
+            "2002:7f00:1::1",
+            "2001::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "fec0::1",
+            "100::1",
+            "64:ff9b::7f00:1",
+            "2001:db8::1",
+            "3fff::1",
         ] {
             assert!(!is_public(ip.parse().unwrap()), "{ip}");
         }
@@ -306,7 +397,11 @@ mod tests {
         ));
         assert!(!valid_redirect_uri("http://example.com/cb"));
         assert!(!valid_redirect_uri("https://example.com/cb#frag"));
+        assert!(valid_redirect_uri("com.example.app:/oauth/callback"));
         assert!(!valid_redirect_uri("javascript:alert(1)"));
+        assert!(!valid_redirect_uri("ms-msdt:/id"));
+        assert!(!valid_redirect_uri("search-ms:query=x"));
+        assert!(!valid_redirect_uri("intent://x"));
         assert!(!valid_redirect_uri("not a url"));
     }
 
@@ -368,5 +463,50 @@ mod tests {
         ] {
             assert!(cache.fetch(id).await.is_err(), "{id}");
         }
+        // Local addresses get the same answer as unreachable hosts.
+        let err = cache
+            .fetch("https://127.0.0.1/client.json")
+            .await
+            .unwrap_err();
+        assert_eq!(err, FETCH_FAILED);
+        // Failures are remembered, so repeating the request costs nothing.
+        assert!(cache.lock().contains_key("https://127.0.0.1/client.json"));
+    }
+
+    #[test]
+    fn full_cache_drops_the_oldest_entry() {
+        let cache = ClientCache::default();
+        for i in 0..CACHE_ENTRIES {
+            cache.insert(&format!("https://c{i}.example/c.json"), Err("x".into()));
+        }
+        cache.insert("https://new.example/c.json", Err("x".into()));
+        let entries = cache.lock();
+        assert_eq!(entries.len(), CACHE_ENTRIES);
+        assert!(entries.contains_key("https://new.example/c.json"));
+        assert!(!entries.contains_key("https://c0.example/c.json"));
+    }
+
+    #[test]
+    fn failures_do_not_push_out_verified_clients() {
+        let cache = ClientCache::default();
+        let real = "https://real.example/c.json";
+        cache.insert(
+            real,
+            Ok(Arc::new(ClientInfo {
+                client_id: real.into(),
+                client_name: None,
+                redirect_uris: vec!["https://real.example/cb".into()],
+                verified: true,
+            })),
+        );
+        for i in 0..CACHE_ENTRIES * 2 {
+            cache.insert(&format!("https://c{i}.example/c.json"), Err("x".into()));
+        }
+        assert!(
+            cache
+                .lock()
+                .get(real)
+                .is_some_and(|(_, result)| result.is_ok())
+        );
     }
 }

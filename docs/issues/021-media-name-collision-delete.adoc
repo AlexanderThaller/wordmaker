@@ -1,13 +1,13 @@
 = 021: A colliding upload name overwrites and then deletes the existing file
 :severity: Low
 :area: Media
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Media
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -30,3 +30,12 @@ then removed, while its database row remains. Unlikely, but real.
 
 * Open with `create_new(true)` and retry with a new prefix, or use the full
   UUID.
+
+== Resolution
+
+`store` opens the new file with `create_new`, so an existing file is never
+truncated. When the name is taken on disk, or by a database row whose
+file is gone, it draws a new prefix (up to eight times). The cleanup after
+a failed insert only ever removes the file this upload created. Stored
+names keep their 8-character prefix, so existing URLs and the documented
+`/media/1a2b3c4d-name` shape stay the same.

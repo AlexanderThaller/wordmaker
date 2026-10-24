@@ -1,13 +1,13 @@
 = 020: 404 list in the admin dashboard can link to another host
 :severity: Low
 :area: wordmaker-admin UI
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: wordmaker-admin UI
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -29,3 +29,10 @@ An attacker requests `/\evil.com` a few times; the admin sees it in
 
 * Only link paths that start with a single `/` and contain no `\`, or do
   not link 404 paths at all.
+
+== Resolution
+
+The dashboard's page and "Not found" lists link through `siteLink`, which
+only links paths that start with a single `/` and contain no `\`, and only
+when the resolved URL has the site's origin (which also catches tabs or
+newlines the URL parser drops). Anything else is listed as plain text.

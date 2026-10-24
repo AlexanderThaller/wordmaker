@@ -1,13 +1,13 @@
 = 009: Anonymous requests can fill fixed-size tables and lock out DCR and admin sign-in
 :severity: Medium
 :area: OAuth / wordmaker-admin
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Medium
 Area:: OAuth / wordmaker-admin
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -41,3 +41,29 @@ evicting old ones.
 * Keep no server-side state before the OIDC callback: put the PKCE verifier
   and nonce in a signed or encrypted login cookie. Or evict the oldest entry
   and cap entries per client IP.
+<<<<<<< HEAD
+
+== Resolution
+
+*Dynamic client registration:* registered clients record when they
+first got tokens (`oauth_clients.used_at`, migration `0005_oauth_reuse.sql`,
+backfilled from existing tokens). Registration runs in one transaction that
+starts with a write. It drops clients that never got tokens, have no
+pending code and are older than 24 hours. When the table is still full,
+the oldest such unused clients make way, and the insert itself is
+conditional on the count. Registration now fails only when all 500 clients
+are in use, which needs 500 approvals with the admin token. Per-IP rate
+limiting was not added; see 030 for why.
+
+*Admin sign-in:* `wordmaker-admin` keeps no state for a sign-in under way
+any more. The pending-login table and `MAX_PENDING_LOGINS` are gone:
+`/auth/login` puts the PKCE verifier, the nonce and the start time into a
+login cookie, HMAC-SHA256-signed together with the `state` under a key made
+at start-up. The callback checks the MAC and the 10-minute lifetime and
+uses the provider as currently discovered. Any number of anonymous
+`/auth/login` requests therefore fill nothing and cannot lock anyone out.
+
+Clients registered in the last 15 minutes never make way: their user may
+still be on the sign-in page. Registrations that find only such clients
+are refused, so a burst of anonymous registrations cannot push out a
+client in the middle of signing in.

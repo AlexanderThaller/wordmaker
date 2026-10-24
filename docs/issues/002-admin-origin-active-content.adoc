@@ -1,13 +1,13 @@
 = 002: Admin proxy serves script-capable upstream files on the admin origin
 :severity: High
 :area: wordmaker-admin
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: High
 Area:: wordmaker-admin
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -45,3 +45,21 @@ dropped, because only allow-listed headers are copied.
   `Content-Disposition: attachment` for everything else.
 * Give the admin app itself a CSP
   (`+script-src 'self' 'wasm-unsafe-eval'; object-src 'none'; frame-ancestors 'self'+`).
+
+== Resolution
+
+* Everything the admin passes on from `/_wm` and `/media` now carries
+  `+Content-Security-Policy: default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'; sandbox+`,
+  so an SVG or HTML file opened on its own runs no script on the admin
+  origin. PDFs are left without it, since browsers refuse to show
+  sandboxed PDFs and their viewers run no script of the origin.
+  `X-Content-Type-Options: nosniff` was already sent on every response.
+* The admin's own responses get a policy of their own:
+  `+script-src 'self' 'wasm-unsafe-eval'+`, `+connect-src 'self'+`,
+  `+object-src 'none'+`, `+base-uri 'self'+`, `+form-action 'self'+`,
+  `+frame-ancestors 'self'+`. Styles (inline too), images, fonts and media
+  stay broad because the preview's `srcdoc` frame inherits the policy and
+  shows pages as the site would.
+* Checked in headless Firefox: the editor loads, the preview renders with
+  the theme's stylesheet and uploaded images, and the pages, media,
+  settings and dashboard views report no CSP violations.

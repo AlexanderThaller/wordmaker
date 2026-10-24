@@ -1,13 +1,13 @@
 = 022: OAuth sign-in page shows a stray backslash and "n"
 :severity: Low
 :area: OAuth
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: OAuth
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -27,3 +27,9 @@ Every OAuth page renders a visible `\` and `n` before the content
 == Suggested fix
 
 * Write `+<main>\n{body}+`.
+
+== Resolution
+
+The page is now assembled from short pieces, since rustfmt's
+`format_strings` wrapping is what split the `\n` escape. A test checks
+that `<main>` is followed directly by the content.

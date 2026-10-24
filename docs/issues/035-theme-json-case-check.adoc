@@ -1,13 +1,13 @@
 = 035: theme.json object check is a raw string comparison
 :severity: Low
 :area: Themes
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Themes
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -27,3 +27,9 @@ ENOTDIR (tested), so it is not exploitable there.
 == Suggested fix
 
 * Compare the normalised path case-insensitively.
+
+== Resolution
+
+`write_file` now treats any path whose only component is `theme.json` in
+any letter case (`THEME.JSON`, `theme.json/`) as `theme.json`, and
+requires it to be a JSON object.

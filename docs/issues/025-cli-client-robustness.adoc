@@ -1,13 +1,13 @@
 = 025: wordmaker client: broken-pipe panic, unbounded $ref recursion, plain-HTTP token
 :severity: Low
 :area: CLI client
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: CLI client
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -34,3 +34,21 @@ Several robustness gaps in the stdio-to-HTTP client.
 * Add a recursion depth limit to `type_name`.
 * Warn or refuse when the URL is plain HTTP to a non-loopback host.
 * Set request timeouts.
+
+== Resolution
+
+* Output goes through `writeln!` to stdout, and a broken pipe (the reader
+  stopped, e.g. `| head -1`) ends the client quietly with status 0 instead
+  of a panic.
+* `type_name` stops following nested or referenced schemas after 16
+  levels and says `any`, so a self-referential `$ref` cannot overflow the
+  stack.
+* A warning is logged when the URL is plain `http://` to a host other than
+  `localhost`, `*.localhost` or a loopback address. Refusing was not chosen,
+  since a server on the LAN without TLS is a legitimate setup.
+* The MCP transport uses a reqwest client with a 10 s connect timeout, and
+  the whole session (connect plus command) is bounded by `--timeout` /
+  `WORDMAKER_CLIENT_TIMEOUT`, default 300 s. No per-read timeout, since the
+  server's event streams may legitimately be quiet between keep-alives.
+* Checked by hand against a running server and a listener that never
+  answers.

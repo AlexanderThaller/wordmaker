@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt::Write,
     net::SocketAddr,
     sync::Arc,
@@ -15,7 +16,6 @@ use axum::{
         State,
     },
     http::{
-        HeaderMap,
         HeaderValue,
         Method,
         StatusCode,
@@ -31,6 +31,10 @@ use axum::{
         Response,
     },
     routing::get,
+};
+use sha2::{
+    Digest,
+    Sha256,
 };
 use tower::{
     Layer,
@@ -50,6 +54,7 @@ use crate::{
     domain::{
         pages::{
             self,
+            Page,
             PageSummary,
             Status,
         },
@@ -79,13 +84,15 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/_wm/img/{width}/{filename}", get(scaled_image))
         .nest_service(
             "/media",
-            // Stored names carry a random prefix and are never reused, so a
-            // file at a given URL never changes.
-            SetResponseHeaderLayer::if_not_present(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static(IMMUTABLE),
-            )
-            .layer(ServeDir::new(&state.config.media_dir)),
+            middleware::from_fn(media_file).layer(
+                // Stored names carry a random prefix and are never reused, so
+                // a file at a given URL never changes.
+                SetResponseHeaderLayer::if_not_present(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static(IMMUTABLE),
+                )
+                .layer(ServeDir::new(&state.config.media_dir)),
+            ),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -127,7 +134,7 @@ async fn record_page_view(State(state): State<AppState>, request: Request, next:
     };
     analytics.record(Hit {
         time,
-        ip: analytics.client_ip(forwarded_for(&headers).as_deref(), peer),
+        ip: analytics.client_ip(crate::analytics::forwarded_for(&headers).as_deref(), peer),
         slug: uri.path().trim_start_matches('/').to_owned(),
         path: uri.path().to_owned(),
         query: uri.query().map(str::to_owned),
@@ -140,35 +147,79 @@ async fn record_page_view(State(state): State<AppState>, request: Request, next:
     response
 }
 
-/// All `X-Forwarded-For` headers as one list, in order.
-fn forwarded_for(headers: &HeaderMap) -> Option<String> {
-    let values: Vec<&str> = headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .collect();
-    (!values.is_empty()).then(|| values.join(","))
+const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
+/// Uploads and theme files are served from the site's origin, where a
+/// script would run with access to everything the site can do. Opened on
+/// their own, none of them may run one: the sandbox gives the document an
+/// origin of its own and turns scripts off. Embedded as images, fonts or
+/// stylesheets they are unaffected, since this policy only applies to the
+/// file as a document.
+const FILE_POLICY: &str = "sandbox; default-src 'none'; img-src 'self' data:; style-src \
+                           'unsafe-inline'; frame-ancestors 'self'";
+
+/// Locks down the response for a media or theme file at `path`; see
+/// [`FILE_POLICY`]. Types a browser shows without running anything of the
+/// file's are shown inline; everything else (HTML, XML, scripts, unknown
+/// types) is a download. Decided by the name, as the file's content type
+/// is, so that a `304` without a content type gets the same headers.
+fn harden_file<B>(response: &mut Response<B>, path: &str) {
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    let essence = mime.essence_str();
+    let headers = response.headers_mut();
+    // Browsers refuse to show a PDF in a sandbox; their viewers run PDF
+    // scripts apart from the page's origin anyway.
+    if essence != "application/pdf" {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(FILE_POLICY),
+        );
+    }
+    let inline = matches!(essence, "application/pdf" | "text/css" | "text/plain")
+        || ["image/", "font/", "audio/", "video/"]
+            .iter()
+            .any(|kind| essence.starts_with(kind));
+    if !inline {
+        headers.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
+    }
 }
 
-const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+async fn media_file(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_owned();
+    let mut response = next.run(request).await;
+    harden_file(&mut response, &path);
+    response
+}
 
 /// Everything a page needs besides its own content.
 struct Frame {
     settings: Settings,
     nav: Vec<PageSummary>,
     stylesheet: Arc<Stylesheet>,
-    footer_html: Option<String>,
+    footer_html: Option<Arc<str>>,
 }
 
-async fn frame(state: &AppState) -> Result<Frame, AppError> {
-    let settings = settings::get(&state.pool).await?;
+async fn frame(state: &AppState, settings: Settings) -> Result<Frame, AppError> {
     let nav = pages::navigation(&state.pool).await?;
     let sheet = state
         .themes
         .stylesheet(&state.config.themes_dir, &settings)
         .await;
     let footer_html = match &settings.footer_text {
-        Some(text) => Some(render::render_async(text.clone()).await?.html),
+        Some(text) => {
+            let key = render_key(&[b"footer", text.as_bytes()]);
+            Some(
+                state
+                    .renders
+                    .get_or_render(key, async {
+                        Ok(render::render_async(text.clone()).await?.html)
+                    })
+                    .await?,
+            )
+        }
         None => None,
     };
     Ok(Frame {
@@ -179,10 +230,25 @@ async fn frame(state: &AppState) -> Result<Frame, AppError> {
     })
 }
 
+/// The page at `slug`, if it is published.
+async fn published_page(state: &AppState, slug: &str) -> Result<Option<Page>, AppError> {
+    match pages::get(&state.pool, slug).await {
+        Ok(page) if page.status == Status::Published => Ok(Some(page)),
+        Ok(_) | Err(AppError::NotFound(_)) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 async fn home(State(state): State<AppState>) -> Result<Response, SiteError> {
-    let frame = frame(&state).await?;
-    if let Some(home) = frame.settings.home_slug.clone() {
-        return render_page(&state, &frame, &home, true).await;
+    let settings = settings::get(&state.pool).await?;
+    // Not published (yet): `/` lists the pages that are.
+    let home = match &settings.home_slug {
+        Some(slug) => published_page(&state, slug).await?,
+        None => None,
+    };
+    let frame = frame(&state, settings).await?;
+    if let Some(home) = home {
+        return render_page(&state, &frame, home, true).await;
     }
 
     let published = pages::list(&state.pool, Some(Status::Published)).await?;
@@ -205,22 +271,32 @@ async fn show(
     State(state): State<AppState>,
     Path(slug): Path<String>,
 ) -> Result<Response, SiteError> {
-    let frame = frame(&state).await?;
-    render_page(&state, &frame, &slug, false).await
+    // Looked up first, so that a miss costs one query and no frame.
+    let page = published_page(&state, &slug)
+        .await?
+        .ok_or(SiteError::NotFound)?;
+    let frame = frame(&state, settings::get(&state.pool).await?).await?;
+    render_page(&state, &frame, page, false).await
 }
 
 async fn render_page(
     state: &AppState,
     frame: &Frame,
-    slug: &str,
+    page: Page,
     is_home: bool,
 ) -> Result<Response, SiteError> {
-    let page = match pages::get(&state.pool, slug).await {
-        Ok(page) if page.status == Status::Published => page,
-        Ok(_) | Err(AppError::NotFound(_)) => return Err(SiteError::NotFound),
-        Err(err) => return Err(err.into()),
-    };
-    let html = content_html(state, frame, page.body).await?;
+    let layout_widths = frame.stylesheet.layout;
+    let key = render_key(&[
+        b"page",
+        &layout_widths.content.to_le_bytes(),
+        &layout_widths.wide.to_le_bytes(),
+        &state.images.generation().to_le_bytes(),
+        page.body.as_bytes(),
+    ]);
+    let html = state
+        .renders
+        .get_or_render(key, content_html(state, frame, page.body))
+        .await?;
     let site_title = &frame.settings.site_title;
     let title = if is_home {
         site_title.clone()
@@ -229,10 +305,10 @@ async fn render_page(
     };
     // The home page is also reachable under its slug; both name `/`.
     let canonical = state.config.page_url(
-        if is_home || frame.settings.home_slug.as_deref() == Some(slug) {
+        if is_home || frame.settings.home_slug.as_deref() == Some(page.slug.as_str()) {
             ""
         } else {
-            slug
+            &page.slug
         },
     );
     Ok(layout(
@@ -246,12 +322,108 @@ async fn render_page(
     .into_response())
 }
 
+/// Most rendered bodies and footers kept, and their total size: enough for
+/// every page of a sizeable site, while edits leave old versions behind.
+const RENDER_CACHE_ENTRIES: usize = 512;
+const RENDER_CACHE_BYTES: usize = 64 << 20;
+
+/// Rendered page bodies and footer texts, keyed by a hash of everything
+/// they are made from, so an edit, a new footer or a theme with other
+/// widths simply misses rather than needing to be invalidated. The least
+/// recently used entries make room for new ones.
+#[derive(Debug, Default)]
+pub struct RenderCache {
+    entries: std::sync::Mutex<RenderEntries>,
+}
+
+#[derive(Debug, Default)]
+struct RenderEntries {
+    map: HashMap<[u8; 32], (Arc<str>, u64)>,
+    bytes: usize,
+    clock: u64,
+}
+
+/// A cache key over `parts`, each length-prefixed so that no two different
+/// lists hash the same input.
+fn render_key(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
+impl RenderCache {
+    fn entries(&self) -> std::sync::MutexGuard<'_, RenderEntries> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The HTML stored under `key`, rendering it with `render` first when
+    /// there is none. Rendered without holding the lock; two requests that
+    /// miss together both render.
+    async fn get_or_render(
+        &self,
+        key: [u8; 32],
+        render: impl Future<Output = Result<String, AppError>>,
+    ) -> Result<Arc<str>, AppError> {
+        if let Some(html) = self.get(&key) {
+            return Ok(html);
+        }
+        let html: Arc<str> = render.await?.into();
+        self.insert(key, html.clone());
+        Ok(html)
+    }
+
+    fn get(&self, key: &[u8; 32]) -> Option<Arc<str>> {
+        let mut entries = self.entries();
+        entries.clock += 1;
+        let now = entries.clock;
+        let (html, used) = entries.map.get_mut(key)?;
+        *used = now;
+        Some(html.clone())
+    }
+
+    fn insert(&self, key: [u8; 32], html: Arc<str>) {
+        // One huge page should not push out the rest of the site.
+        if html.len() > RENDER_CACHE_BYTES / 8 {
+            return;
+        }
+        let mut entries = self.entries();
+        while !entries.map.is_empty()
+            && (entries.map.len() >= RENDER_CACHE_ENTRIES
+                || entries.bytes + html.len() > RENDER_CACHE_BYTES)
+        {
+            let oldest = entries
+                .map
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| *key);
+            if let Some((evicted, _)) = oldest.and_then(|key| entries.map.remove(&key)) {
+                entries.bytes -= evicted.len();
+            }
+        }
+        entries.clock += 1;
+        let now = entries.clock;
+        entries.bytes += html.len();
+        if let Some((replaced, _)) = entries.map.insert(key, (html, now)) {
+            entries.bytes -= replaced.len();
+        }
+    }
+}
+
 /// Every published page, for search engines. The home page is listed as
 /// `/`; the page it shows is not listed again under its own slug.
 async fn sitemap(State(state): State<AppState>) -> Result<Response, SiteError> {
     let settings = settings::get(&state.pool).await?;
     let published = pages::list(&state.pool, Some(Status::Published)).await?;
-    let home_slug = settings.home_slug.as_deref();
+    // `/` lists the pages while the home page is not published.
+    let home_slug = settings
+        .home_slug
+        .as_deref()
+        .filter(|&slug| published.iter().any(|page| page.slug == slug));
     let home_updated = match home_slug {
         Some(slug) => published
             .iter()
@@ -314,7 +486,8 @@ pub async fn preview(
     slug: Option<&str>,
     body: String,
 ) -> Result<Html<String>, AppError> {
-    let frame = frame(state).await?;
+    let frame = frame(state, settings::get(&state.pool).await?).await?;
+    // Not cached: previews change with every keystroke.
     let html = content_html(state, &frame, body).await?;
     let site_title = &frame.settings.site_title;
     Ok(layout(
@@ -374,11 +547,13 @@ fn layout(
     }
     // Inline rather than linked: a stylesheet request blocks the first
     // paint, and this one is small once compressed. It changes with the
-    // page, so a theme switch shows at once.
+    // page, so a theme switch shows at once. Only `</` can end the element,
+    // in any case (`</STYLE`), and `<\/` means the same in a CSS string,
+    // comment or URL. A lone `<` stays: media queries use it as an operator.
     let _ = write!(
         html,
         "<style>{}</style>\n</head>\n<body>\n<div class=\"wp-site-blocks\">\n",
-        frame.stylesheet.css.replace("</style", "<\\/style")
+        frame.stylesheet.css.replace("</", "<\\/")
     );
 
     write_header(&mut html, frame, current);
@@ -585,25 +760,30 @@ async fn theme_asset(
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| THEME_ASSET_EXTENSIONS.contains(&ext.to_lowercase().as_str()));
-    // `{slug}@{stamp}`, as the stylesheet links them, names one install of
-    // the theme, which never changes; a bare slug is whatever is there now.
-    let (theme, stamped) = match theme.split_once('@') {
-        Some((slug, _)) => (slug, true),
-        None => (theme.as_str(), false),
+    // `{slug}@{stamp}`, as the stylesheet links them, names one version of
+    // the theme's files, which never changes; a bare slug is whatever is
+    // there now. Any other stamp is not cached at all.
+    let (theme, stamp) = match theme.split_once('@') {
+        Some((slug, stamp)) => (slug, Some(stamp)),
+        None => (theme.as_str(), None),
     };
     if crate::theme::validate_slug(theme).is_err() || !safe_path || !allowed {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let cache_control = match stamp {
+        Some(stamp) if crate::theme::is_current_stamp(&state.config.themes_dir, theme, stamp) => {
+            IMMUTABLE
+        }
+        Some(_) => "no-cache",
+        None => "public, max-age=86400",
+    };
     let file = state.config.themes_dir.join(theme).join(&path);
     match ServeFile::new(file).oneshot(request).await {
         Ok(mut response) => {
+            harden_file(&mut response, &path);
             response.headers_mut().insert(
                 header::CACHE_CONTROL,
-                HeaderValue::from_static(if stamped {
-                    IMMUTABLE
-                } else {
-                    "public, max-age=86400"
-                }),
+                HeaderValue::from_static(cache_control),
             );
             response.into_response()
         }
@@ -625,6 +805,7 @@ async fn scaled_image(
     };
     match ServeFile::new(file).oneshot(request).await {
         Ok(mut response) => {
+            harden_file(&mut response, &filename);
             response
                 .headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static(IMMUTABLE));
@@ -677,5 +858,48 @@ impl IntoResponse for SiteError {
                     .into_response()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(n: usize) -> [u8; 32] {
+        render_key(&[&n.to_le_bytes()])
+    }
+
+    #[test]
+    fn render_cache_keeps_recent_entries_within_bounds() {
+        let cache = RenderCache::default();
+        cache.insert(key(0), "first".into());
+        for n in 1..RENDER_CACHE_ENTRIES * 2 {
+            // Kept in use, so it is never the oldest.
+            assert!(cache.get(&key(0)).is_some(), "{n}");
+            cache.insert(key(n), "page".into());
+        }
+        assert_eq!(cache.entries().map.len(), RENDER_CACHE_ENTRIES);
+        assert!(cache.get(&key(1)).is_none());
+        assert!(cache.get(&key(RENDER_CACHE_ENTRIES * 2 - 1)).is_some());
+
+        let big: Arc<str> = "x".repeat(RENDER_CACHE_BYTES / 8).into();
+        for n in 0..10 {
+            cache.insert(key(10_000 + n), big.clone());
+        }
+        let entries = cache.entries();
+        assert!(entries.bytes <= RENDER_CACHE_BYTES, "{}", entries.bytes);
+        assert_eq!(
+            entries.bytes,
+            entries
+                .map
+                .values()
+                .map(|(html, _)| html.len())
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn render_keys_separate_their_parts() {
+        assert_ne!(render_key(&[b"ab", b"c"]), render_key(&[b"a", b"bc"]));
     }
 }

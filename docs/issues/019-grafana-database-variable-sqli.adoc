@@ -1,13 +1,13 @@
 = 019: Grafana dashboard variable allows SQL injection by viewers
 :severity: Low
 :area: Grafana
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Grafana
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -27,3 +27,18 @@ the data source's credentials.
 
 * Make the variable a constant or hidden.
 * Recommend a read-only ClickHouse user for Grafana in the README.
+
+== Resolution
+
+* `database` is now a hidden constant variable (`hide: 2`,
+  `skipUrlSync: true`), so viewers can neither edit it nor set it with
+  `?var-database=`. The _Sites_ table link no longer passes it on.
+* The README explains how to change the constant and recommends a
+  read-only ClickHouse user limited to `SELECT` on `page_views` for the
+  data source.
+* Worth knowing: `site` is a multi-value query variable placed with
+  `${site:singlequote}`, which as far as I know escapes `'` but not `\`,
+  and Grafana may accept URL-set values outside the query's options. That
+  path was not changed (it needs the variable to stay URL-settable for the
+  _Sites_ link); the read-only user limits what it could reach to the
+  data viewers already see. Not verified against a running Grafana.

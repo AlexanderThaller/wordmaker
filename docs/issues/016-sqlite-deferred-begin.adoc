@@ -1,13 +1,13 @@
 = 016: Read-then-write transactions fail with "database is locked" under concurrency
 :severity: Low
 :area: Database
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Database
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -33,3 +33,11 @@ data is lost and revision numbers stay unique; the errors are spurious.
 
 * Use `begin_with("BEGIN IMMEDIATE")` for transactions that read and then
   write.
+
+== Resolution
+
+`db::begin_write` starts transactions with `BEGIN IMMEDIATE`, so they take
+the write lock up front and wait for each other within the busy timeout.
+All page transactions use it (create, update, set_status, save_draft and
+discard_draft). A test runs sixteen concurrent edits against a file
+database in WAL mode; it failed with "database is locked" before.

@@ -1,13 +1,13 @@
 = 043: Two quick page clicks can show the wrong page
 :severity: Low
 :area: wordmaker-admin UI
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: wordmaker-admin UI
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -26,3 +26,10 @@ prompt.
 == Suggested fix
 
 * Use a request counter, as `previewRequest` already does.
+
+== Resolution
+
+`openPage` numbers its requests like `previewRequest` does and drops an
+answer when a later page has been asked for since. It checks again after
+waiting for the editor to load, so an older call cannot put its body into
+the editor after a newer page is shown.

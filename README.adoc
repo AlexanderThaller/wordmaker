@@ -16,6 +16,11 @@ export WORDMAKER_TOKEN=$(./target/release/wordmaker token)
 
 The site is now at http://127.0.0.1:3000.
 
+The token must be at least 32 characters long; `wordmaker token` prints a random one of 64.
+Wrong tokens are throttled: after 20 in a row from one address (one /64 for IPv6; behind a reverse proxy, the client's address from `X-Forwarded-For` as for analytics, see `WORDMAKER_PROXY_HOPS`), `/api`, `/mcp` and the OAuth sign-in refuse to check further tokens from it, the right one included, until the allowance comes back at one try per second.
+`/api` and the sign-in answer 429; `/mcp` answers 401 with its sign-in challenge, since MCP clients only sign in again on that.
+OAuth access tokens on `/mcp` are still accepted meanwhile.
+
 === Configuration
 
 [cols="1,1,2"]
@@ -28,9 +33,10 @@ The site is now at http://127.0.0.1:3000.
 |`WORDMAKER_BASE_URL` |`http://127.0.0.1:3000` |Public URL, used for links returned by the API
 |`WORDMAKER_MAX_UPLOAD` |`26214400` |Largest upload in bytes
 |`WORDMAKER_BIND` |`127.0.0.1:3000` |Listen address (`serve` only)
-|`WORDMAKER_TOKEN` |– |Bearer token for `/api` and `/mcp` (required by `serve`, `client` and `wordmaker-admin`)
+|`WORDMAKER_TOKEN` |– |Bearer token for `/api` and `/mcp` (required by `serve`, `client` and `wordmaker-admin`); `serve` needs at least 32 characters
 |`WORDMAKER_TOKEN_FILE` |– |File holding the token instead, e.g. a systemd credential (`$CREDENTIALS_DIRECTORY/token`) or Docker secret; surrounding whitespace is ignored
 |`WORDMAKER_MCP_URL` |`$WORDMAKER_BASE_URL/mcp` |MCP endpoint (`client` only)
+|`WORDMAKER_CLIENT_TIMEOUT` |`300` |Seconds `client` waits for the server before giving up
 |`WORDMAKER_ALLOWED_HOSTS` |– |Extra comma-separated `Host` values accepted by `/mcp`
 |`WORDMAKER_CLICKHOUSE_URL` |– |ClickHouse HTTP endpoint for page-view analytics, e.g. `http://127.0.0.1:8123`; analytics is off without it
 |`WORDMAKER_CLICKHOUSE_DATABASE` |`wordmaker` |ClickHouse database; must exist, the `page_views` table is created on start
@@ -39,7 +45,7 @@ The site is now at http://127.0.0.1:3000.
 |`WORDMAKER_CLICKHOUSE_PASSWORD_FILE` |– |File holding the ClickHouse password instead
 |`WORDMAKER_GEOIP_CITY_DB` |– |MaxMind GeoLite2-City `.mmdb` for country, region and city
 |`WORDMAKER_GEOIP_ASN_DB` |– |MaxMind GeoLite2-ASN `.mmdb` for the visitor's network
-|`WORDMAKER_PROXY_HOPS` |`1` |Reverse proxies appending to `X-Forwarded-For`; `0` uses the connection's address
+|`WORDMAKER_PROXY_HOPS` |`1` |Reverse proxies appending to `X-Forwarded-For`, which is only read from loopback and private-network connections; `0` uses the connection's address
 |`WORDMAKER_GEOIP_DIR` |`geoip` |Where `wordmaker geoip` saves the DB-IP databases
 |===
 
@@ -56,7 +62,7 @@ Any number of instances can share one database: the `site` column holds each ins
 CREATE DATABASE wordmaker;
 ----
 
-Each row has the path and slug, status and render time, referrer and its host, `utm_source`/`utm_medium`/`utm_campaign`, the user agent with browser, OS, device type and a bot flag (crawlers the parser knows, plus anything calling itself a bot, crawler or spider, headless browsers included), the preferred language, and, with the GeoIP databases, country, region, city and network (ASN).
+Each row has the path and slug, status and render time, referrer (scheme, host and path only, without query string) and its host, `utm_source`/`utm_medium`/`utm_campaign`, the user agent with browser, OS, device type and a bot flag (crawlers the parser knows, plus anything calling itself a bot, crawler or spider, headless browsers included), the preferred language, and, with the GeoIP databases, country, region, city and network (ASN).
 `wordmaker geoip` downloads the free https://db-ip.com/db/lite.php[DB-IP Lite] city and ASN databases (no account needed) into `WORDMAKER_GEOIP_DIR` and prints the settings that point at them; DB-IP publishes a new edition every month.
 MaxMind's GeoLite2 files work as well, kept current with https://github.com/maxmind/geoipupdate[geoipupdate].
 A running `serve` checks the files every minute and loads new versions by itself; if a new file cannot be opened, it keeps using the old one.
@@ -73,9 +79,19 @@ No IP address is stored.
 The address is used for the GeoIP lookup and for `visitor_id`, a hash of address and user agent with a random salt that only lives in memory and changes every UTC day.
 It counts unique visitors per day, but cannot be traced back to an address or followed across days.
 
+The visitor's address is taken from `X-Forwarded-For` (`WORDMAKER_PROXY_HOPS` entries from the right) only when the connection comes from a loopback or private address (`10/8`, `172.16/12`, `192.168/16`, `fc00::/7`, link-local), as from a reverse proxy; anyone connecting directly from elsewhere is counted by the connection's address.
+Without a proxy, set `WORDMAKER_PROXY_HOPS=0`, so visitors on the local network cannot choose their address either; `serve` warns when it listens on a non-loopback address with hops above 0.
+
 Analytics never slows the site down: requests only queue a page view, without waiting.
-When ClickHouse is unreachable, page views are buffered (up to 50,000) and written once it is back.
-On shutdown (Ctrl-C or SIGTERM) the buffer is written before the process exits.
+When ClickHouse is unreachable, page views are buffered (up to 50,000, or 64 MiB) and written once it is back.
+On shutdown (Ctrl-C or SIGTERM) open requests get 5 seconds to finish (MCP event streams are closed right away), then the buffer is written before the process exits.
+A failed insert is retried with the same deduplication token, so an insert that timed out but did reach ClickHouse is not written twice.
+That needs the `non_replicated_deduplication_window` setting, which tables created by older versions lack:
+
+[source,sql]
+----
+ALTER TABLE page_views MODIFY SETTING non_replicated_deduplication_window = 1000;
+----
 
 [source,sql]
 ----
@@ -99,7 +115,8 @@ The _Site_ selector shows all instances or the ones you pick; clicking a site in
 
 It needs Grafana 11 or newer with the https://grafana.com/grafana/plugins/grafana-clickhouse-datasource/[ClickHouse data source] plugin.
 Add a ClickHouse data source for the server (HTTP, port 8123), then import the file under _Dashboards → New → Import_ and pick the data source.
-If the database is not called `wordmaker`, change the _Database_ field at the top.
+If the database is not called `wordmaker`, change the hidden `database` constant under _Dashboard settings → Variables_ (or in the file before importing); it is a constant so viewers cannot change it, since it goes into the SQL as is.
+
 To provision it instead, point a dashboard provider at the `grafana` directory:
 
 [source,yaml]
@@ -110,6 +127,15 @@ providers:
     type: file
     options:
       path: /path/to/wordmaker/grafana
+----
+
+Give the data source a ClickHouse user that can only read `page_views`, not the user `serve` writes with.
+Dashboard viewers can set variables such as _Site_ through the URL, and Grafana's quoting of them does not rule out SQL injection, so the data source's rights are what viewers can reach:
+
+[source,sql]
+----
+CREATE USER grafana IDENTIFIED BY 'change me' SETTINGS readonly = 2;
+GRANT SELECT ON wordmaker.page_views TO grafana;
 ----
 
 == Admin interface
@@ -127,6 +153,7 @@ WORDMAKER_TOKEN_FILE=/path/to/token ./target/release/wordmaker-admin
 
 Then open http://127.0.0.1:3001.
 It talks to the server at `WORDMAKER_BASE_URL` through the REST API and holds the token itself, so the browser never sees it.
+When that is an internal address, set `WORDMAKER_ADMIN_SITE_URL` to the site's public URL for the interface's links to the site.
 That also means anyone who can reach the interface can change the site: it listens on `127.0.0.1:3001` (`WORDMAKER_ADMIN_BIND`) and only answers to loopback host names.
 To reach it under another name, behind something that checks who is asking, add the name to `WORDMAKER_ADMIN_ALLOWED_HOSTS`.
 
@@ -148,7 +175,7 @@ Only verified email addresses on `WORDMAKER_ADMIN_ALLOWED_USERS` get in, either 
 The client secret is optional for providers that register public clients, since the sign-in uses PKCE.
 Sessions last 12 hours and are kept in memory, so a restart signs everyone out.
 
-The editor is vendored in `crates/wordmaker-admin/vendor`; `vendor/update-editor.sh [version]` replaces it with a release from npm.
+The editor is vendored in `crates/wordmaker-admin/vendor`; `vendor/update-editor.sh [version integrity]` replaces it with a release from npm, checked against the sha512 integrity hash pinned in the script.
 The dashboard's world map is generated from https://www.naturalearthdata.com/[Natural Earth] (public domain) by `vendor/update-world.sh`.
 
 == Claude Desktop
@@ -191,6 +218,7 @@ The client then gets an access token (valid for an hour) and a refresh token (30
 
 * `WORDMAKER_BASE_URL` must be the public URL the client connects to, e.g. `https://example.com`; it is the OAuth issuer and part of every metadata URL.
 * Clients identify themselves with a client ID metadata document or through dynamic client registration.
+* Redirect URIs must use HTTPS, plain HTTP to `localhost` or a loopback address, or an app scheme named after a reverse domain name such as `com.example.app:` (`cursor:`, `vscode:` and `vscode-insiders:` are allowed too).
 * OAuth tokens are only accepted on `/mcp`, not on `/api`.
 * Changing `WORDMAKER_TOKEN` signs out every OAuth client.
 
@@ -204,6 +232,8 @@ When the server is not reached through `localhost`, set `WORDMAKER_BASE_URL` (or
 `list_revisions`, `get_revision`, `restore_revision`, `preview_adoc`,
 `upload_media`, `list_media`, `delete_media`, `get_settings`, `set_settings`,
 `list_themes`, `get_theme`, `read_theme_file`, `write_theme_file`, `install_theme`, `activate_theme`, `delete_theme`.
+
+A tool call's arguments may be up to 2 MiB, like a REST API request; only `upload_media` takes up to `WORDMAKER_MAX_UPLOAD`, as base64 (standard or URL-safe, padding and line breaks optional).
 
 === Command line client
 
@@ -225,6 +255,7 @@ echo '{"slug": "about"}' | wordmaker client call get_page -
 Arguments come from an optional JSON object (`-` reads it from stdin), overridden by
 `--arg KEY=VALUE` (string), `--json KEY=JSON`, `--file KEY=PATH` (file contents as a string) and `--base64 KEY=PATH`.
 The result goes to stdout; a failed tool call prints the error to stderr and exits with status 1.
+The client gives up after `--timeout` seconds (default 300), and warns when the token would cross the network over plain `http://`.
 
 == REST API
 
@@ -270,10 +301,14 @@ curl -H "Authorization: Bearer $WORDMAKER_TOKEN" -H 'content-type: application/j
 
 * The page title is rendered as the heading, so start the body with `==` sections rather than a `= Title` line.
 * Reference uploaded images by their path: `image::/media/1a2b3c4d-logo.png[Logo]`.
+Images (SVG included), fonts, audio, video, CSS, plain text and PDFs open in the browser; other uploads, such as HTML, download instead.
+Media and theme files never run scripts on the site: opened on their own they are sandboxed, PDFs aside, which browsers show in their own viewer.
 * Link to other pages with `link:/about[About]`.
 * Changing a published page with `PATCH` changes the site at once.
 To prepare changes first, save them as a draft (`PUT /pages/{slug}/draft`): the site keeps showing the published version until the page is published again, which makes the draft live as a new revision.
-* Only published pages are visible on the site. `/` shows the page chosen as `home_slug`, or a list of all published pages.
+While a draft is pending, `PATCH` and restoring a revision refuse to change title or body (409), since publishing would replace them; change the draft instead, or discard it first.
+* Only published pages are visible on the site. `/` shows the page chosen as `home_slug`, or a list of all published pages while there is none or it is not published.
+`home_slug` must name an existing page; it follows the page when its slug changes and is cleared when the page is deleted.
 * Published pages appear in the header navigation, ordered by `nav_order` then title; set `in_nav` to false to leave one out.
 
 == Themes

@@ -10,16 +10,25 @@
 mod client_metadata;
 mod store;
 
-use std::fmt::Write;
+/// Also guards theme downloads.
+pub use client_metadata::is_public;
+
+use std::{
+    fmt::Write,
+    net::SocketAddr,
+};
 
 use axum::{
+    Extension,
     Form,
     Json,
     Router,
     body::Bytes,
     extract::{
+        ConnectInfo,
         Query,
         State,
+        rejection::FormRejection,
     },
     http::{
         HeaderMap,
@@ -75,7 +84,13 @@ const ACCESS_TOKEN_TTL: TimeDelta = TimeDelta::hours(1);
 const REFRESH_TOKEN_TTL: TimeDelta = TimeDelta::days(30);
 const CODE_TTL: TimeDelta = TimeDelta::minutes(5);
 /// Dynamic registration needs no credentials; this bounds what it can fill.
+/// Clients that never got tokens make way for new ones.
 const MAX_REGISTERED_CLIENTS: i64 = 500;
+/// How long a registered client may go without getting tokens.
+const UNUSED_CLIENT_TTL: TimeDelta = TimeDelta::days(1);
+/// How long a new client is safe from making way for later ones: long
+/// enough for its user to read the sign-in page and approve.
+const NEW_CLIENT_GRACE: TimeDelta = TimeDelta::minutes(15);
 
 pub fn router() -> Router<AppState> {
     // Metadata, registration and the token endpoint are called from
@@ -227,20 +242,23 @@ async fn register(State(state): State<AppState>, body: Bytes) -> Response {
         .map(|name| name.trim().chars().take(100).collect::<String>())
         .filter(|name| !name.is_empty());
 
-    match store::count_clients(&state.pool).await {
-        Ok(count) if count >= MAX_REGISTERED_CLIENTS => {
-            return invalid("too many registered clients");
-        }
-        Ok(_) => {}
-        Err(err) => return server_error(&err),
-    }
     let client = store::RegisteredClient {
         client_id: uuid::Uuid::new_v4().to_string(),
         client_name,
         redirect_uris: registration.redirect_uris,
     };
-    if let Err(err) = store::insert_client(&state.pool, &client).await {
-        return server_error(&err);
+    match store::insert_client(
+        &state.pool,
+        &client,
+        MAX_REGISTERED_CLIENTS,
+        Utc::now() - UNUSED_CLIENT_TTL,
+        Utc::now() - NEW_CLIENT_GRACE,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => return invalid("too many registered clients"),
+        Err(err) => return server_error(&err),
     }
     (
         StatusCode::CREATED,
@@ -289,38 +307,32 @@ struct Request {
     state: Option<String>,
 }
 
-/// Why an authorization request cannot go ahead. Until the client and its
-/// redirect URI are known to belong together, errors are shown to the user
-/// instead of being sent anywhere.
-enum Refusal {
-    Page(String),
-    Redirect {
-        redirect_uri: String,
-        state: Option<String>,
-        error: &'static str,
-        description: String,
-    },
-}
-
-async fn check(state: &AppState, params: &AuthorizeParams) -> Result<Request, Refusal> {
+/// Check an authorization request. Problems are shown to the user, never
+/// sent to the client: before the user has approved, a redirect would let
+/// anyone use this site to send browsers to any URI they registered (RFC
+/// 9700, section 4.11.2).
+async fn check(state: &AppState, params: &AuthorizeParams) -> Result<Request, String> {
     let client_id = params
         .client_id
         .as_deref()
         .filter(|id| !id.is_empty())
-        .ok_or_else(|| Refusal::Page("The request does not name a client.".into()))?;
+        .ok_or("The request does not name a client.")?;
     let client = if is_metadata_url(client_id) {
         state
             .oauth_clients
             .fetch(client_id)
             .await
-            .map_err(|err| Refusal::Page(format!("The client could not be verified: {err}.")))?
+            .map_err(|err| format!("The client could not be verified: {err}."))?
             .as_ref()
             .clone()
     } else {
         let client = store::get_client(&state.pool, client_id)
             .await
-            .map_err(|err| Refusal::Page(format!("Could not look up the client: {err}.")))?
-            .ok_or_else(|| Refusal::Page("This client is not registered.".into()))?;
+            .map_err(|err| {
+                tracing::error!(error = %err, "could not look up an OAuth client");
+                "Could not look up the client."
+            })?
+            .ok_or("This client is not registered.")?;
         ClientInfo {
             client_id: client.client_id,
             client_name: client.client_name,
@@ -331,35 +343,26 @@ async fn check(state: &AppState, params: &AuthorizeParams) -> Result<Request, Re
     let redirect_uri = match params.redirect_uri.as_deref() {
         Some(uri) if redirect_matches(&client.redirect_uris, uri) => uri.to_owned(),
         None if client.redirect_uris.len() == 1 => client.redirect_uris[0].clone(),
-        _ => {
-            return Err(Refusal::Page(
-                "The redirect URI does not belong to this client.".into(),
-            ));
-        }
+        _ => return Err("The redirect URI does not belong to this client.".into()),
     };
+    // Clients registered before the rules got stricter may still hold one.
+    if !valid_redirect_uri(&redirect_uri) {
+        return Err("The redirect URI of this client is not allowed.".into());
+    }
 
-    let refuse = |error, description: &str| Refusal::Redirect {
-        redirect_uri: redirect_uri.clone(),
-        state: params.state.clone(),
-        error,
-        description: description.to_owned(),
-    };
     if params.response_type.as_deref() != Some("code") {
-        return Err(refuse(
-            "unsupported_response_type",
-            "only response_type=code is supported",
-        ));
+        return Err("The client asked for an unsupported response type.".into());
     }
     let code_challenge = params
         .code_challenge
         .as_deref()
         .filter(|c| (43..=128).contains(&c.len()))
         .filter(|_| params.code_challenge_method.as_deref() == Some("S256"))
-        .ok_or_else(|| refuse("invalid_request", "PKCE with S256 is required"))?;
+        .ok_or("The client did not use PKCE with S256, which is required.")?;
     if let Some(requested) = &params.resource
         && !names_resource(&state.config, requested)
     {
-        return Err(refuse("invalid_target", "unknown resource"));
+        return Err("The client asked for access to an unknown resource.".into());
     }
     Ok(Request {
         client,
@@ -382,31 +385,42 @@ async fn authorize(
 ) -> Response {
     match check(&state, &params).await {
         Ok(request) => login_page(&state, &params, &request, None).await,
-        Err(refusal) => refuse(&state, refusal),
+        Err(message) => refuse(&message),
     }
 }
 
-async fn decide(State(state): State<AppState>, Form(form): Form<DecisionForm>) -> Response {
+async fn decide(
+    State(state): State<AppState>,
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Form(form): Form<DecisionForm>,
+) -> Response {
     // Everything the page carried is checked again; it came back from the
     // browser and may have been changed.
     let request = match check(&state, &form.params).await {
         Ok(request) => request,
-        Err(refusal) => return refuse(&state, refusal),
+        Err(message) => return refuse(&message),
     };
     if form.decision.as_deref() != Some("approve") {
-        return refuse(
+        return deny(&state, &request, &headers);
+    }
+    let peer = state
+        .guesses
+        .client(&headers, connect.map(|Extension(ConnectInfo(peer))| peer));
+    if !state.guesses.allowed(peer) {
+        let mut response = login_page(
             &state,
-            Refusal::Redirect {
-                redirect_uri: request.redirect_uri,
-                state: request.state,
-                error: "access_denied",
-                description: "the request was denied".into(),
-            },
-        );
+            &form.params,
+            &request,
+            Some("Too many wrong tokens. Wait a minute, then try again."),
+        )
+        .await;
+        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        return response;
     }
     let presented = form.token.unwrap_or_default();
     if !bool::from(presented.trim().as_bytes().ct_eq(state.token.as_bytes())) {
-        // Slows down guessing; the token itself is long enough not to be.
+        state.guesses.failed(peer);
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let mut response = login_page(
             &state,
@@ -423,6 +437,7 @@ async fn decide(State(state): State<AppState>, Form(form): Form<DecisionForm>) -
     let stored = store::AuthCode {
         client_id: request.client.client_id.clone(),
         redirect_uri: request.redirect_uri.clone(),
+        redirect_uri_sent: form.params.redirect_uri.is_some(),
         code_challenge: request.code_challenge,
         resource: resource(&state.config),
         expires_at: Utc::now() + CODE_TTL,
@@ -438,43 +453,68 @@ async fn decide(State(state): State<AppState>, Form(form): Form<DecisionForm>) -
     )
 }
 
-fn refuse(state: &AppState, refusal: Refusal) -> Response {
-    match refusal {
-        Refusal::Page(message) => {
-            let mut body = String::from("<h1>Cannot sign in</h1>\n");
-            let _ = writeln!(body, "<p>{}</p>", escape(&message));
-            let mut response = page("Cannot sign in", &body);
-            *response.status_mut() = StatusCode::BAD_REQUEST;
-            response
-        }
-        Refusal::Redirect {
-            redirect_uri,
-            state: client_state,
-            error,
-            description,
-        } => redirect_to_client(
-            state,
-            &redirect_uri,
-            &[("error", error), ("error_description", &description)],
-            client_state.as_deref(),
-        ),
-    }
+fn refuse(message: &str) -> Response {
+    let mut body = String::from("<h1>Cannot sign in</h1>\n");
+    let _ = writeln!(body, "<p>{}</p>", escape(message));
+    let mut response = page("Cannot sign in", &body);
+    *response.status_mut() = StatusCode::BAD_REQUEST;
+    response
 }
 
-/// Send the browser back to the client with `params`, the client's `state`
-/// and our issuer (RFC 9207), so the client can tell who answered.
+/// Tell the client that the user said no. Only the form posted from our
+/// own page is answered with a redirect. Anyone can post the deny form
+/// from elsewhere without knowing the admin token, so other requests get
+/// a link instead of an automatic bounce to the client's URI.
+fn deny(state: &AppState, request: &Request, headers: &HeaderMap) -> Response {
+    let Some(url) = client_url(
+        state,
+        &request.redirect_uri,
+        &[
+            ("error", "access_denied"),
+            ("error_description", "the request was denied"),
+        ],
+        request.state.as_deref(),
+    ) else {
+        return refuse("The redirect URI is not valid.");
+    };
+    let same_origin = headers
+        .get("sec-fetch-site")
+        .is_some_and(|site| site == "same-origin");
+    if same_origin {
+        return Redirect::to(url.as_str()).into_response();
+    }
+    let mut body = String::from("<h1>Request denied</h1>\n");
+    let _ = writeln!(
+        body,
+        "<p>Nothing was shared.</p>\n<p><a href=\"{}\">Return to {}</a></p>",
+        escape(url.as_str()),
+        escape(&destination(&request.redirect_uri)),
+    );
+    page("Request denied", &body)
+}
+
+/// Send the browser back to the client with `params`.
 fn redirect_to_client(
     state: &AppState,
     redirect_uri: &str,
     params: &[(&str, &str)],
     client_state: Option<&str>,
 ) -> Response {
-    let Ok(mut url) = url::Url::parse(redirect_uri) else {
-        return refuse(
-            state,
-            Refusal::Page("The redirect URI is not valid.".into()),
-        );
-    };
+    match client_url(state, redirect_uri, params, client_state) {
+        Some(url) => Redirect::to(url.as_str()).into_response(),
+        None => refuse("The redirect URI is not valid."),
+    }
+}
+
+/// The client's redirect URI with `params`, the client's `state` and our
+/// issuer (RFC 9207), so the client can tell who answered.
+fn client_url(
+    state: &AppState,
+    redirect_uri: &str,
+    params: &[(&str, &str)],
+    client_state: Option<&str>,
+) -> Option<url::Url> {
+    let mut url = url::Url::parse(redirect_uri).ok()?;
     {
         let mut query = url.query_pairs_mut();
         for (key, value) in params {
@@ -485,7 +525,15 @@ fn redirect_to_client(
         }
         query.append_pair("iss", issuer(&state.config));
     }
-    Redirect::to(url.as_str()).into_response()
+    Some(url)
+}
+
+/// Where a redirect URI leads, as shown to the user.
+fn destination(redirect_uri: &str) -> String {
+    url::Url::parse(redirect_uri)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| redirect_uri.to_owned())
 }
 
 async fn login_page(
@@ -502,10 +550,7 @@ async fn login_page(
         .client_name
         .clone()
         .unwrap_or_else(|| "An MCP client".into());
-    let destination = url::Url::parse(&request.redirect_uri)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .unwrap_or_else(|| request.redirect_uri.clone());
+    let destination = destination(&request.redirect_uri);
     let identity = if request.client.verified {
         format!(
             "Identified by <code>{}</code>.",
@@ -567,13 +612,14 @@ async fn login_page(
 /// A standalone page of the sign-in flow. It must never be framed, cached
 /// or leak its URL, which carries the request.
 fn page(title: &str, body: &str) -> Response {
-    let html = format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta \
-         name=\"viewport\" content=\"width=device-width, \
-         initial-scale=1\">\n<title>{}</title>\n<style>{STYLE}</style>\n</head>\n<body>\n<main>\\
-         n{body}</main>\n</body>\n</html>\n",
-        escape(title)
-    );
+    // Built in short pieces: rustfmt's string wrapping once split a `\n`
+    // here into a visible backslash and "n".
+    let mut html = String::from("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n");
+    html.push_str("<meta charset=\"utf-8\">\n");
+    html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+    let _ = writeln!(html, "<title>{}</title>", escape(title));
+    let _ = writeln!(html, "<style>{STYLE}</style>\n</head>\n<body>\n<main>");
+    let _ = writeln!(html, "{body}</main>\n</body>\n</html>");
     (
         [
             (header::CACHE_CONTROL, "no-store"),
@@ -622,10 +668,37 @@ struct TokenRequest {
     resource: Option<String>,
 }
 
-async fn token(State(state): State<AppState>, Form(request): Form<TokenRequest>) -> Response {
-    if let Err(err) = store::purge_expired(&state.pool).await {
-        tracing::warn!(error = %err, "could not purge expired OAuth codes and tokens");
-    }
+/// Expired codes and tokens are useless; drop them from time to time.
+pub fn spawn_purge(pool: sqlx::SqlitePool) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_mins(10));
+        loop {
+            interval.tick().await;
+            if let Err(err) = store::purge_expired(&pool).await {
+                tracing::warn!(error = %err, "could not purge expired OAuth codes and tokens");
+            }
+        }
+    });
+}
+
+/// The OAuth error for a missing or malformed form body, instead of
+/// axum's plain-text rejection.
+fn form_rejected(rejection: &FormRejection) -> Response {
+    oauth_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        &format!("expected an application/x-www-form-urlencoded body: {rejection}"),
+    )
+}
+
+async fn token(
+    State(state): State<AppState>,
+    request: Result<Form<TokenRequest>, FormRejection>,
+) -> Response {
+    let request = match request {
+        Ok(Form(request)) => request,
+        Err(rejection) => return form_rejected(&rejection),
+    };
     let result = match request.grant_type.as_deref() {
         Some("authorization_code") => redeem_code(&state, &request).await,
         Some("refresh_token") => refresh(&state, &request).await,
@@ -691,17 +764,58 @@ async fn redeem_code(state: &AppState, request: &TokenRequest) -> Result<Respons
     let client_id = required(request.client_id.as_ref(), "client_id")?;
     let verifier = required(request.code_verifier.as_ref(), "code_verifier")?;
 
-    let stored = store::take_code(&state.pool, &hash(state, code))
-        .await?
-        .ok_or_else(TokenError::invalid_grant)?;
-    let redirect_ok = request
-        .redirect_uri
-        .as_deref()
-        .is_none_or(|uri| uri == stored.redirect_uri);
+    let grant_id = uuid::Uuid::new_v4().to_string();
+    let mut tx = state.pool.begin().await.map_err(AppError::from)?;
+    let stored = match store::redeem_code(&mut tx, &hash(state, code), &grant_id).await? {
+        store::Redeemed::Fresh(stored) => stored,
+        store::Redeemed::Unknown => return Err(TokenError::invalid_grant()),
+        store::Redeemed::Replayed { grant_id } => {
+            // The code was intercepted, or the client is confused; either
+            // way the tokens it was exchanged for are not to be trusted
+            // (RFC 6749, section 4.1.2).
+            store::revoke_grant(&mut tx, &grant_id).await?;
+            tx.commit().await.map_err(AppError::from)?;
+            tracing::warn!(
+                grant_id,
+                "authorization code replayed; OAuth sign-in revoked"
+            );
+            return Err(TokenError::invalid_grant());
+        }
+    };
+    // The code is spent even if the request turns out to be wrong.
+    if let Err(err) = check_code(state, request, &stored, client_id, verifier) {
+        tx.commit().await.map_err(AppError::from)?;
+        return Err(err);
+    }
+
+    store::mark_client_used(&mut tx, &stored.client_id).await?;
+    let grant = store::TokenGrant {
+        grant_id,
+        client_id: stored.client_id,
+        resource: stored.resource,
+    };
+    let response = issue(state, &mut tx, &grant).await?;
+    tx.commit().await.map_err(AppError::from)?;
+    Ok(response)
+}
+
+fn check_code(
+    state: &AppState,
+    request: &TokenRequest,
+    stored: &store::AuthCode,
+    client_id: &str,
+    verifier: &str,
+) -> Result<(), TokenError> {
+    // The redirect URI has to be repeated if the authorization request
+    // named it (RFC 6749, section 4.1.3).
+    let redirect_ok = match request.redirect_uri.as_deref() {
+        Some(uri) => uri == stored.redirect_uri,
+        None => !stored.redirect_uri_sent,
+    };
     if stored.expires_at < Utc::now() || stored.client_id != client_id || !redirect_ok {
         return Err(TokenError::invalid_grant());
     }
-    if !(43..=128).contains(&verifier.len())
+    if !valid_verifier(verifier)
         || !bool::from(
             pkce_challenge(verifier)
                 .as_bytes()
@@ -713,30 +827,36 @@ async fn redeem_code(state: &AppState, request: &TokenRequest) -> Result<Respons
             "code_verifier does not match the code_challenge",
         ));
     }
-    check_resource(state, request, &stored.resource)?;
-
-    let grant = store::TokenGrant {
-        grant_id: uuid::Uuid::new_v4().to_string(),
-        client_id: stored.client_id,
-        resource: stored.resource,
-    };
-    issue(state, &grant).await
+    check_resource(state, request, &stored.resource)
 }
 
 async fn refresh(state: &AppState, request: &TokenRequest) -> Result<Response, TokenError> {
     let refresh_token = required(request.refresh_token.as_ref(), "refresh_token")?;
     let client_id = required(request.client_id.as_ref(), "client_id")?;
-    let grant = store::find_token(
-        &state.pool,
-        store::Kind::Refresh,
-        &hash(state, refresh_token),
-    )
-    .await?
-    .filter(|grant| grant.client_id == client_id)
-    .ok_or_else(TokenError::invalid_grant)?;
+    // Using up the token and issuing its successors happen in one
+    // transaction; anything that fails before the commit leaves the token
+    // as it was.
+    let mut tx = state.pool.begin().await.map_err(AppError::from)?;
+    let grant = match store::use_refresh_token(&mut tx, &hash(state, refresh_token)).await? {
+        store::Refresh::Fresh(grant) if grant.client_id == client_id => grant,
+        store::Refresh::Fresh(_) | store::Refresh::Unknown => {
+            return Err(TokenError::invalid_grant());
+        }
+        store::Refresh::Reused { grant_id } => {
+            // Either the client or someone who stole the token already
+            // used it; there is no telling which, so the sign-in ends
+            // (RFC 9700, section 4.14.2).
+            store::revoke_grant(&mut tx, &grant_id).await?;
+            tx.commit().await.map_err(AppError::from)?;
+            tracing::warn!(grant_id, "refresh token reused; OAuth sign-in revoked");
+            return Err(TokenError::invalid_grant());
+        }
+    };
     check_resource(state, request, &grant.resource)?;
     // Refresh tokens are rotated: issuing new ones removes the old pair.
-    issue(state, &grant).await
+    let response = issue(state, &mut tx, &grant).await?;
+    tx.commit().await.map_err(AppError::from)?;
+    Ok(response)
 }
 
 fn check_resource(
@@ -757,12 +877,16 @@ fn check_resource(
     }
 }
 
-async fn issue(state: &AppState, grant: &store::TokenGrant) -> Result<Response, TokenError> {
+async fn issue(
+    state: &AppState,
+    conn: &mut sqlx::SqliteConnection,
+    grant: &store::TokenGrant,
+) -> Result<Response, TokenError> {
     let access_token = random_token();
     let refresh_token = random_token();
     let now = Utc::now();
-    store::issue_tokens(
-        &state.pool,
+    store::replace_tokens(
+        conn,
         grant,
         &[
             (
@@ -798,7 +922,14 @@ struct RevokeRequest {
     token: Option<String>,
 }
 
-async fn revoke(State(state): State<AppState>, Form(request): Form<RevokeRequest>) -> Response {
+async fn revoke(
+    State(state): State<AppState>,
+    request: Result<Form<RevokeRequest>, FormRejection>,
+) -> Response {
+    let request = match request {
+        Ok(Form(request)) => request,
+        Err(rejection) => return form_rejected(&rejection),
+    };
     let Some(token) = request.token.filter(|t| !t.is_empty()) else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -832,6 +963,15 @@ fn hash(state: &AppState, value: &str) -> String {
     hasher.update([0]);
     hasher.update(value.as_bytes());
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+/// A PKCE verifier: 43 to 128 unreserved characters (RFC 7636, section
+/// 4.1).
+fn valid_verifier(verifier: &str) -> bool {
+    (43..=128).contains(&verifier.len())
+        && verifier
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
 }
 
 fn pkce_challenge(verifier: &str) -> String {
@@ -881,6 +1021,10 @@ mod tests {
     const REDIRECT: &str = "https://claude.ai/api/mcp/auth_callback";
 
     async fn app() -> Router {
+        app_with(Arc::default()).await
+    }
+
+    async fn app_with(guesses: Arc<crate::token::Guesses>) -> Router {
         let config = Config {
             database_url: String::new(),
             media_dir: std::env::temp_dir().join("wordmaker-oauth-test"),
@@ -894,10 +1038,16 @@ mod tests {
             token: "admin-secret".into(),
             themes: Arc::default(),
             images: Arc::default(),
+            renders: Arc::default(),
             oauth_clients: Arc::default(),
+            guesses,
             analytics: None,
         };
-        crate::app::router(state, vec!["site.example".into()])
+        crate::app::router(
+            state,
+            vec!["site.example".into()],
+            tokio_util::sync::CancellationToken::new(),
+        )
     }
 
     struct Reply {
@@ -937,14 +1087,36 @@ mod tests {
     }
 
     async fn post_form(app: &Router, uri: &str, form: &[(&str, &str)]) -> Reply {
+        post_form_from(app, uri, form, None).await
+    }
+
+    /// Post a form as a browser would, from a page of `fetch_site`
+    /// (`Sec-Fetch-Site`).
+    async fn post_form_from(
+        app: &Router,
+        uri: &str,
+        form: &[(&str, &str)],
+        fetch_site: Option<&str>,
+    ) -> Reply {
         let body = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(form)
             .finish();
+        let mut request = axum::http::Request::post(uri)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(site) = fetch_site {
+            request = request.header("sec-fetch-site", site);
+        }
+        call(app, request.body(Body::from(body)).unwrap()).await
+    }
+
+    async fn register(app: &Router, redirect_uri: &str) -> Reply {
         call(
             app,
-            axum::http::Request::post(uri)
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from(body))
+            axum::http::Request::post("/oauth/register")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "redirect_uris": [redirect_uri] }).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -1060,6 +1232,7 @@ mod tests {
         assert!(reply.body.contains("Connect Claude"), "{}", reply.body);
         assert!(reply.body.contains("claude.ai"), "{}", reply.body);
         assert_eq!(reply.headers[header::X_FRAME_OPTIONS], "DENY");
+        assert!(reply.body.contains("<main>\n<h1>"), "{}", reply.body);
 
         let code = sign_in(&app, &client_id).await;
         let reply = post_form(
@@ -1094,20 +1267,6 @@ mod tests {
         .await;
         assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
 
-        // A code works once.
-        let reply = post_form(
-            &app,
-            "/oauth/token",
-            &[
-                ("grant_type", "authorization_code"),
-                ("code", &code),
-                ("client_id", &client_id),
-                ("code_verifier", VERIFIER),
-            ],
-        )
-        .await;
-        assert_eq!(reply.json()["error"], "invalid_grant");
-
         // Refreshing rotates both tokens.
         let reply = post_form(
             &app,
@@ -1127,17 +1286,6 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(mcp_status(&app, &new_access).await.status, StatusCode::OK);
-        let reply = post_form(
-            &app,
-            "/oauth/token",
-            &[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", &refresh),
-                ("client_id", &client_id),
-            ],
-        )
-        .await;
-        assert_eq!(reply.json()["error"], "invalid_grant");
 
         // Revoking the refresh token ends the sign-in.
         let reply = post_form(&app, "/oauth/revoke", &[("token", &new_refresh)]).await;
@@ -1145,6 +1293,128 @@ mod tests {
         assert_eq!(
             mcp_status(&app, &new_access).await.status,
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// Exchange a fresh code for tokens; returns (access, refresh).
+    async fn tokens(app: &Router, client_id: &str) -> (String, String) {
+        let code = sign_in(app, client_id).await;
+        let reply = redeem(app, client_id, &code).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        let tokens = reply.json();
+        (
+            tokens["access_token"].as_str().unwrap().to_owned(),
+            tokens["refresh_token"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    async fn redeem(app: &Router, client_id: &str, code: &str) -> Reply {
+        post_form(
+            app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("client_id", client_id),
+                ("redirect_uri", REDIRECT),
+                ("code_verifier", VERIFIER),
+            ],
+        )
+        .await
+    }
+
+    async fn refresh_with(app: &Router, client_id: &str, refresh: &str) -> Reply {
+        post_form(
+            app,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh),
+                ("client_id", client_id),
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn refresh_token_reuse_revokes_the_sign_in() {
+        let app = app().await;
+        let client_id = register_client(&app).await;
+        let (_, refresh) = tokens(&app, &client_id).await;
+
+        let reply = refresh_with(&app, &client_id, &refresh).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        let access = reply.json()["access_token"].as_str().unwrap().to_owned();
+        let next_refresh = reply.json()["refresh_token"].as_str().unwrap().to_owned();
+        assert_eq!(mcp_status(&app, &access).await.status, StatusCode::OK);
+
+        // The old token again: whoever holds the new pair loses it too.
+        let reply = refresh_with(&app, &client_id, &refresh).await;
+        assert_eq!(reply.json()["error"], "invalid_grant");
+        assert_eq!(
+            mcp_status(&app, &access).await.status,
+            StatusCode::UNAUTHORIZED
+        );
+        let reply = refresh_with(&app, &client_id, &next_refresh).await;
+        assert_eq!(reply.json()["error"], "invalid_grant");
+
+        // A refresh token presented by another client is not used up.
+        let (_, refresh) = tokens(&app, &client_id).await;
+        let reply = refresh_with(&app, "someone-else", &refresh).await;
+        assert_eq!(reply.json()["error"], "invalid_grant");
+        let reply = refresh_with(&app, &client_id, &refresh).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    }
+
+    #[tokio::test]
+    async fn code_replay_revokes_the_sign_in() {
+        let app = app().await;
+        let client_id = register_client(&app).await;
+        let code = sign_in(&app, &client_id).await;
+        let reply = redeem(&app, &client_id, &code).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        let access = reply.json()["access_token"].as_str().unwrap().to_owned();
+        let refresh = reply.json()["refresh_token"].as_str().unwrap().to_owned();
+        assert_eq!(mcp_status(&app, &access).await.status, StatusCode::OK);
+
+        let reply = redeem(&app, &client_id, &code).await;
+        assert_eq!(reply.json()["error"], "invalid_grant");
+        assert_eq!(
+            mcp_status(&app, &access).await.status,
+            StatusCode::UNAUTHORIZED
+        );
+        let reply = refresh_with(&app, &client_id, &refresh).await;
+        assert_eq!(reply.json()["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn sign_in_is_throttled_after_wrong_tokens() {
+        let guesses = Arc::new(crate::token::Guesses::default());
+        let app = app_with(guesses.clone()).await;
+        let client_id = register_client(&app).await;
+        let (access, _) = tokens(&app, &client_id).await;
+        // Wrong tokens elsewhere, e.g. on /api, count here too.
+        for _ in 0..20 {
+            guesses.failed(None);
+        }
+        // Signed-in clients are not locked out, but the admin token is no
+        // longer checked.
+        assert_eq!(mcp_status(&app, &access).await.status, StatusCode::OK);
+        assert_eq!(
+            mcp_status(&app, "admin-secret").await.status,
+            StatusCode::UNAUTHORIZED
+        );
+        let mut form = authorize_params(&client_id);
+        form.push(("token", "admin-secret".into()));
+        form.push(("decision", "approve".into()));
+        let pairs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let reply = post_form(&app, "/oauth/authorize", &pairs).await;
+        assert_eq!(reply.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(!reply.headers.contains_key(header::LOCATION));
+        assert!(
+            reply.body.contains("Too many wrong tokens"),
+            "{}",
+            reply.body
         );
     }
 
@@ -1163,10 +1433,19 @@ mod tests {
         let mut form = authorize_params(&client_id);
         form.push(("decision", "deny".into()));
         let pairs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let reply = post_form(&app, "/oauth/authorize", &pairs).await;
+        let reply = post_form_from(&app, "/oauth/authorize", &pairs, Some("same-origin")).await;
         let query: HashMap<_, _> = reply.location().query_pairs().into_owned().collect();
         assert_eq!(query["error"], "access_denied");
         assert_eq!(query["state"], "xyz");
+
+        // A denial posted from anywhere else is not bounced on to the
+        // client, since anyone could send it.
+        for site in [None, Some("cross-site")] {
+            let reply = post_form_from(&app, "/oauth/authorize", &pairs, site).await;
+            assert_eq!(reply.status, StatusCode::OK);
+            assert!(!reply.headers.contains_key(header::LOCATION));
+            assert!(reply.body.contains("error=access_denied"), "{}", reply.body);
+        }
     }
 
     #[tokio::test]
@@ -1184,7 +1463,8 @@ mod tests {
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
         assert!(!reply.headers.contains_key(header::LOCATION));
 
-        // PKCE is required.
+        // PKCE is required, and errors before the user approved are shown
+        // instead of being sent to the client.
         let params: Vec<_> = authorize_params(&client_id)
             .into_iter()
             .filter(|(k, _)| !k.starts_with("code_challenge"))
@@ -1193,8 +1473,16 @@ mod tests {
             .extend_pairs(params)
             .finish();
         let reply = get(&app, &format!("/oauth/authorize?{query}")).await;
-        let query: HashMap<_, _> = reply.location().query_pairs().into_owned().collect();
-        assert_eq!(query["error"], "invalid_request");
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert!(!reply.headers.contains_key(header::LOCATION));
+        assert!(reply.body.contains("PKCE"), "{}", reply.body);
+        let reply = get(
+            &app,
+            &format!("/oauth/authorize?client_id={client_id}&redirect_uri={REDIRECT}"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert!(!reply.headers.contains_key(header::LOCATION));
 
         // A wrong verifier gets no tokens.
         let code = sign_in(&app, &client_id).await;
@@ -1214,18 +1502,48 @@ mod tests {
         .await;
         assert_eq!(reply.json()["error"], "invalid_grant");
 
+        // A redirect URI named at authorization has to be repeated.
+        let code = sign_in(&app, &client_id).await;
+        let without_redirect = [
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("client_id", client_id.as_str()),
+            ("code_verifier", VERIFIER),
+        ];
+        let reply = post_form(&app, "/oauth/token", &without_redirect).await;
+        assert_eq!(reply.json()["error"], "invalid_grant");
+
+        // Verifiers are made of unreserved characters only.
+        assert!(valid_verifier(VERIFIER));
+        assert!(!valid_verifier(&format!("{VERIFIER}+/=")));
+        assert!(!valid_verifier(&"é".repeat(30)));
+
+        // Malformed bodies get OAuth errors.
+        for path in ["/oauth/token", "/oauth/revoke"] {
+            let reply = call(
+                &app,
+                axum::http::Request::post(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
+            assert_eq!(reply.json()["error"], "invalid_request", "{path}");
+        }
+
         // Registration refuses redirect URIs that are not safe.
-        let reply = call(
-            &app,
-            axum::http::Request::post("/oauth/register")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({ "redirect_uris": ["http://evil.example/cb"] }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-        assert_eq!(reply.json()["error"], "invalid_redirect_uri");
+        for uri in [
+            "http://evil.example/cb",
+            "ms-msdt:/id",
+            "search-ms:query=x",
+            "intent://x#Intent;end",
+        ] {
+            let reply = register(&app, uri).await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(reply.json()["error"], "invalid_redirect_uri");
+        }
+        let reply = register(&app, "com.example.app:/oauth/callback").await;
+        assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
     }
 }

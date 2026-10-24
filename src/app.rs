@@ -1,13 +1,19 @@
 use std::sync::Arc;
 
+use std::net::SocketAddr;
+
 use axum::{
+    Json,
     Router,
     extract::{
+        ConnectInfo,
         Request,
         State,
     },
     http::{
         HeaderMap,
+        HeaderValue,
+        StatusCode,
         header,
     },
     middleware::{
@@ -24,10 +30,13 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpService,
     session::local::LocalSessionManager,
 };
+use serde_json::json;
 use sqlx::SqlitePool;
 use subtle::ConstantTimeEq;
+use tokio_util::sync::CancellationToken;
 use tower_http::{
     compression::CompressionLayer,
+    set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
 };
 
@@ -41,6 +50,7 @@ use crate::{
     oauth,
     site,
     theme::ThemeCache,
+    token::Guesses,
 };
 
 #[derive(Clone)]
@@ -50,18 +60,29 @@ pub struct AppState {
     pub token: Arc<str>,
     pub themes: Arc<ThemeCache>,
     pub images: Arc<Images>,
+    /// Rendered page bodies and footers.
+    pub renders: Arc<site::RenderCache>,
     pub oauth_clients: Arc<oauth::ClientCache>,
+    /// Wrong admin tokens, to throttle guessing.
+    pub guesses: Arc<Guesses>,
     /// Records page views; `None` when analytics is off.
     pub analytics: Option<Analytics>,
 }
 
-/// The whole application: public site, `/api/v1` and `/mcp`.
-pub fn router(state: AppState, mcp_allowed_hosts: Vec<String>) -> Router {
+/// The whole application: public site, `/api/v1` and `/mcp`. Cancelling
+/// `shutdown` ends the MCP sessions and their event streams, which would
+/// otherwise keep a graceful shutdown waiting forever.
+pub fn router(
+    state: AppState,
+    mcp_allowed_hosts: Vec<String>,
+    shutdown: CancellationToken,
+) -> Router {
     let mcp = {
         let pool = state.pool.clone();
         let config = state.config.clone();
         let mut mcp_config = StreamableHttpServerConfig::default();
         mcp_config.allowed_hosts = mcp_allowed_hosts;
+        mcp_config.cancellation_token = shutdown;
         mcp_config.max_request_body_bytes = state.config.max_upload_bytes * 2;
         StreamableHttpService::new(
             move || Ok(WordMakerMcp::new(pool.clone(), config.clone())),
@@ -80,11 +101,28 @@ pub fn router(state: AppState, mcp_allowed_hosts: Vec<String>) -> Router {
             require_mcp_auth,
         ));
 
+    // Every response gets these unless it sets its own, as the OAuth pages
+    // and media files do: no content sniffing, no framing by other sites,
+    // and only the origin in the `Referer` of links to other sites. The
+    // admin interface shows previews on its own origin and never frames
+    // the site.
+    let default_header =
+        |name, value| SetResponseHeaderLayer::if_not_present(name, HeaderValue::from_static(value));
     Router::new()
         .merge(api)
         .merge(mcp)
         .merge(oauth::router())
         .merge(site::router(&state).layer(CompressionLayer::new()))
+        .layer(default_header(header::X_CONTENT_TYPE_OPTIONS, "nosniff"))
+        .layer(default_header(
+            header::REFERRER_POLICY,
+            "strict-origin-when-cross-origin",
+        ))
+        .layer(default_header(header::X_FRAME_OPTIONS, "SAMEORIGIN"))
+        .layer(default_header(
+            header::CONTENT_SECURITY_POLICY,
+            "frame-ancestors 'self'",
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -97,7 +135,10 @@ fn presented_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(|value| value.split_once(' '))
+        // The scheme is case-insensitive (RFC 9110, section 11.1).
+        .filter(|(scheme, _)| scheme.to_lowercase() == "bearer")
+        .map(|(_, token)| token.trim_start())
         .or_else(|| {
             headers
                 .get(TOKEN_HEADER)
@@ -109,15 +150,42 @@ fn is_admin_token(state: &AppState, presented: &str) -> bool {
     presented.as_bytes().ct_eq(state.token.as_bytes()).into()
 }
 
+/// The client a request's wrong tokens are counted against.
+fn guesser(state: &AppState, request: &Request) -> Option<std::net::IpAddr> {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|&ConnectInfo(peer)| peer);
+    state.guesses.client(request.headers(), peer)
+}
+
+/// The answer while a client has presented too many wrong tokens.
+pub fn too_many_guesses() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, "60")],
+        Json(json!({ "error": "too many wrong tokens; try again later" })),
+    )
+        .into_response()
+}
+
 async fn require_token(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    match presented_token(request.headers()) {
-        Some(presented) if is_admin_token(&state, presented) => Ok(next.run(request).await),
-        _ => Err(AppError::Unauthorized),
+    let Some(presented) = presented_token(request.headers()) else {
+        return Err(AppError::Unauthorized);
+    };
+    let peer = guesser(&state, &request);
+    if !state.guesses.allowed(peer) {
+        return Ok(too_many_guesses());
     }
+    if is_admin_token(&state, presented) {
+        return Ok(next.run(request).await);
+    }
+    state.guesses.failed(peer);
+    Err(AppError::Unauthorized)
 }
 
 /// `/mcp` takes the admin token or an OAuth access token. Without either,
@@ -128,18 +196,40 @@ async fn require_mcp_auth(
     next: Next,
 ) -> Result<Response, AppError> {
     let presented = presented_token(request.headers()).map(str::to_owned);
-    if let Some(presented) = &presented
-        && (is_admin_token(&state, presented)
-            || oauth::access_token_valid(&state, presented).await?)
-    {
-        return Ok(next.run(request).await);
+    if let Some(presented) = &presented {
+        // OAuth access tokens are random and long, so they are checked
+        // even while wrong tokens are throttled; signed-in clients keep
+        // working when someone guesses at the admin token.
+        if oauth::access_token_valid(&state, presented).await? {
+            return Ok(next.run(request).await);
+        }
+        // An expired or revoked OAuth token lands here too. Its client only
+        // signs in again on a 401 with a challenge, so a throttled client
+        // gets that rather than a 429, without its token being checked.
+        let peer = guesser(&state, &request);
+        if !state.guesses.allowed(peer) {
+            let mut response = unauthorized(&state, true);
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+            return Ok(response);
+        }
+        if is_admin_token(&state, presented) {
+            return Ok(next.run(request).await);
+        }
+        state.guesses.failed(peer);
     }
+    Ok(unauthorized(&state, presented.is_some()))
+}
+
+/// A 401 that tells MCP clients where to find out how to sign in.
+fn unauthorized(state: &AppState, presented: bool) -> Response {
     let mut response = AppError::Unauthorized.into_response();
     response.headers_mut().insert(
         header::WWW_AUTHENTICATE,
-        oauth::challenge(&state.config, presented.is_some()),
+        oauth::challenge(&state.config, presented),
     );
-    Ok(response)
+    response
 }
 
 #[cfg(test)]
@@ -166,6 +256,18 @@ mod tests {
     }
 
     async fn app_with(analytics: Option<Analytics>) -> Router {
+        app_until(analytics, CancellationToken::new()).await
+    }
+
+    async fn app_until(analytics: Option<Analytics>, shutdown: CancellationToken) -> Router {
+        app_guessing(analytics, shutdown, Arc::default()).await
+    }
+
+    async fn app_guessing(
+        analytics: Option<Analytics>,
+        shutdown: CancellationToken,
+        guesses: Arc<Guesses>,
+    ) -> Router {
         let config = Config {
             database_url: String::new(),
             media_dir: std::env::temp_dir().join("wordmaker-app-test"),
@@ -182,10 +284,12 @@ mod tests {
             token: "secret".into(),
             themes: Arc::default(),
             images: Arc::default(),
+            renders: Arc::default(),
             oauth_clients: Arc::default(),
+            guesses,
             analytics,
         };
-        router(state, vec!["localhost".into()])
+        router(state, vec!["localhost".into()], shutdown)
     }
 
     async fn send(
@@ -216,7 +320,10 @@ mod tests {
     }
 
     async fn get_page(app: &Router, uri: &str) -> StatusCode {
+        // As from a reverse proxy on the same host.
+        let proxy = std::net::SocketAddr::from(([127, 0, 0, 1], 4000));
         let request = Request::get(uri)
+            .extension(axum::extract::ConnectInfo(proxy))
             .header("x-forwarded-for", "198.51.100.9, 203.0.113.7")
             .header("user-agent", "Mozilla/5.0 (compatible; Googlebot/2.1)")
             .header("referer", "https://search.example/")
@@ -278,7 +385,7 @@ mod tests {
         ]);
         let (analytics, sink) = args
             .analytics
-            .start("http://localhost:3000")
+            .start("http://localhost:3000", CancellationToken::new())
             .unwrap()
             .unwrap();
         let app = app_with(Some(analytics)).await;
@@ -317,6 +424,77 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    fn mcp_request(method: Method, session: Option<&str>, body: Option<Value>) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(method)
+            .uri("/mcp")
+            .header("host", "localhost")
+            .header("authorization", "Bearer secret")
+            .header("accept", "application/json, text/event-stream");
+        if let Some(session) = session {
+            request = request.header("mcp-session-id", session);
+        }
+        match body {
+            Some(json) => request
+                .header("content-type", "application/json")
+                .body(Body::from(json.to_string())),
+            None => request.body(Body::empty()),
+        }
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn shutdown_ends_mcp_event_streams() {
+        let shutdown = CancellationToken::new();
+        let app = app_until(None, shutdown.clone()).await;
+        let initialize = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1" }
+            }
+        });
+        let response = app
+            .clone()
+            .oneshot(mcp_request(Method::POST, None, Some(initialize)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session = response.headers()["mcp-session-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        response.into_body().collect().await.unwrap();
+        let initialized = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+        app.clone()
+            .oneshot(mcp_request(Method::POST, Some(&session), Some(initialized)))
+            .await
+            .unwrap();
+
+        // The stream a client keeps open for server messages.
+        let response = app
+            .oneshot(mcp_request(Method::GET, Some(&session), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        // Past the priming event it stays open, waiting for server messages.
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(300), body.frame()).await {
+                Err(_) => break,
+                Ok(Some(Ok(_))) => {}
+                ended => panic!("the stream ended: {ended:?}"),
+            }
+        }
+
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), body.collect())
+            .await
+            .expect("the stream ends on shutdown")
+            .ok();
+    }
+
     #[tokio::test]
     async fn api_requires_token() {
         let app = app().await;
@@ -337,6 +515,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn wrong_tokens_are_throttled() {
+        let app = app().await;
+        let status = |path: &'static str, token: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::post(path)
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("host", "localhost")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+        // /api and /mcp share one allowance.
+        for i in 0..20 {
+            let path = if i % 2 == 0 { "/api/v1/pages" } else { "/mcp" };
+            assert_eq!(status(path, "wrong").await, StatusCode::UNAUTHORIZED);
+        }
+        // Now even the right token is not checked.
+        assert_eq!(
+            status("/api/v1/pages", "secret").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // MCP clients only sign in again on a 401 with a challenge.
+        assert_eq!(status("/mcp", "secret").await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn guesses_behind_a_proxy_count_per_client() {
+        let guesses = Arc::new(Guesses::behind(1));
+        let app = app_guessing(None, CancellationToken::new(), guesses).await;
+        let status = |peer: [u8; 4], client: &'static str, token: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::get("/api/v1/pages")
+                        .extension(axum::extract::ConnectInfo(SocketAddr::from((peer, 4000))))
+                        .header("x-forwarded-for", client)
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+        let proxy = [127, 0, 0, 1];
+        for _ in 0..20 {
+            status(proxy, "203.0.113.7", "wrong").await;
+        }
+        assert_eq!(
+            status(proxy, "203.0.113.7", "secret").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // Someone else behind the same proxy is not locked out.
+        assert_eq!(
+            status(proxy, "198.51.100.9", "secret").await,
+            StatusCode::OK
+        );
+        // A direct connection cannot pick its address to escape the limit.
+        let direct = [192, 0, 2, 1];
+        for _ in 0..20 {
+            status(direct, "198.51.100.1", "wrong").await;
+        }
+        assert_eq!(
+            status(direct, "198.51.100.2", "secret").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn bearer_scheme_is_case_insensitive() {
+        let app = app().await;
+        for value in ["bearer secret", "BEARER secret", "Bearer  secret"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get("/api/v1/pages")
+                        .header("authorization", value)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{value}");
+        }
     }
 
     #[tokio::test]
@@ -484,6 +756,181 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn unpublished_home_page_falls_back_to_the_list() {
+        let app = app().await;
+        for (title, publish) in [("Welcome", true), ("About", true)] {
+            send(
+                &app,
+                Method::POST,
+                "/api/v1/pages",
+                Some(json!({ "title": title, "body": "Welcome text.", "publish": publish })),
+            )
+            .await;
+        }
+        send(
+            &app,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(json!({ "home_slug": "welcome" })),
+        )
+        .await;
+        send(&app, Method::POST, "/api/v1/pages/welcome/unpublish", None).await;
+
+        let (status, html) = send(&app, Method::GET, "/", None).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(html.contains("wm-page-list"), "{html}");
+        assert!(html.contains("href=\"/about\""), "{html}");
+        let (_, xml) = send(&app, Method::GET, "/sitemap.xml", None).await;
+        assert!(
+            xml.contains("<loc>http://localhost:3000/about</loc>"),
+            "{xml}"
+        );
+    }
+
+    async fn get_response(app: &Router, uri: &str) -> Response {
+        app.clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn responses_carry_security_headers() {
+        let app = app().await;
+        for uri in ["/", "/missing", "/_wm/style.css", "/api/v1/pages"] {
+            let response = get_response(&app, uri).await;
+            let headers = response.headers();
+            assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{uri}");
+            assert_eq!(
+                headers[header::REFERRER_POLICY],
+                "strict-origin-when-cross-origin",
+                "{uri}"
+            );
+            assert_eq!(headers[header::X_FRAME_OPTIONS], "SAMEORIGIN", "{uri}");
+            assert_eq!(
+                headers[header::CONTENT_SECURITY_POLICY],
+                "frame-ancestors 'self'",
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn uploads_cannot_run_scripts_on_the_site() {
+        let app = app().await;
+        let boundary = "wm-boundary";
+        let parts: String = ["x.html", "x.svg", "x.png", "x.pdf", "x.js"]
+            .map(|name| {
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+                     filename=\"{name}\"\r\n\r\n<script>alert(1)</script>\r\n"
+                )
+            })
+            .concat();
+        let body = format!("{parts}--{boundary}--\r\n");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/media")
+                    .header("authorization", "Bearer secret")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let stored: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+
+        let sandboxed = |headers: &HeaderMap| {
+            headers[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap()
+                .starts_with("sandbox; default-src 'none'")
+        };
+        for media in &stored {
+            let path = media["path"].as_str().unwrap();
+            let response = get_response(&app, path).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let headers = response.headers();
+            assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+            let download = headers.get(header::CONTENT_DISPOSITION).is_some();
+            let extension = path.rsplit('.').next().unwrap();
+            match extension {
+                "html" | "js" => assert!(download && sandboxed(headers), "{path}"),
+                "svg" | "png" => assert!(!download && sandboxed(headers), "{path}"),
+                // A sandbox would keep the browser's viewer from showing it.
+                "pdf" => assert!(!download && !sandboxed(headers), "{path}"),
+                other => panic!("unexpected {other}"),
+            }
+            // Revalidating does not lift the policy.
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .header(header::IF_MODIFIED_SINCE, "Fri, 01 Jan 2100 00:00:00 GMT")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_MODIFIED, "{path}");
+            assert_eq!(sandboxed(response.headers()), extension != "pdf", "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rendered_pages_follow_edits_and_settings() {
+        let app = app().await;
+        send(
+            &app,
+            Method::POST,
+            "/api/v1/pages",
+            Some(json!({ "title": "News", "body": "Old *news*.", "publish": true })),
+        )
+        .await;
+        let (_, html) = send(&app, Method::GET, "/news", None).await;
+        assert!(html.contains("Old <strong>news</strong>."), "{html}");
+
+        send(
+            &app,
+            Method::PATCH,
+            "/api/v1/pages/news",
+            Some(json!({ "title": "Latest", "body": "New *news*." })),
+        )
+        .await;
+        send(
+            &app,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(json!({ "footer_text": "Footer *one*." })),
+        )
+        .await;
+        let (_, html) = send(&app, Method::GET, "/news", None).await;
+        assert!(html.contains("New <strong>news</strong>."), "{html}");
+        assert!(html.contains("Latest</h1>"), "{html}");
+        assert!(html.contains("Footer <strong>one</strong>."), "{html}");
+
+        send(
+            &app,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(json!({ "footer_text": "Footer *two*." })),
+        )
+        .await;
+        let (_, html) = send(&app, Method::GET, "/news", None).await;
+        assert!(html.contains("Footer <strong>two</strong>."), "{html}");
+        // Unpublished pages are not served from the cache.
+        send(&app, Method::POST, "/api/v1/pages/news/unpublish", None).await;
+        let (status, _) = send(&app, Method::GET, "/news", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -708,6 +1155,19 @@ mod tests {
         );
         let font = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(font, "font-bytes");
+
+        // Any other stamp, such as a guess at the next one, is not cached.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/_wm/theme/mytheme@1/assets/fonts/body.woff2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
     }
 
     async fn send_bytes(app: &Router, uri: &str, body: Vec<u8>) -> (StatusCode, String) {
@@ -910,5 +1370,41 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = send(&app, Method::GET, "/api/v1/themes/nope", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn theme_css_cannot_end_the_style_element() {
+        let app = app().await;
+        send_bytes(&app, "/api/v1/themes/upload", theme_zip()).await;
+        send(
+            &app,
+            Method::PUT,
+            "/api/v1/themes/active",
+            Some(json!({ "theme": "mytheme" })),
+        )
+        .await;
+        send(
+            &app,
+            Method::PUT,
+            "/api/v1/themes/mytheme/files/style.css",
+            Some(
+                json!({ "content": "a::after { content: '</STYLE><script>alert(1)</script>'; }" }),
+            ),
+        )
+        .await;
+        send(
+            &app,
+            Method::POST,
+            "/api/v1/pages",
+            Some(json!({ "title": "Hello", "publish": true })),
+        )
+        .await;
+        let (status, html) = send(&app, Method::GET, "/hello", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(html.to_lowercase().matches("</style").count(), 1, "{html}");
+        assert!(
+            html.contains("<\\/STYLE><script>alert(1)<\\/script>"),
+            "{html}"
+        );
     }
 }

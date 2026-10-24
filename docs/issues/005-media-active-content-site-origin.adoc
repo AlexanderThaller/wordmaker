@@ -1,13 +1,13 @@
 = 005: Uploaded HTML/SVG and theme SVGs are served inline on the site origin
 :severity: Medium
 :area: Media / themes
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Medium
 Area:: Media / themes
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -40,3 +40,22 @@ response has `nosniff`, a CSP or `Content-Disposition`.
 * Add `X-Content-Type-Options: nosniff` to `/media` and theme assets.
 * Serve SVG with `Content-Security-Policy: sandbox` (or `default-src 'none'`),
   or drop `svg` from the theme asset allow-list.
+
+== Resolution
+
+`/media`, theme assets and scaled images go through `harden_file`, which
+decides by file name (as `ServeDir` picks the content type), so a `304`
+without a content type carries the same headers:
+
+* Every file except PDFs gets `Content-Security-Policy: sandbox;
+  default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline';
+  frame-ancestors 'self'`. Opened directly, an SVG renders but cannot run
+  script on the site origin; as an `<img>`, font or stylesheet nothing
+  changes. PDFs are not sandboxed because browsers then refuse to show
+  them; their viewers run PDF scripts apart from the page's origin.
+* Only images (SVG included), fonts, audio, video, CSS, plain text and
+  PDFs are shown inline. Everything else, HTML, XML and scripts included,
+  gets `Content-Disposition: attachment`. Uploads stay unrestricted, so
+  existing files such as PDFs keep working.
+* `nosniff` comes from the site-wide headers of
+  link:039-public-site-security-headers.adoc[issue 39].

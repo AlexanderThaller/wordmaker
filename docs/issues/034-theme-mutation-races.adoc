@@ -1,13 +1,13 @@
 = 034: Theme install, delete and write are not atomic and race each other
 :severity: Low
 :area: Themes
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Themes
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -33,3 +33,14 @@ serialised.
 * Rename the old directory aside, swap in the new one, then remove the old
   one.
 * Serialise theme mutations with a mutex.
+
+== Resolution
+
+* Reinstalling renames the existing theme folder aside (`.old-<uuid>`),
+  renames the new one into place and only then removes the old one. If the
+  second rename fails, the old folder is put back.
+* `install_zip`, `delete`, `write_file` and `activate` take one mutex for
+  their whole check-then-change sequence. The blocking install and write
+  tasks hold it until they finish, even when the request is dropped.
+  Downloading a theme happens before the lock, so a slow download does not
+  block other theme changes.

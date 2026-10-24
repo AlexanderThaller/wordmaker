@@ -1,13 +1,13 @@
 = 050: Full Referer URLs, including query strings, are stored
 :severity: Low
 :area: Analytics / privacy
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Analytics / privacy
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -25,3 +25,10 @@ addresses) end up in ClickHouse.
 == Suggested fix
 
 * Store only scheme, host and path, or just `referrer_host`.
+
+== Resolution
+
+The sink stores only the referrer's scheme, host and path: query string,
+fragment and user info are removed, and a `Referer` that is not a URL is
+stored as empty. `referrer_host` is unchanged. Rows written before the fix
+keep their full referrers.
