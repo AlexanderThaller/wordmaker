@@ -1,13 +1,13 @@
 = 056: base_url_hosts parses the base URL by hand
 :severity: Info
 :area: Config
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Info
 Area:: Config
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -25,3 +25,10 @@ IPv6 or userinfo base URLs produce junk entries. Not exploitable.
 == Suggested fix
 
 * Parse with `url::Url` and use `host_str()` and `port()`.
+
+== Resolution
+
+`base_url_hosts` now parses the base URL with `url::Url` and returns
+`host_str()` (with `host:port` too when a port is given). Userinfo is
+dropped, IPv6 hosts keep their brackets (which rmcp's Host check strips),
+and an unparsable base URL adds nothing.

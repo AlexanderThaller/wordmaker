@@ -195,17 +195,37 @@ async fn mcp_stdio(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `https://example.com:8443/x` yields `example.com:8443` and `example.com`.
+/// `https://example.com:8443/x` yields `example.com:8443` and `example.com`;
+/// without an explicit port only the host is returned.
 fn base_url_hosts(base_url: &str) -> Vec<String> {
-    let rest = base_url
-        .split_once("://")
-        .map_or(base_url, |(_, rest)| rest);
-    let authority = rest.split('/').next().unwrap_or_default();
-    if authority.is_empty() {
+    let Ok(url) = url::Url::parse(base_url) else {
         return Vec::new();
+    };
+    let Some(host) = url.host_str() else {
+        return Vec::new();
+    };
+    match url.port() {
+        Some(port) => vec![format!("{host}:{port}"), host.to_owned()],
+        None => vec![host.to_owned()],
     }
-    let host = authority
-        .rsplit_once(':')
-        .map_or(authority, |(host, _)| host);
-    vec![authority.to_owned(), host.to_owned()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hosts_from_base_url() {
+        assert_eq!(
+            base_url_hosts("https://example.com:8443/x"),
+            ["example.com:8443", "example.com"]
+        );
+        assert_eq!(base_url_hosts("https://Example.com/"), ["example.com"]);
+        assert_eq!(base_url_hosts("http://[::1]:3000"), ["[::1]:3000", "[::1]"]);
+        assert_eq!(
+            base_url_hosts("https://user:pw@example.com"),
+            ["example.com"]
+        );
+        assert_eq!(base_url_hosts("not a url"), Vec::<String>::new());
+    }
 }
