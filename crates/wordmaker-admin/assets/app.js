@@ -915,12 +915,17 @@ async function loadMedia() {
   if (!media.length) grid.append(h("li", { class: "media-empty" }, "Nothing uploaded yet."));
 }
 
+/**
+ * Text for a macro's attribute list. The uploader chose the name, so
+ * nothing in it may close the list or add attributes such as `link=`.
+ */
+const macroText = (text) => text.replace(/[[\],="{}]+/g, " ").replace(/\s+/g, " ").trim();
+
 /** What to write in a page to show or link the file. */
 function snippet(item) {
-  const name = item.original_name.replace(/\.[^.]+$/, "").replace(/[[\]]/g, "");
   return item.content_type.startsWith("image/")
-    ? `image::${item.path}[${name}]`
-    : `link:${item.path}[${item.original_name.replace(/[[\]]/g, "")}]`;
+    ? `image::${item.path}[${macroText(item.original_name.replace(/\.[^.]+$/, ""))}]`
+    : `link:${item.path}[${macroText(item.original_name)}]`;
 }
 
 function mediaCard(item) {
