@@ -1,13 +1,13 @@
 = 046: Page views can be written twice after an insert timeout
 :severity: Low
 :area: Analytics
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Analytics
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -26,3 +26,16 @@ Duplicate page views in ClickHouse after a slow insert.
 
 * Use an insert deduplication token (`insert_deduplication_token`), or
   accept and document it.
+
+== Resolution
+
+clickhouse 0.15.2 supports per-insert settings, so each insert carries an
+`insert_deduplication_token`. A failed insert is frozen (its rows and token)
+and retried unchanged; page views that arrive meanwhile go into the next
+insert. New tables are created with `non_replicated_deduplication_window =
+1000`, which plain `MergeTree` needs for deduplication; the README gives the
+`ALTER TABLE` for existing tables, without which the token is ignored.
+
+Remaining gap: if the buffer overflows while a retry is pending, the oldest
+rows are dropped, the batch changes and gets a new token, so a duplicate is
+still possible in that case (commented in `Sink::push`).

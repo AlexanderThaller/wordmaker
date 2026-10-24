@@ -74,8 +74,15 @@ The address is used for the GeoIP lookup and for `visitor_id`, a hash of address
 It counts unique visitors per day, but cannot be traced back to an address or followed across days.
 
 Analytics never slows the site down: requests only queue a page view, without waiting.
-When ClickHouse is unreachable, page views are buffered (up to 50,000) and written once it is back.
+When ClickHouse is unreachable, page views are buffered (up to 50,000, or 64 MiB) and written once it is back.
 On shutdown (Ctrl-C or SIGTERM) the buffer is written before the process exits.
+A failed insert is retried with the same deduplication token, so an insert that timed out but did reach ClickHouse is not written twice.
+That needs the `non_replicated_deduplication_window` setting, which tables created by older versions lack:
+
+[source,sql]
+----
+ALTER TABLE page_views MODIFY SETTING non_replicated_deduplication_window = 1000;
+----
 
 [source,sql]
 ----

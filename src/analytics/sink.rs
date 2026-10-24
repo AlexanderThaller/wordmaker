@@ -83,7 +83,8 @@ const CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS page_views (
     visitor_id      UInt64
 ) ENGINE = MergeTree
 PARTITION BY toYYYYMM(timestamp)
-ORDER BY (site, toDate(timestamp), path, timestamp)";
+ORDER BY (site, toDate(timestamp), path, timestamp)
+SETTINGS non_replicated_deduplication_window = 1000";
 
 /// A client for the `ClickHouse` server at `url`, set up the way the sink
 /// needs it.
@@ -170,6 +171,8 @@ pub struct Sink {
     buffer: VecDeque<PageView>,
     /// [`PageView::size`] of everything in `buffer`.
     buffer_bytes: usize,
+    /// The insert being retried, if the last one failed.
+    attempt: Option<Attempt>,
     table_ready: bool,
     healthy: bool,
 }
@@ -191,6 +194,7 @@ impl Sink {
             salt: DailySalt::default(),
             buffer: VecDeque::new(),
             buffer_bytes: 0,
+            attempt: None,
             table_ready: false,
             healthy: true,
         }
@@ -247,6 +251,10 @@ impl Sink {
             };
             self.buffer_bytes -= oldest.size();
             self.dropped.fetch_add(1, Ordering::Relaxed);
+            // The rows of a failed insert changed, so its retry must not be
+            // mistaken for it; should it have arrived after all, its rows
+            // are written twice.
+            self.attempt = None;
         }
         self.buffer_bytes += size;
         self.buffer.push_back(view);
@@ -258,31 +266,36 @@ impl Sink {
         if dropped > 0 {
             tracing::warn!("analytics: dropped {dropped} page views, the queue was full");
         }
-        if self.buffer.is_empty() {
-            return true;
-        }
-        let result = match self.ensure_table().await {
-            Ok(()) => self.insert().await,
-            Err(err) => Err(err),
-        };
-        match result {
-            Ok(()) => {
-                if !self.healthy {
-                    tracing::info!(
-                        "analytics: ClickHouse is back, wrote {} buffered page views",
-                        self.buffer.len()
-                    );
-                    self.healthy = true;
-                }
-                self.buffer.clear();
-                self.buffer_bytes = 0;
-                true
-            }
-            Err(err) => {
+        let mut written = 0;
+        while !self.buffer.is_empty() {
+            // A timed-out insert may still have been written, so the same
+            // rows are sent again with the same deduplication token, which
+            // has ClickHouse ignore them the second time. Page views that
+            // came in since go in the next insert.
+            let attempt = self.attempt.get_or_insert_with(|| Attempt {
+                token: uuid::Uuid::new_v4().to_string(),
+                rows: self.buffer.len(),
+                bytes: self.buffer_bytes,
+            });
+            let attempt = attempt.clone();
+            let result = match self.ensure_table().await {
+                Ok(()) => self.insert(&attempt).await,
+                Err(err) => Err(err),
+            };
+            if let Err(err) = result {
                 self.went_down(&err);
-                false
+                return false;
             }
+            self.buffer.drain(..attempt.rows);
+            self.buffer_bytes -= attempt.bytes;
+            self.attempt = None;
+            written += attempt.rows;
         }
+        if !self.healthy {
+            tracing::info!("analytics: ClickHouse is back, wrote {written} buffered page views");
+            self.healthy = true;
+        }
+        true
     }
 
     fn went_down(&mut self, err: &anyhow::Error) {
@@ -303,15 +316,20 @@ impl Sink {
         Ok(())
     }
 
-    async fn insert(&self) -> anyhow::Result<()> {
+    /// Writes the first `attempt.rows` buffered page views.
+    async fn insert(&self, attempt: &Attempt) -> anyhow::Result<()> {
         let insert = async {
-            let mut insert = self.client.insert::<PageView>(TABLE).await?;
-            for view in &self.buffer {
+            let mut insert = self
+                .client
+                .insert::<PageView>(TABLE)
+                .await?
+                .with_setting("insert_deduplication_token", &attempt.token);
+            for view in self.buffer.iter().take(attempt.rows) {
                 insert.write(view).await?;
             }
             insert.end().await
         };
-        let mib = u64::try_from(self.buffer_bytes >> 20).unwrap_or(u64::MAX);
+        let mib = u64::try_from(attempt.bytes >> 20).unwrap_or(u64::MAX);
         tokio::time::timeout(TIMEOUT + Duration::from_secs(mib), insert)
             .await
             .map_err(|_| anyhow::anyhow!("writing page views timed out"))??;
@@ -394,6 +412,15 @@ fn referrer(referer: &str) -> (String, String) {
     let _ = url.set_password(None);
     let host = url.host_str().unwrap_or_default().to_owned();
     (url.into(), host)
+}
+
+/// An insert of the oldest `rows` buffered page views (`bytes` in size),
+/// identified by `token` across retries.
+#[derive(Clone, Debug)]
+struct Attempt {
+    token: String,
+    rows: usize,
+    bytes: usize,
 }
 
 /// `de-DE,de;q=0.9,en;q=0.8` yields `de`.
@@ -825,5 +852,67 @@ mod tests {
         assert!(sink.buffer.is_empty());
         let rows: Vec<PageView> = recording.collect().await;
         assert_eq!(rows, vec![view]);
+    }
+
+    #[tokio::test]
+    async fn retries_the_same_rows_and_writes_newer_ones_separately() {
+        let mock = Mock::new();
+        mock.add(handlers::record_ddl());
+        mock.add(handlers::failure(
+            clickhouse::test::status::INTERNAL_SERVER_ERROR,
+        ));
+        let retried = mock.add(handlers::record::<PageView>());
+        let newer = mock.add(handlers::record::<PageView>());
+        let (mut sink, _tx) = sink(clickhouse::Client::default().with_mock(&mock));
+
+        let time = DateTime::parse_from_rfc3339("2026-10-08T10:00:00.123Z")
+            .unwrap()
+            .to_utc();
+        let mut first = sink.enrich(hit(time));
+        first.path = "/first".into();
+        sink.push(first.clone());
+        assert!(!sink.flush().await);
+        let token = sink.attempt.as_ref().unwrap().token.clone();
+
+        let mut second = sink.enrich(hit(time));
+        second.path = "/second".into();
+        sink.push(second.clone());
+        assert_eq!(sink.attempt.as_ref().unwrap().token, token, "kept");
+        assert_eq!(sink.attempt.as_ref().unwrap().rows, 1);
+
+        assert!(sink.flush().await);
+        assert!(sink.buffer.is_empty());
+        assert_eq!(sink.buffer_bytes, 0);
+        assert!(sink.attempt.is_none());
+        assert_eq!(retried.collect::<Vec<PageView>>().await, vec![first]);
+        assert_eq!(newer.collect::<Vec<PageView>>().await, vec![second]);
+    }
+
+    #[tokio::test]
+    async fn real_clickhouse_ignores_a_repeated_insert() {
+        let Some((_container, db)) = real_clickhouse().await else {
+            return;
+        };
+        let (mut sink, _tx) = sink(db.clone());
+        for _ in 0..2 {
+            let view = sink.enrich(hit(Utc::now()));
+            sink.push(view);
+        }
+        sink.ensure_table().await.unwrap();
+        let attempt = Attempt {
+            token: "retry".into(),
+            rows: 2,
+            bytes: sink.buffer_bytes,
+        };
+        // As if the first answer had timed out.
+        sink.insert(&attempt).await.unwrap();
+        sink.insert(&attempt).await.unwrap();
+
+        let count = db
+            .query("SELECT count() FROM page_views")
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
     }
 }
