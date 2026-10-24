@@ -1,3 +1,6 @@
+use std::time::Duration;
+
+use anyhow::Context;
 use axum::{
     Json,
     body::Body,
@@ -14,12 +17,21 @@ use axum::{
         Response,
     },
 };
-use anyhow::Context;
 use serde_json::json;
 
 /// Largest request body passed on: room for the server's media uploads
 /// (25 MiB by default) and its theme zips (100 MiB).
 const MAX_BODY: usize = 128 * 1024 * 1024;
+
+/// How long reaching the server may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a request may take as a whole, answer included; installing a
+/// theme from a URL is about the slowest the server gets.
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(2);
+/// The same for requests with a body larger than [`LARGE_BODY`], which
+/// may come from a slow uplink.
+const UPLOAD_TIMEOUT: Duration = Duration::from_mins(15);
+const LARGE_BODY: usize = 1024 * 1024;
 
 /// Request headers the server gets to see. Cookies and the like stay here.
 const REQUEST_HEADERS: &[HeaderName] = &[
@@ -65,6 +77,7 @@ impl Upstream {
             client: reqwest::Client::builder()
                 // The browser follows redirects itself, against this origin.
                 .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(CONNECT_TIMEOUT)
                 .build()?,
             base_url,
             base_path,
@@ -88,7 +101,16 @@ impl Upstream {
             return error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
         };
 
-        let mut outgoing = self.client.request(parts.method, url).body(body);
+        let timeout = if body.len() > LARGE_BODY {
+            UPLOAD_TIMEOUT
+        } else {
+            REQUEST_TIMEOUT
+        };
+        let mut outgoing = self
+            .client
+            .request(parts.method, url)
+            .timeout(timeout)
+            .body(body);
         for name in REQUEST_HEADERS {
             if let Some(value) = parts.headers.get(name) {
                 outgoing = outgoing.header(name, value);
@@ -100,6 +122,7 @@ impl Upstream {
 
         let upstream = match outgoing.send().await {
             Ok(upstream) => upstream,
+            Err(err) if err.is_timeout() && !err.is_connect() => return too_slow(&err),
             Err(err) => {
                 tracing::warn!(error = %err, "server request failed");
                 return error(
@@ -113,6 +136,7 @@ impl Upstream {
         let headers = upstream.headers().clone();
         let body = match upstream.bytes().await {
             Ok(body) => body,
+            Err(err) if err.is_timeout() => return too_slow(&err),
             Err(err) => {
                 tracing::warn!(error = %err, "server response failed");
                 return error(
@@ -164,6 +188,14 @@ impl Upstream {
             .starts_with(&format!("{}{prefix}", self.base_path))
             .then_some(url)
     }
+}
+
+fn too_slow(err: &reqwest::Error) -> Response {
+    tracing::warn!(error = %err, "server request timed out");
+    error(
+        StatusCode::GATEWAY_TIMEOUT,
+        "the WordMaker server took too long to answer",
+    )
 }
 
 /// An error in the shape the server uses, so the page reads both alike.
