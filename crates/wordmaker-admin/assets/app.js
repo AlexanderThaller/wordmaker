@@ -1306,16 +1306,15 @@ function renderDashboard() {
     ),
   );
 
-  const pageLink = (name) => (state.siteUrl ? new URL(name, state.siteUrl).href : null);
   $("#tops").replaceChildren(
-    topList("Pages", report.pages, { link: pageLink }),
+    topList("Pages", report.pages, { link: siteLink }),
     topList("Referrers", report.referrers, { link: (name) => `https://${name}`, empty: "No visits from other sites yet." }),
     topList("Countries", report.countries),
     topList("Browsers", report.browsers, { label: known }),
     topList("Operating systems", report.systems, { label: known }),
     topList("Devices", report.devices, { label: deviceName }),
     topList("Not found", report.not_found, {
-      link: pageLink,
+      link: siteLink,
       empty: "No broken links.",
       hint: "Pages visitors asked for that do not exist.",
     }),
@@ -1326,6 +1325,22 @@ function renderDashboard() {
   );
   $("#dashboard-notes").replaceChildren(...notes());
   drawMap();
+}
+
+/**
+ * A link to `path` on the site, or none. Paths come from what visitors
+ * asked for: `/\evil.example` or `//evil.example` would lead elsewhere.
+ */
+function siteLink(path) {
+  if (!state.siteUrl || !path.startsWith("/") || path.startsWith("//") || path.includes("\\")) {
+    return null;
+  }
+  try {
+    const url = new URL(path, state.siteUrl);
+    return url.origin === new URL(state.siteUrl).origin ? url.href : null;
+  } catch {
+    return null;
+  }
 }
 
 function stat(label, value, detail) {
