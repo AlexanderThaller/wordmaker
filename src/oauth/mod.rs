@@ -567,13 +567,14 @@ async fn login_page(
 /// A standalone page of the sign-in flow. It must never be framed, cached
 /// or leak its URL, which carries the request.
 fn page(title: &str, body: &str) -> Response {
-    let html = format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta \
-         name=\"viewport\" content=\"width=device-width, \
-         initial-scale=1\">\n<title>{}</title>\n<style>{STYLE}</style>\n</head>\n<body>\n<main>\\
-         n{body}</main>\n</body>\n</html>\n",
-        escape(title)
-    );
+    // Built in short pieces: rustfmt's string wrapping once split a `\n`
+    // here into a visible backslash and "n".
+    let mut html = String::from("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n");
+    html.push_str("<meta charset=\"utf-8\">\n");
+    html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+    let _ = writeln!(html, "<title>{}</title>", escape(title));
+    let _ = writeln!(html, "<style>{STYLE}</style>\n</head>\n<body>\n<main>");
+    let _ = writeln!(html, "{body}</main>\n</body>\n</html>");
     (
         [
             (header::CACHE_CONTROL, "no-store"),
@@ -1060,6 +1061,7 @@ mod tests {
         assert!(reply.body.contains("Connect Claude"), "{}", reply.body);
         assert!(reply.body.contains("claude.ai"), "{}", reply.body);
         assert_eq!(reply.headers[header::X_FRAME_OPTIONS], "DENY");
+        assert!(reply.body.contains("<main>\n<h1>"), "{}", reply.body);
 
         let code = sign_in(&app, &client_id).await;
         let reply = post_form(
