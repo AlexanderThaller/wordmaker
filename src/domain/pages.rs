@@ -195,7 +195,7 @@ pub async fn create(pool: &SqlitePool, new: NewPage) -> AppResult<Page> {
         (Status::Draft, None)
     };
 
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO pages (slug, title, body, status, in_nav, nav_order, created_at, updated_at,
                             published_at)
@@ -220,7 +220,7 @@ pub async fn create(pool: &SqlitePool, new: NewPage) -> AppResult<Page> {
 }
 
 pub async fn update(pool: &SqlitePool, slug: &str, update: PageUpdate) -> AppResult<Page> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     let page = fetch(&mut tx, slug).await?;
 
     let title = match update.title.as_deref() {
@@ -271,7 +271,7 @@ pub async fn delete(pool: &SqlitePool, slug: &str) -> AppResult<()> {
 
 /// Publishing also makes a pending draft the live version of the page.
 pub async fn set_status(pool: &SqlitePool, slug: &str, status: Status) -> AppResult<Page> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     let now = Utc::now();
     if status == Status::Published {
         apply_draft(&mut tx, slug, now).await?;
@@ -298,7 +298,7 @@ pub async fn set_status(pool: &SqlitePool, slug: &str, status: Status) -> AppRes
 /// Keeps changes to the title and body without touching what the site
 /// shows. Changes that leave the page as published remove the draft.
 pub async fn save_draft(pool: &SqlitePool, slug: &str, update: DraftUpdate) -> AppResult<Page> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     let page = fetch(&mut tx, slug).await?;
     let title = match update.title.as_deref() {
         Some(title) => validate_title(title)?.to_owned(),
@@ -332,7 +332,7 @@ pub async fn save_draft(pool: &SqlitePool, slug: &str, update: DraftUpdate) -> A
 
 /// Throws away the pending draft, if there is one.
 pub async fn discard_draft(pool: &SqlitePool, slug: &str) -> AppResult<Page> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     let page = fetch(&mut tx, slug).await?;
     clear_draft(&mut tx, page.id).await?;
     let page = fetch(&mut tx, slug).await?;
@@ -633,6 +633,54 @@ mod tests {
         .unwrap();
         let page = discard_draft(&pool, "home").await.unwrap();
         assert_eq!((page.body.as_str(), page.draft_body), ("next", None));
+    }
+
+    #[tokio::test]
+    async fn concurrent_edits_wait_for_each_other() {
+        let dir = std::env::temp_dir().join(format!("wordmaker-pages-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}", dir.join("db.sqlite").display());
+        let pool = crate::db::connect(&url).await.unwrap();
+        create(&pool, new_page("Home", "")).await.unwrap();
+        set_status(&pool, "home", Status::Published).await.unwrap();
+
+        // Each one reads the page and then writes it. With a deferred
+        // BEGIN, the write fails at once when another one committed first.
+        let edits: Vec<_> = (0..16)
+            .map(|i| {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    if i % 2 == 0 {
+                        update(
+                            &pool,
+                            "home",
+                            PageUpdate {
+                                nav_order: Some(i),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .map(drop)
+                    } else {
+                        save_draft(
+                            &pool,
+                            "home",
+                            DraftUpdate {
+                                body: Some(format!("edit {i}")),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .map(drop)
+                    }
+                })
+            })
+            .collect();
+        for edit in edits {
+            edit.await.unwrap().unwrap();
+        }
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
