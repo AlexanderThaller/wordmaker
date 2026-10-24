@@ -273,6 +273,7 @@ curl -H "Authorization: Bearer $WORDMAKER_TOKEN" -H 'content-type: application/j
 * Link to other pages with `link:/about[About]`.
 * Changing a published page with `PATCH` changes the site at once.
 To prepare changes first, save them as a draft (`PUT /pages/{slug}/draft`): the site keeps showing the published version until the page is published again, which makes the draft live as a new revision.
+While a draft is pending, `PATCH` and restoring a revision refuse to change title or body (409), since publishing would replace them; change the draft instead, or discard it first.
 * Only published pages are visible on the site. `/` shows the page chosen as `home_slug`, or a list of all published pages.
 * Published pages appear in the header navigation, ordered by `nav_order` then title; set `in_nav` to false to leave one out.
 

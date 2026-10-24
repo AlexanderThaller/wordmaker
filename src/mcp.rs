@@ -56,7 +56,7 @@ WordMaker is a small CMS. Each page has a title, a URL slug and a body written i
 - update_page changes a page right away, live if it is published. To prepare changes to a \
      published page without showing them yet, use save_draft; publish_page then makes the draft \
      live, and discard_draft drops it. get_page shows a pending draft as `draft_title` and \
-     `draft_body`.
+     `draft_body`; while there is one, change title and body with save_draft, not update_page.
 - Write the body in AsciiDoc. The title is rendered as the page heading, so do not start the body \
      with a `= Title` line; use `==` for top-level sections.
 - Use preview_adoc to check how AsciiDoc renders before saving.
@@ -266,7 +266,9 @@ impl WordMakerMcp {
 
     #[tool(
         description = "Change a page's title, slug and/or body. Omitted fields stay as they are; \
-                       a given body replaces the whole body."
+                       a given body replaces the whole body. While the page has an unpublished \
+                       draft, title and body changes are refused: use save_draft, or \
+                       discard_draft first."
     )]
     async fn update_page(
         &self,
@@ -380,7 +382,11 @@ impl WordMakerMcp {
         respond(pages::get_revision(&self.pool, &args.slug, args.revision).await)
     }
 
-    #[tool(description = "Make an old revision current again (recorded as a new revision).")]
+    #[tool(
+        description = "Make an old revision current again (recorded as a new revision). Refused \
+                       while the page has an unpublished draft: use get_revision and save_draft, \
+                       or discard_draft first."
+    )]
     async fn restore_revision(
         &self,
         Parameters(args): Parameters<RevisionArgs>,

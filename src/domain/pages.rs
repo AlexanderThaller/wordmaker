@@ -219,6 +219,8 @@ pub async fn create(pool: &SqlitePool, new: NewPage) -> AppResult<Page> {
     Ok(page)
 }
 
+/// Changes the page itself, live if it is published. Title and body cannot
+/// change while a draft is pending, since publishing would replace them.
 pub async fn update(pool: &SqlitePool, slug: &str, update: PageUpdate) -> AppResult<Page> {
     let mut tx = crate::db::begin_write(pool).await?;
     let page = fetch(&mut tx, slug).await?;
@@ -232,6 +234,15 @@ pub async fn update(pool: &SqlitePool, slug: &str, update: PageUpdate) -> AppRes
         None => page.slug.clone(),
     };
     let body = update.body.unwrap_or_else(|| page.body.clone());
+    let changes_content = title != page.title || body != page.body;
+    // Publishing makes the draft live, which would silently undo this
+    // change; the draft is the place for it.
+    if changes_content && page.draft_body.is_some() {
+        return Err(AppError::Conflict(format!(
+            "page '{slug}' has an unpublished draft: save title and body changes to the draft, or \
+             discard the draft first"
+        )));
+    }
     let now = Utc::now();
 
     sqlx::query(
@@ -249,7 +260,7 @@ pub async fn update(pool: &SqlitePool, slug: &str, update: PageUpdate) -> AppRes
     .await
     .map_err(|err| slug_conflict(err, &new_slug))?;
 
-    if title != page.title || body != page.body {
+    if changes_content {
         record_revision(&mut tx, page.id, &title, &body, now).await?;
     }
 
@@ -397,7 +408,8 @@ pub async fn get_revision(pool: &SqlitePool, slug: &str, revision: i64) -> AppRe
 }
 
 /// Make an old revision current again. This adds a new revision rather than
-/// discarding the ones after it.
+/// discarding the ones after it. Like [`update`], refused while a draft is
+/// pending.
 pub async fn restore_revision(pool: &SqlitePool, slug: &str, revision: i64) -> AppResult<Page> {
     let old = get_revision(pool, slug, revision).await?;
     update(
@@ -633,6 +645,55 @@ mod tests {
         .unwrap();
         let page = discard_draft(&pool, "home").await.unwrap();
         assert_eq!((page.body.as_str(), page.draft_body), ("next", None));
+    }
+
+    #[tokio::test]
+    async fn live_edits_do_not_pass_a_pending_draft() {
+        let pool = connect_memory().await;
+        create(&pool, new_page("Home", "first")).await.unwrap();
+        set_status(&pool, "home", Status::Published).await.unwrap();
+        let live = PageUpdate {
+            body: Some("live".into()),
+            ..Default::default()
+        };
+        update(&pool, "home", live).await.unwrap();
+        let draft = DraftUpdate {
+            body: Some("next".into()),
+            ..Default::default()
+        };
+        save_draft(&pool, "home", draft).await.unwrap();
+
+        // Publishing would replace these with the draft, so they are refused.
+        let edit = PageUpdate {
+            body: Some("hotfix".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            update(&pool, "home", edit.clone()).await,
+            Err(AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            restore_revision(&pool, "home", 1).await,
+            Err(AppError::Conflict(_))
+        ));
+        // What the draft does not cover still changes at once.
+        let page = update(
+            &pool,
+            "home",
+            PageUpdate {
+                body: Some("live".into()),
+                nav_order: Some(3),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.nav_order, 3);
+        assert_eq!(page.draft_body.as_deref(), Some("next"));
+
+        discard_draft(&pool, "home").await.unwrap();
+        let page = update(&pool, "home", edit).await.unwrap();
+        assert_eq!(page.body, "hotfix");
     }
 
     #[tokio::test]
