@@ -511,7 +511,10 @@ for (const input of Object.values(fields)) {
 async function save() {
   // A second Ctrl+S would send the same changes again, to a slug that may
   // be gone by then.
-  if (state.saving) return false;
+  if (state.saving) {
+    toast("Still saving…");
+    return false;
+  }
   const update = changes();
   if (!Object.keys(update).length) return true;
   if (update.title === "") {
@@ -531,8 +534,22 @@ async function save() {
   let page = target;
   let ok = true;
   if (Object.keys(direct).length) {
-    page = (await attempt(() => api("PATCH", pagePath(before), direct))) ?? page;
-    ok = page !== target;
+    try {
+      page = await api("PATCH", pagePath(before), direct);
+    } catch (error) {
+      ok = false;
+      if (error.status === 409) {
+        // A draft was saved elsewhere since the page was opened, and the
+        // server keeps live edits from passing it. Showing the page with
+        // its draft sends the next save there; what was typed stays.
+        page = (await attempt(() => api("GET", pagePath(before)))) ?? target;
+        toast("This page got a draft elsewhere meanwhile. Save again to put your changes into it.", {
+          error: true,
+        });
+      } else {
+        toast(error.message, { error: true });
+      }
+    }
   }
   if (ok && Object.keys(content).length) {
     const drafted = await attempt(() => api("PUT", `${pagePath(page.slug)}/draft`, content));

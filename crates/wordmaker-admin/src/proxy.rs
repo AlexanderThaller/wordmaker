@@ -26,8 +26,9 @@ const MAX_BODY: usize = 128 * 1024 * 1024;
 /// How long reaching the server may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a request may take as a whole, answer included; installing a
-/// theme from a URL is about the slowest the server gets.
-const REQUEST_TIMEOUT: Duration = Duration::from_mins(2);
+/// theme from a URL is about the slowest the server gets: up to 10 s to
+/// resolve and 2 min to download, then unpacking, so this leaves room.
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(4);
 /// The same for requests with a body larger than [`LARGE_BODY`], which
 /// may come from a slow uplink.
 const UPLOAD_TIMEOUT: Duration = Duration::from_mins(15);
