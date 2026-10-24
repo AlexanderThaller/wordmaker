@@ -478,6 +478,11 @@ fn extract(themes_dir: &Path, bytes: &[u8], slug: Option<String>) -> AppResult<S
     let bad = |message: String| AppError::BadRequest(message);
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|err| bad(format!("not a zip file: {err}")))?;
+    // Before anything walks the entries: the count below only covers the
+    // files that get extracted.
+    if archive.len() > MAX_FILES {
+        return Err(bad(format!("theme zip has more than {MAX_FILES} entries")));
+    }
 
     // The theme root is wherever the shallowest theme.json is.
     let mut root: Option<PathBuf> = None;
@@ -939,6 +944,21 @@ mod tests {
         for path in ["styles/theme.json", "theme.json5", "xtheme.json"] {
             assert!(!is_theme_json(path), "{path}");
         }
+    }
+
+    #[test]
+    fn zip_with_too_many_entries_is_refused() {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("t/theme.json", options).unwrap();
+        for i in 0..MAX_FILES {
+            zip.start_file(format!("t/{i}.txt"), options).unwrap();
+        }
+        let bytes = zip.finish().unwrap().into_inner();
+        let themes = temp_themes();
+        let err = extract(&themes, &bytes, None).unwrap_err();
+        assert!(err.to_string().contains("entries"), "{err}");
+        assert!(!themes.exists());
     }
 
     #[test]
