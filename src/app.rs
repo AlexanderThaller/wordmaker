@@ -911,4 +911,40 @@ mod tests {
         let (status, _) = send(&app, Method::GET, "/api/v1/themes/nope", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+
+    #[tokio::test]
+    async fn theme_css_cannot_end_the_style_element() {
+        let app = app().await;
+        send_bytes(&app, "/api/v1/themes/upload", theme_zip()).await;
+        send(
+            &app,
+            Method::PUT,
+            "/api/v1/themes/active",
+            Some(json!({ "theme": "mytheme" })),
+        )
+        .await;
+        send(
+            &app,
+            Method::PUT,
+            "/api/v1/themes/mytheme/files/style.css",
+            Some(
+                json!({ "content": "a::after { content: '</STYLE><script>alert(1)</script>'; }" }),
+            ),
+        )
+        .await;
+        send(
+            &app,
+            Method::POST,
+            "/api/v1/pages",
+            Some(json!({ "title": "Hello", "publish": true })),
+        )
+        .await;
+        let (status, html) = send(&app, Method::GET, "/hello", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(html.to_lowercase().matches("</style").count(), 1, "{html}");
+        assert!(
+            html.contains("<\\/STYLE><script>alert(1)<\\/script>"),
+            "{html}"
+        );
+    }
 }

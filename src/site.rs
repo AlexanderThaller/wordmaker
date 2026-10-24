@@ -374,11 +374,13 @@ fn layout(
     }
     // Inline rather than linked: a stylesheet request blocks the first
     // paint, and this one is small once compressed. It changes with the
-    // page, so a theme switch shows at once.
+    // page, so a theme switch shows at once. Only `</` can end the element,
+    // in any case (`</STYLE`), and `<\/` means the same in a CSS string,
+    // comment or URL. A lone `<` stays: media queries use it as an operator.
     let _ = write!(
         html,
         "<style>{}</style>\n</head>\n<body>\n<div class=\"wp-site-blocks\">\n",
-        frame.stylesheet.css.replace("</style", "<\\/style")
+        frame.stylesheet.css.replace("</", "<\\/")
     );
 
     write_header(&mut html, frame, current);
