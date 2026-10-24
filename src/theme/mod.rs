@@ -49,6 +49,10 @@ const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 250 * 1024 * 1024;
 const MAX_FILES: usize = 10_000;
 
+/// Held while themes are installed, deleted, written to or activated, so
+/// that, say, a delete cannot remove a theme that is being activated.
+static MUTATIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ThemeInfo {
     /// Directory name, used to activate the theme.
@@ -117,6 +121,7 @@ pub async fn activate(
     let Some(theme) = theme.filter(|t| !t.is_empty()) else {
         return settings::set_theme(pool, None, &[]).await;
     };
+    let _lock = MUTATIONS.lock().await;
     let info = info(themes_dir, theme).await?;
     for id in &variations {
         if !info.variations.iter().any(|v| &v.id == id) {
@@ -135,6 +140,7 @@ pub async fn activate(
 
 pub async fn delete(pool: &SqlitePool, themes_dir: &Path, slug: &str) -> AppResult<()> {
     validate_slug(slug)?;
+    let _lock = MUTATIONS.lock().await;
     if settings::get(pool).await?.theme.as_deref() == Some(slug) {
         return Err(AppError::Conflict(format!(
             "theme '{slug}' is active; activate another theme first"
@@ -315,6 +321,7 @@ pub async fn write_file(
     content: String,
 ) -> AppResult<ThemeFileEntry> {
     validate_slug(slug)?;
+    let lock = MUTATIONS.lock().await;
     let dir = existing_theme_dir(themes_dir, slug)?;
     let file = theme_file_path(&dir, path)?;
     let extension = file
@@ -335,6 +342,7 @@ pub async fn write_file(
     }
     let path = path.to_owned();
     blocking(move || {
+        let _lock = lock;
         if file.is_dir() {
             return Err(AppError::BadRequest(format!("'{path}' is a folder")));
         }
@@ -467,7 +475,10 @@ pub async fn install_zip(
     }
     let themes_dir = themes_dir.to_owned();
     let slug = slug.map(str::to_owned);
+    let lock = MUTATIONS.lock().await;
     blocking(move || {
+        // Kept until the files are in place, even if the request goes away.
+        let _lock = lock;
         let slug = extract(&themes_dir, &bytes, slug)?;
         read_info(&themes_dir, &slug)
     })
@@ -556,11 +567,25 @@ fn extract(themes_dir: &Path, bytes: &[u8], slug: Option<String>) -> AppResult<S
             }
         }
         read_json(&staging.join("theme.json"))?;
+        // Move an earlier install aside rather than deleting it first, so
+        // the theme is only missing between two renames, and a failed swap
+        // puts it back.
         let target = themes_dir.join(&slug);
-        if target.exists() {
-            std::fs::remove_dir_all(&target)?;
+        let old = themes_dir.join(format!(".old-{}", uuid::Uuid::new_v4().simple()));
+        let replacing = match std::fs::rename(&target, &old) {
+            Ok(()) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => return Err(err.into()),
+        };
+        if let Err(err) = std::fs::rename(&staging, &target) {
+            if replacing {
+                let _ = std::fs::rename(&old, &target);
+            }
+            return Err(err.into());
         }
-        std::fs::rename(&staging, &target)?;
+        if replacing {
+            let _ = std::fs::remove_dir_all(&old);
+        }
         Ok(())
     })();
     if result.is_err() {
@@ -959,6 +984,40 @@ mod tests {
         let err = extract(&themes, &bytes, None).unwrap_err();
         assert!(err.to_string().contains("entries"), "{err}");
         assert!(!themes.exists());
+    }
+
+    fn zip_of(files: &[(&str, &str)]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, content) in files {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn reinstall_swaps_the_theme_in() {
+        let themes = temp_themes();
+        let first = zip_of(&[("t/theme.json", "{}"), ("t/old.css", "a{}")]);
+        let second = zip_of(&[("t/theme.json", "{}"), ("t/new.css", "b{}")]);
+        extract(&themes, &first, None).unwrap();
+        extract(&themes, &second, None).unwrap();
+        assert!(themes.join("t/new.css").is_file());
+        assert!(!themes.join("t/old.css").exists());
+        let names: Vec<_> = std::fs::read_dir(&themes)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["t"], "nothing left aside");
+
+        // A broken zip leaves the installed theme as it was.
+        let broken = zip_of(&[("t/theme.json", "{")]);
+        assert!(extract(&themes, &broken, None).is_err());
+        assert!(themes.join("t/new.css").is_file());
+        std::fs::remove_dir_all(&themes).unwrap();
     }
 
     #[test]
