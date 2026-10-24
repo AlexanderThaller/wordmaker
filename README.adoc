@@ -31,6 +31,7 @@ The site is now at http://127.0.0.1:3000.
 |`WORDMAKER_TOKEN` |– |Bearer token for `/api` and `/mcp` (required by `serve`, `client` and `wordmaker-admin`)
 |`WORDMAKER_TOKEN_FILE` |– |File holding the token instead, e.g. a systemd credential (`$CREDENTIALS_DIRECTORY/token`) or Docker secret; surrounding whitespace is ignored
 |`WORDMAKER_MCP_URL` |`$WORDMAKER_BASE_URL/mcp` |MCP endpoint (`client` only)
+|`WORDMAKER_CLIENT_TIMEOUT` |`300` |Seconds `client` waits for the server before giving up
 |`WORDMAKER_ALLOWED_HOSTS` |– |Extra comma-separated `Host` values accepted by `/mcp`
 |`WORDMAKER_CLICKHOUSE_URL` |– |ClickHouse HTTP endpoint for page-view analytics, e.g. `http://127.0.0.1:8123`; analytics is off without it
 |`WORDMAKER_CLICKHOUSE_DATABASE` |`wordmaker` |ClickHouse database; must exist, the `page_views` table is created on start
@@ -235,6 +236,7 @@ echo '{"slug": "about"}' | wordmaker client call get_page -
 Arguments come from an optional JSON object (`-` reads it from stdin), overridden by
 `--arg KEY=VALUE` (string), `--json KEY=JSON`, `--file KEY=PATH` (file contents as a string) and `--base64 KEY=PATH`.
 The result goes to stdout; a failed tool call prints the error to stderr and exits with status 1.
+The client gives up after `--timeout` seconds (default 300), and warns when the token would cross the network over plain `http://`.
 
 == REST API
 

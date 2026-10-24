@@ -111,16 +111,12 @@ async fn download(
         // Written next to the target and renamed once it checks out, so a
         // running server or a failed download never sees half a file. The
         // name is unique, so runs that overlap do not write the same file.
-        let partial = path.with_extension(format!(
-            "mmdb.{}.partial",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let partial =
+            path.with_extension(format!("mmdb.{}.partial", uuid::Uuid::new_v4().simple()));
         let file = std::fs::File::create_new(&partial)
             .with_context(|| format!("cannot write {}", partial.display()))?;
-        let mut gunzip = flate2::write::GzDecoder::new(Limited::new(
-            std::io::BufWriter::new(file),
-            MAX_SIZE,
-        ));
+        let mut gunzip =
+            flate2::write::GzDecoder::new(Limited::new(std::io::BufWriter::new(file), MAX_SIZE));
         let saved = async {
             while let Some(chunk) = response
                 .chunk()
