@@ -1,13 +1,13 @@
 = 014: Switching pages during a save can write one page's content into another
 :severity: Medium
 :area: wordmaker-admin UI
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Medium
 Area:: wordmaker-admin UI
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -43,3 +43,16 @@ during the save.
   `state.current` without touching the fields).
 * Return early when `state.saving` is set, and disable Save/Publish while
   saving.
+
+== Resolution
+
+* `save()` remembers the page it started on. If another page is open once
+  the server has answered (`stillOpen` compares page ids), it leaves the
+  form alone, refreshes the page list, reports the save and returns
+  `false`, so a Publish that was waiting on it stops too.
+* A save while one is under way returns at once, and Save and Publish are
+  disabled while saving, so the same PATCH or draft PUT is not sent twice.
+* After a save the slug, navigation and order fields keep what was typed
+  meanwhile, as the title already did.
+* Publish, Unpublish, Discard draft and Delete likewise touch the form only
+  if their page is still open when the server answers.

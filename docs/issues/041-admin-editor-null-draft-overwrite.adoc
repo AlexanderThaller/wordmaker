@@ -1,13 +1,13 @@
 = 041: Saving while the editor is not loaded overwrites the draft with the published body
 :severity: Low
 :area: wordmaker-admin UI
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: wordmaker-admin UI
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -29,3 +29,10 @@ sends the published body as the draft; the draft is lost.
 == Suggested fix
 
 * Fall back to `savedContent(current).body`.
+
+== Resolution
+
+`draft()` falls back to `savedContent(current).body`, the draft body when
+there is one, the same value `changes()` compares against. Without the
+editor the body is therefore never a change, and saving sends only the
+other fields.

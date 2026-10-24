@@ -1,13 +1,13 @@
 = 042: A revision that loads after a page switch is shown on the wrong page
 :severity: Low
 :area: wordmaker-admin UI
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: wordmaker-admin UI
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -28,3 +28,9 @@ B, and Restore puts A's content into B's editor.
 
 * Remember the slug before the request and ignore the response if it
   changed.
+
+== Resolution
+
+`openRevision` remembers the page it was asked on and drops the revision
+if another page is open by the time it arrives, so it is neither shown
+nor restorable there.

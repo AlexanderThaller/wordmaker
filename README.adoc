@@ -127,6 +127,7 @@ WORDMAKER_TOKEN_FILE=/path/to/token ./target/release/wordmaker-admin
 
 Then open http://127.0.0.1:3001.
 It talks to the server at `WORDMAKER_BASE_URL` through the REST API and holds the token itself, so the browser never sees it.
+When that is an internal address, set `WORDMAKER_ADMIN_SITE_URL` to the site's public URL for the interface's links to the site.
 That also means anyone who can reach the interface can change the site: it listens on `127.0.0.1:3001` (`WORDMAKER_ADMIN_BIND`) and only answers to loopback host names.
 To reach it under another name, behind something that checks who is asking, add the name to `WORDMAKER_ADMIN_ALLOWED_HOSTS`.
 
@@ -148,7 +149,7 @@ Only verified email addresses on `WORDMAKER_ADMIN_ALLOWED_USERS` get in, either 
 The client secret is optional for providers that register public clients, since the sign-in uses PKCE.
 Sessions last 12 hours and are kept in memory, so a restart signs everyone out.
 
-The editor is vendored in `crates/wordmaker-admin/vendor`; `vendor/update-editor.sh [version]` replaces it with a release from npm.
+The editor is vendored in `crates/wordmaker-admin/vendor`; `vendor/update-editor.sh [version integrity]` replaces it with a release from npm, checked against the sha512 integrity hash pinned in the script.
 The dashboard's world map is generated from https://www.naturalearthdata.com/[Natural Earth] (public domain) by `vendor/update-world.sh`.
 
 == Claude Desktop

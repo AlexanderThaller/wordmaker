@@ -47,9 +47,42 @@ use crate::{
 /// using the token this server holds.
 pub const API_GUARD_HEADER: &str = "x-wordmaker-admin";
 
+/// What the interface's own pages may load. Script only from here (and
+/// the editor's wasm); styles, images, fonts and media more widely, since
+/// the preview shows pages as the site would, and its frame inherits this.
+const ADMIN_CSP: &str = concat!(
+    "default-src 'self'; ",
+    "script-src 'self' 'wasm-unsafe-eval'; ",
+    "style-src 'self' 'unsafe-inline' https:; ",
+    "img-src * data: blob:; ",
+    "font-src * data:; ",
+    "media-src * data: blob:; ",
+    "frame-src 'self' https:; ",
+    "connect-src 'self'; ",
+    "object-src 'none'; ",
+    "base-uri 'self'; ",
+    "form-action 'self'; ",
+    "frame-ancestors 'self'",
+);
+
+/// Files passed on from the site's `/_wm` and `/media` may be anything a
+/// theme or an upload holds, SVG and HTML included. Opened on their own on
+/// this origin they could script the API with the token, so they are shown
+/// sandboxed, without script. Loading them into the interface's pages as
+/// images, styles or fonts is not affected.
+const PUBLIC_CSP: &str = concat!(
+    "default-src 'none'; ",
+    "img-src 'self' data:; ",
+    "style-src 'self' 'unsafe-inline'; ",
+    "font-src 'self'; ",
+    "sandbox",
+);
+
 #[derive(Debug, Clone)]
 pub struct Admin {
     pub upstream: Upstream,
+    /// The site as visitors reach it, if not at the server's URL.
+    pub site_url: Option<Arc<str>>,
     /// `Host` names this interface answers to; anything else may be a DNS
     /// rebinding attempt.
     pub allowed_hosts: Arc<[String]>,
@@ -115,7 +148,10 @@ pub fn router(admin: Admin) -> Router {
             auth::require_session,
         ))
         .merge(auth::router())
-        .layer(middleware::map_response(security_headers))
+        .layer(middleware::map_response_with_state(
+            admin.clone(),
+            security_headers,
+        ))
         .layer(middleware::from_fn_with_state(admin.clone(), check_host))
         .layer(TraceLayer::new_for_http())
         .with_state(admin)
@@ -140,7 +176,7 @@ async fn config(
     user: Option<Extension<User>>,
 ) -> Json<serde_json::Value> {
     Json(json!({
-        "site_url": admin.upstream.base_url(),
+        "site_url": admin.site_url.as_deref().unwrap_or(admin.upstream.base_url()),
         "version": env!("CARGO_PKG_VERSION"),
         "user": user.map(|Extension(User(email))| email),
     }))
@@ -153,11 +189,30 @@ async fn api(State(admin): State<Admin>, request: Request) -> Response {
             &format!("API requests need the {API_GUARD_HEADER} header"),
         );
     }
-    admin.upstream.forward(request, true).await
+    admin.upstream.forward(request, "/api/v1/", true).await
 }
 
 async fn public(State(admin): State<Admin>, request: Request) -> Response {
-    admin.upstream.forward(request, false).await
+    let prefix = if request.uri().path().starts_with("/_wm/") {
+        "/_wm/"
+    } else {
+        "/media/"
+    };
+    let mut response = admin.upstream.forward(request, prefix, false).await;
+    // A sandbox keeps browsers from showing PDFs at all, and their viewers
+    // run no script of this origin.
+    let pdf = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim_start().starts_with("application/pdf"));
+    if !pdf {
+        response.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(PUBLIC_CSP),
+        );
+    }
+    response
 }
 
 async fn check_host(State(admin): State<Admin>, request: Request, next: Next) -> Response {
@@ -177,8 +232,21 @@ async fn check_host(State(admin): State<Admin>, request: Request, next: Next) ->
     }
 }
 
-async fn security_headers(mut response: Response) -> Response {
+async fn security_headers(State(admin): State<Admin>, mut response: Response) -> Response {
     let headers = response.headers_mut();
+    // Reached over https, it stays there; cookies are `Secure` then.
+    if admin.auth.as_ref().is_some_and(Auth::https) {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000"),
+        );
+    }
+    if !headers.contains_key(header::CONTENT_SECURITY_POLICY) {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(ADMIN_CSP),
+        );
+    }
     headers.insert(
         header::X_FRAME_OPTIONS,
         HeaderValue::from_static("SAMEORIGIN"),
@@ -252,6 +320,7 @@ mod tests {
     fn admin(base_url: &str) -> Router {
         router(Admin {
             upstream: Upstream::new(base_url, "secret".into()).unwrap(),
+            site_url: None,
             allowed_hosts: vec!["localhost".to_owned(), "::1".to_owned()].into(),
             auth: None,
         })
@@ -283,6 +352,12 @@ mod tests {
             "{body}"
         );
         assert_eq!(headers[header::X_FRAME_OPTIONS], "SAMEORIGIN");
+        let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        assert!(
+            csp.contains("script-src 'self' 'wasm-unsafe-eval';"),
+            "{csp}"
+        );
+        assert!(!csp.contains("sandbox"), "{csp}");
 
         let (status, headers, _) = send(
             &app,
@@ -293,6 +368,31 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(headers[header::CONTENT_TYPE], "application/wasm");
+    }
+
+    #[tokio::test]
+    async fn links_go_to_the_site_url() {
+        let config = |app: Router| async move {
+            let (_, _, body) = send(
+                &app,
+                request(Method::GET, "/config.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["site_url"].clone()
+        };
+        assert_eq!(
+            config(admin("http://127.0.0.1:9")).await,
+            "http://127.0.0.1:9"
+        );
+        let app = router(Admin {
+            upstream: Upstream::new("http://wordmaker.internal:3000", "secret".into()).unwrap(),
+            site_url: Some("https://example.com".into()),
+            allowed_hosts: vec!["localhost".to_owned()].into(),
+            auth: None,
+        });
+        assert_eq!(config(app).await, "https://example.com");
     }
 
     #[tokio::test]
@@ -363,7 +463,7 @@ mod tests {
     #[tokio::test]
     async fn public_files_go_without_the_token() {
         let app = admin(&fake_server().await);
-        let (status, _, body) = send(
+        let (status, headers, body) = send(
             &app,
             request(Method::GET, "/media/logo.png")
                 .body(Body::empty())
@@ -373,6 +473,11 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let seen: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(seen["authorization"], serde_json::Value::Null);
+        // Opened on their own, the site's files cannot script this origin.
+        let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        assert!(csp.starts_with("default-src 'none';"), "{csp}");
+        assert!(csp.ends_with("sandbox"), "{csp}");
+        assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
 
         // Only reading is passed on.
         let (status, ..) = send(
@@ -383,6 +488,41 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn paths_cannot_step_out_of_their_prefix() {
+        let app = admin(&fake_server().await);
+        for uri in [
+            "/api/v1/../../x",
+            "/api/v1/./pages",
+            "/api/v1/%2e%2e/%2E%2E/x",
+            "/api/v1/pages%2f..%2fx",
+            "/api/v1/..%5cx",
+            "/api/v1/..\\x",
+            "/media/../about",
+            "/_wm/..",
+        ] {
+            let (status, _, body) = send(
+                &app,
+                request(Method::GET, uri)
+                    .header(API_GUARD_HEADER, "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+        }
+
+        // Dots inside a name are fine.
+        let (status, _, body) = send(
+            &app,
+            request(Method::GET, "/media/logo.v2..png")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     #[tokio::test]

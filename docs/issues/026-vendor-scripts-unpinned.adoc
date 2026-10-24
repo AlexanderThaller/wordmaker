@@ -1,13 +1,13 @@
 = 026: Vendor update scripts install unpinned, unverified code
 :severity: Low
 :area: Supply chain
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Supply chain
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -30,3 +30,16 @@ machine) on the next vendor update.
 
 * Pin exact versions and verify `sha512` integrity.
 * Use `npm install --ignore-scripts`.
+
+== Resolution
+
+* `update-editor.sh` no longer takes npm's latest release: it defaults to
+  the vendored 0.1.2 and its sha512 integrity, and another release needs
+  both a version and its integrity hash, which the script checks against
+  the downloaded tarball before using it.
+* `update-world.sh` no longer runs `npm install d3-geo@3`. It fetches
+  d3-geo 3.1.1, d3-array 3.2.4 and internmap 2.0.3 (its whole dependency
+  tree) with `npm pack --ignore-scripts`, checks each against a pinned
+  sha512 integrity and unpacks them into `node_modules` itself, so no
+  package script runs and no version range is resolved.
+* The scripts were not re-run; the vendored files are unchanged.

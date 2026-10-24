@@ -1,13 +1,13 @@
 = 054: Minor admin UI issues
 :severity: Low
 :area: wordmaker-admin
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: wordmaker-admin
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -35,3 +35,15 @@ Small correctness gaps in the admin.
 * Catch decoding errors in the router.
 * Add a separate public site URL setting for links.
 * Key the login cookie by state, or tolerate parallel logins.
+
+== Resolution
+
+* The router catches `decodeURIComponent` errors; a mangled hash such as
+  `#/pages/%zz` is treated as naming no page.
+* New setting `WORDMAKER_ADMIN_SITE_URL` (`--site-url`): the site's public
+  URL for `/config.json`'s `site_url`, which "Open site" and the
+  dashboard's page links use. Without it they use `WORDMAKER_BASE_URL` as
+  before. The "View" links come from the server's own page URLs and were
+  already public.
+* Parallel sign-ins: fixed with link:009-unbounded-tables-lockout.adoc[issue 9]; each sign-in now
+  has its own login cookie, named after its `state`.

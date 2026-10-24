@@ -1,13 +1,13 @@
 = 045: Copied image snippets can carry attributes from the uploaded filename
 :severity: Low
 :area: wordmaker-admin UI
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: wordmaker-admin UI
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -27,3 +27,10 @@ elsewhere.
 == Suggested fix
 
 * Also strip `,`, `=` and `"`, or quote the alt text.
+
+== Resolution
+
+The `image::` and `link:` snippets now pass the uploaded name through
+`macroText`, which turns `[`, `]`, `,`, `=`, `"`, `{` and `}` into spaces,
+so the name can neither close the attribute list nor add attributes such
+as `link=` or `role=`, nor refer to document attributes.

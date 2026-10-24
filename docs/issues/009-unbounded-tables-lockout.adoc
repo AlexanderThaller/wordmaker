@@ -41,3 +41,16 @@ evicting old ones.
 * Keep no server-side state before the OIDC callback: put the PKCE verifier
   and nonce in a signed or encrypted login cookie. Or evict the oldest entry
   and cap entries per client IP.
+
+== Resolution (admin sign-in)
+
+The admin half is fixed; the dynamic client registration half is handled
+separately, so the status stays open until it is.
+
+`wordmaker-admin` keeps no state for a sign-in under way any more. The
+pending-login table and `MAX_PENDING_LOGINS` are gone: `/auth/login` puts
+the PKCE verifier, the nonce and the start time into a login cookie,
+HMAC-SHA256-signed together with the `state` under a key made at start-up.
+The callback checks the MAC and the 10-minute lifetime and uses the
+provider as currently discovered. Any number of anonymous `/auth/login`
+requests therefore fill nothing and cannot lock anyone out.

@@ -190,7 +190,12 @@ async function route() {
   if (name === "settings") return loadSettings();
   if (name === "dashboard") return loadDashboard();
 
-  const slug = rest.length ? decodeURIComponent(rest.join("/")) : null;
+  let slug = null;
+  try {
+    slug = rest.length ? decodeURIComponent(rest.join("/")) : null;
+  } catch {
+    // A mangled hash such as `#/pages/%zz` names no page.
+  }
   if (!slug) {
     // Back to the pages view: keep showing what was open.
     if (state.current) history.replaceState(null, "", `#/pages/${state.current.slug}`);
@@ -322,8 +327,13 @@ const fields = {
   navOrder: $("#page-nav-order"),
 };
 
+let pageRequest = 0;
+
 async function openPage(slug) {
+  // Answers can come back out of order; only the last page asked for shows.
+  const request = ++pageRequest;
   const page = await attempt(() => api("GET", pagePath(slug)));
+  if (request !== pageRequest) return;
   if (!page) {
     state.current = null;
     showPageEditor(false);
@@ -336,6 +346,8 @@ async function openPage(slug) {
   renderPageList();
   if (!$("#history").hidden) loadRevisions();
   await ensureEditor();
+  // Another page may have been opened while the editor loaded.
+  if (request !== pageRequest) return;
   state.editor.setValue(savedContent(page).body);
   updateDirty();
   refreshPreview(0);
@@ -386,6 +398,9 @@ $("#toggle-sidebar").addEventListener("click", toggleSidebar);
 // Slug and navigation are not drafted; they change at once.
 
 const hasDraft = (page) => page.draft_body != null;
+
+/** Whether `page` is still the one open, after waiting on the server. */
+const stillOpen = (page) => state.current?.id === page.id;
 
 /** Whether saving keeps title and body as a draft rather than changing the page. */
 function savesDraft(page) {
@@ -445,7 +460,8 @@ function draft() {
   return {
     title: fields.title.value.trim(),
     slug: fields.slug.value.trim(),
-    body: state.editor ? state.editor.value() : current.body,
+    // Before the editor loads it holds what was last saved: the draft, if any.
+    body: state.editor ? state.editor.value() : savedContent(current).body,
     in_nav: fields.inNav.checked,
     nav_order: Number.parseInt(fields.navOrder.value, 10) || 0,
   };
@@ -475,10 +491,13 @@ function updateDirty() {
     label.textContent = state.current ? `Saved ${ago(state.current.updated_at)}` : "";
     label.className = "save-state";
   }
-  // Nothing to publish on a published page without changes.
+  // Nothing to publish on a published page without changes, and nothing
+  // to send twice while a save is under way.
   const current = state.current;
+  $("#save").disabled = state.saving;
   $("#publish").disabled =
-    !!current && savesDraft(current) && current.status === "published" && !hasDraft(current) && !isDirty();
+    state.saving ||
+    (!!current && savesDraft(current) && current.status === "published" && !hasDraft(current) && !isDirty());
 }
 
 for (const input of Object.values(fields)) {
@@ -490,6 +509,9 @@ for (const input of Object.values(fields)) {
 
 /** Saves the draft; resolves to whether everything is saved now. */
 async function save() {
+  // A second Ctrl+S would send the same changes again, to a slug that may
+  // be gone by then.
+  if (state.saving) return false;
   const update = changes();
   if (!Object.keys(update).length) return true;
   if (update.title === "") {
@@ -498,18 +520,19 @@ async function save() {
   }
   state.saving = true;
   updateDirty();
-  const before = state.current.slug;
-  const drafting = savesDraft(state.current);
+  const target = state.current;
+  const before = target.slug;
+  const drafting = savesDraft(target);
   const content = Object.fromEntries(
     Object.entries(update).filter(([key]) => drafting && (key === "title" || key === "body")),
   );
   const direct = Object.fromEntries(Object.entries(update).filter(([key]) => !(key in content)));
 
-  let page = state.current;
+  let page = target;
   let ok = true;
   if (Object.keys(direct).length) {
     page = (await attempt(() => api("PATCH", pagePath(before), direct))) ?? page;
-    ok = page !== state.current;
+    ok = page !== target;
   }
   if (ok && Object.keys(content).length) {
     const drafted = await attempt(() => api("PUT", `${pagePath(page.slug)}/draft`, content));
@@ -517,11 +540,28 @@ async function save() {
     page = drafted ?? page;
   }
   state.saving = false;
-  // The editor and title keep what is in them: anything typed while saving,
+  if (!stillOpen(target)) {
+    // Another page was opened meanwhile; the form is that page's now.
+    updateDirty();
+    if (ok) {
+      loadPages();
+      toast(`Saved “${savedContent(page).title}”`);
+    }
+    return false;
+  }
+  // The form and editor keep what is in them: anything typed while saving,
   // or not saved, stays a change.
-  const typed = fields.title.value;
+  const typed = {
+    title: fields.title.value,
+    slug: fields.slug.value,
+    inNav: fields.inNav.checked,
+    navOrder: fields.navOrder.value,
+  };
   if (page !== state.current) show(page);
-  fields.title.value = typed;
+  fields.title.value = typed.title;
+  fields.slug.value = typed.slug;
+  fields.inNav.checked = typed.inNav;
+  fields.navOrder.value = typed.navOrder;
   updateDirty();
   if (page.slug !== before) history.replaceState(null, "", `#/pages/${page.slug}`);
   if (!ok) return false;
@@ -542,9 +582,15 @@ $("#publish").addEventListener("click", async () => {
   const current = state.current;
   if (current.status === "published" && !("draft_body" in current)) return unpublish();
   if (!(await save())) return;
-  const wasPublished = state.current.status === "published";
-  const page = await attempt(() => api("POST", `${pagePath(state.current.slug)}/publish`));
+  const saved = state.current;
+  const wasPublished = saved.status === "published";
+  const page = await attempt(() => api("POST", `${pagePath(saved.slug)}/publish`));
   if (!page) return;
+  if (!stillOpen(saved)) {
+    loadPages();
+    toast(`Published “${page.title}”`);
+    return;
+  }
   show(page);
   if (!$("#history").hidden) loadRevisions();
   loadPages();
@@ -562,7 +608,7 @@ async function unpublish() {
   if (!sure) return;
   const updated = await attempt(() => api("POST", `${pagePath(page.slug)}/unpublish`));
   if (!updated) return;
-  show(updated);
+  if (stillOpen(page)) show(updated);
   loadPages();
   toast("Unpublished");
 }
@@ -580,8 +626,10 @@ $("#discard-draft").addEventListener("click", async () => {
   if (!sure) return;
   const updated = await attempt(() => api("DELETE", `${pagePath(page.slug)}/draft`));
   if (!updated) return;
-  show(updated, { body: true });
-  refreshPreview(0);
+  if (stillOpen(page)) {
+    show(updated, { body: true });
+    refreshPreview(0);
+  }
   loadPages();
   toast("Draft discarded");
 });
@@ -597,9 +645,11 @@ $("#delete-page").addEventListener("click", async () => {
   if (!sure) return;
   const done = await attempt(() => api("DELETE", pagePath(page.slug)));
   if (done === undefined) return;
-  state.current = null;
-  showPageEditor(false);
-  history.replaceState(null, "", "#/pages");
+  if (stillOpen(page)) {
+    state.current = null;
+    showPageEditor(false);
+    history.replaceState(null, "", "#/pages");
+  }
   await loadPages();
   toast(`Deleted “${page.title}”`);
 });
@@ -815,8 +865,10 @@ async function loadRevisions() {
 }
 
 async function openRevision(number) {
-  const revision = await attempt(() => api("GET", `${pagePath(state.current.slug)}/revisions/${number}`));
-  if (!revision) return;
+  const page = state.current;
+  const revision = await attempt(() => api("GET", `${pagePath(page.slug)}/revisions/${number}`));
+  // Shown on another page, Restore would put this page's text into that one.
+  if (!revision || !stillOpen(page)) return;
   state.revision = revision;
   $("#revision-label").textContent = `Revision ${revision.revision}, ${new Date(revision.created_at).toLocaleString()}`;
   $("#revision-banner").hidden = false;
@@ -868,12 +920,17 @@ async function loadMedia() {
   if (!media.length) grid.append(h("li", { class: "media-empty" }, "Nothing uploaded yet."));
 }
 
+/**
+ * Text for a macro's attribute list. The uploader chose the name, so
+ * nothing in it may close the list or add attributes such as `link=`.
+ */
+const macroText = (text) => text.replace(/[[\],="{}]+/g, " ").replace(/\s+/g, " ").trim();
+
 /** What to write in a page to show or link the file. */
 function snippet(item) {
-  const name = item.original_name.replace(/\.[^.]+$/, "").replace(/[[\]]/g, "");
   return item.content_type.startsWith("image/")
-    ? `image::${item.path}[${name}]`
-    : `link:${item.path}[${item.original_name.replace(/[[\]]/g, "")}]`;
+    ? `image::${item.path}[${macroText(item.original_name.replace(/\.[^.]+$/, ""))}]`
+    : `link:${item.path}[${macroText(item.original_name)}]`;
 }
 
 function mediaCard(item) {
@@ -1254,16 +1311,15 @@ function renderDashboard() {
     ),
   );
 
-  const pageLink = (name) => (state.siteUrl ? new URL(name, state.siteUrl).href : null);
   $("#tops").replaceChildren(
-    topList("Pages", report.pages, { link: pageLink }),
+    topList("Pages", report.pages, { link: siteLink }),
     topList("Referrers", report.referrers, { link: (name) => `https://${name}`, empty: "No visits from other sites yet." }),
     topList("Countries", report.countries),
     topList("Browsers", report.browsers, { label: known }),
     topList("Operating systems", report.systems, { label: known }),
     topList("Devices", report.devices, { label: deviceName }),
     topList("Not found", report.not_found, {
-      link: pageLink,
+      link: siteLink,
       empty: "No broken links.",
       hint: "Pages visitors asked for that do not exist.",
     }),
@@ -1274,6 +1330,22 @@ function renderDashboard() {
   );
   $("#dashboard-notes").replaceChildren(...notes());
   drawMap();
+}
+
+/**
+ * A link to `path` on the site, or none. Paths come from what visitors
+ * asked for: `/\evil.example` or `//evil.example` would lead elsewhere.
+ */
+function siteLink(path) {
+  if (!state.siteUrl || !path.startsWith("/") || path.startsWith("//") || path.includes("\\")) {
+    return null;
+  }
+  try {
+    const url = new URL(path, state.siteUrl);
+    return url.origin === new URL(state.siteUrl).origin ? url.href : null;
+  } catch {
+    return null;
+  }
 }
 
 function stat(label, value, detail) {
