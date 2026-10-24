@@ -322,8 +322,13 @@ const fields = {
   navOrder: $("#page-nav-order"),
 };
 
+let pageRequest = 0;
+
 async function openPage(slug) {
+  // Answers can come back out of order; only the last page asked for shows.
+  const request = ++pageRequest;
   const page = await attempt(() => api("GET", pagePath(slug)));
+  if (request !== pageRequest) return;
   if (!page) {
     state.current = null;
     showPageEditor(false);
@@ -336,6 +341,8 @@ async function openPage(slug) {
   renderPageList();
   if (!$("#history").hidden) loadRevisions();
   await ensureEditor();
+  // Another page may have been opened while the editor loaded.
+  if (request !== pageRequest) return;
   state.editor.setValue(savedContent(page).body);
   updateDirty();
   refreshPreview(0);
