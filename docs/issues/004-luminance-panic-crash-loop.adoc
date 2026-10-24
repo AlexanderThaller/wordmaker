@@ -1,13 +1,13 @@
 = 004: Non-ASCII colour value panics and, under panic=abort, crash-loops the server
 :severity: Medium
 :area: Themes
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Medium
 Area:: Themes
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -34,3 +34,12 @@ puts an offset inside a code point and the slice panics.
 
 * Require `+hex.bytes().all(|b| b.is_ascii_hexdigit())+` before slicing.
   This also rejects the `+` sign that `from_str_radix` currently accepts.
+
+== Resolution
+
+`luminance` returns `None` unless every character after `#` is an ASCII hex
+digit, before it slices anything, so `#é1` and `#+f+f+f` count as unknown
+colours instead of panicking or parsing. The `deploy` profile also unwinds
+now (link:040-panic-abort-hardening.adoc[issue 40]), so a panic elsewhere
+in the theme build falls back to the built-in theme instead of killing the
+server.
