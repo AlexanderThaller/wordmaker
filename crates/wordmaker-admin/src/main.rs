@@ -36,6 +36,11 @@ struct Cli {
     )]
     base_url: String,
 
+    /// Where visitors reach the site, for the interface's links to it, when
+    /// that is not `--base-url` (say, the server is reached internally).
+    #[arg(long, env = "WORDMAKER_ADMIN_SITE_URL")]
+    site_url: Option<String>,
+
     #[command(flatten)]
     token: token::TokenArgs,
 
@@ -93,8 +98,20 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let site_url = match cli.site_url.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(url) => {
+            anyhow::ensure!(
+                url.starts_with("http://") || url.starts_with("https://"),
+                "the site URL must start with http:// or https://, got {url:?}"
+            );
+            Some(url.trim_end_matches('/').into())
+        }
+    };
+
     let admin = Admin {
         upstream: Upstream::new(&cli.base_url, token)?,
+        site_url,
         allowed_hosts: allowed_hosts.into(),
         auth,
     };

@@ -81,6 +81,8 @@ const PUBLIC_CSP: &str = concat!(
 #[derive(Debug, Clone)]
 pub struct Admin {
     pub upstream: Upstream,
+    /// The site as visitors reach it, if not at the server's URL.
+    pub site_url: Option<Arc<str>>,
     /// `Host` names this interface answers to; anything else may be a DNS
     /// rebinding attempt.
     pub allowed_hosts: Arc<[String]>,
@@ -174,7 +176,7 @@ async fn config(
     user: Option<Extension<User>>,
 ) -> Json<serde_json::Value> {
     Json(json!({
-        "site_url": admin.upstream.base_url(),
+        "site_url": admin.site_url.as_deref().unwrap_or(admin.upstream.base_url()),
         "version": env!("CARGO_PKG_VERSION"),
         "user": user.map(|Extension(User(email))| email),
     }))
@@ -318,6 +320,7 @@ mod tests {
     fn admin(base_url: &str) -> Router {
         router(Admin {
             upstream: Upstream::new(base_url, "secret".into()).unwrap(),
+            site_url: None,
             allowed_hosts: vec!["localhost".to_owned(), "::1".to_owned()].into(),
             auth: None,
         })
@@ -365,6 +368,31 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(headers[header::CONTENT_TYPE], "application/wasm");
+    }
+
+    #[tokio::test]
+    async fn links_go_to_the_site_url() {
+        let config = |app: Router| async move {
+            let (_, _, body) = send(
+                &app,
+                request(Method::GET, "/config.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["site_url"].clone()
+        };
+        assert_eq!(
+            config(admin("http://127.0.0.1:9")).await,
+            "http://127.0.0.1:9"
+        );
+        let app = router(Admin {
+            upstream: Upstream::new("http://wordmaker.internal:3000", "secret".into()).unwrap(),
+            site_url: Some("https://example.com".into()),
+            allowed_hosts: vec!["localhost".to_owned()].into(),
+            auth: None,
+        });
+        assert_eq!(config(app).await, "https://example.com");
     }
 
     #[tokio::test]

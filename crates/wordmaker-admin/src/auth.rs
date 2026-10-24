@@ -941,6 +941,7 @@ mod tests {
             .unwrap();
         app::router(Admin {
             upstream: Upstream::new("http://127.0.0.1:9", "secret".into()).unwrap(),
+            site_url: None,
             allowed_hosts: vec!["localhost".to_owned()].into(),
             auth: Some(auth),
         })
@@ -1226,6 +1227,7 @@ mod tests {
         let auth = Auth::new(config.resolve().unwrap().unwrap()).await.unwrap();
         let app = app::router(Admin {
             upstream: Upstream::new("http://127.0.0.1:9", "secret".into()).unwrap(),
+            site_url: None,
             allowed_hosts: vec!["localhost".to_owned()].into(),
             auth: Some(auth),
         });

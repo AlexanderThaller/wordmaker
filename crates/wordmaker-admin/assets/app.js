@@ -190,7 +190,12 @@ async function route() {
   if (name === "settings") return loadSettings();
   if (name === "dashboard") return loadDashboard();
 
-  const slug = rest.length ? decodeURIComponent(rest.join("/")) : null;
+  let slug = null;
+  try {
+    slug = rest.length ? decodeURIComponent(rest.join("/")) : null;
+  } catch {
+    // A mangled hash such as `#/pages/%zz` names no page.
+  }
   if (!slug) {
     // Back to the pages view: keep showing what was open.
     if (state.current) history.replaceState(null, "", `#/pages/${state.current.slug}`);
