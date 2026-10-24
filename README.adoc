@@ -149,7 +149,7 @@ Only verified email addresses on `WORDMAKER_ADMIN_ALLOWED_USERS` get in, either 
 The client secret is optional for providers that register public clients, since the sign-in uses PKCE.
 Sessions last 12 hours and are kept in memory, so a restart signs everyone out.
 
-The editor is vendored in `crates/wordmaker-admin/vendor`; `vendor/update-editor.sh [version]` replaces it with a release from npm.
+The editor is vendored in `crates/wordmaker-admin/vendor`; `vendor/update-editor.sh [version integrity]` replaces it with a release from npm, checked against the sha512 integrity hash pinned in the script.
 The dashboard's world map is generated from https://www.naturalearthdata.com/[Natural Earth] (public domain) by `vendor/update-world.sh`.
 
 == Claude Desktop
