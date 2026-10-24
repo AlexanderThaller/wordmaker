@@ -1,13 +1,13 @@
 = 027: is_public misses IPv6 ranges that embed IPv4 or are not public
 :severity: Low
 :area: OAuth
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: OAuth
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -28,3 +28,11 @@ reach an internal host. Exploitability is uncertain.
 
 * Reject these ranges and check embedded IPv4 addresses against the IPv4
   rules.
+
+== Resolution
+
+`is_public` now judges IPv4-compatible addresses (`::a.b.c.d`) by their
+embedded IPv4 address, like IPv4-mapped ones, and refuses 6to4
+(`2002::/16`), `2001::/23` (Teredo, benchmarking, ORCHID), site-local
+`fec0::/10`, the discard prefix `100::/64` and the `3fff::/20`
+documentation range, in addition to the ranges it already refused.

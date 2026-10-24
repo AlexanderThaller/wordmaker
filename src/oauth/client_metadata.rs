@@ -233,7 +233,9 @@ fn is_loopback(url: &Url) -> bool {
 }
 
 /// Addresses on the public internet: not loopback, private, link-local,
-/// shared, documentation, multicast or otherwise reserved.
+/// shared, documentation, multicast or otherwise reserved. IPv6 tunnel
+/// ranges (6to4, Teredo) are refused, since they lead to IPv4 addresses
+/// that cannot be checked.
 fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -252,17 +254,24 @@ fn is_public(ip: IpAddr) -> bool {
                 || (a == 192 && b == 0))
         }
         IpAddr::V6(ip) => {
-            if let Some(v4) = ip.to_ipv4_mapped() {
+            // IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible
+            // (`::a.b.c.d`, which includes `::` and `::1`) addresses are
+            // judged by the IPv4 address they carry.
+            if let Some(v4) = ip.to_ipv4() {
                 return is_public(IpAddr::V4(v4));
             }
-            let first = ip.segments()[0];
-            !(ip.is_unspecified()
-                || ip.is_loopback()
-                || ip.is_multicast()
-                || (first & 0xfe00) == 0xfc00
-                || (first & 0xffc0) == 0xfe80
-                || first == 0x2001 && ip.segments()[1] == 0x0db8
-                || first == 0x0064)
+            let segments = ip.segments();
+            let first = segments[0];
+            !(ip.is_multicast()
+                || (first & 0xfe00) == 0xfc00 // unique local
+                || (first & 0xffc0) == 0xfe80 // link-local
+                || (first & 0xffc0) == 0xfec0 // site-local
+                || first == 0x0064 // NAT64
+                || (first == 0x0100 && segments[1..4] == [0, 0, 0]) // discard
+                || (first == 0x2001 && segments[1] < 0x0200) // Teredo, benchmarking, ORCHID
+                || (first == 0x2001 && segments[1] == 0x0db8) // documentation
+                || first == 0x2002 // 6to4, which embeds an IPv4 address
+                || (first == 0x3fff && segments[1] < 0x1000)) // documentation
         }
     }
 }
@@ -273,7 +282,13 @@ mod tests {
 
     #[test]
     fn public_addresses() {
-        for ip in ["1.1.1.1", "2a00:1450:4001::1"] {
+        for ip in [
+            "1.1.1.1",
+            "2a00:1450:4001::1",
+            "2606:4700:4700::1111",
+            "100:1::1",
+            "2001:4860::1",
+        ] {
             assert!(is_public(ip.parse().unwrap()), "{ip}");
         }
         for ip in [
@@ -289,6 +304,17 @@ mod tests {
             "fe80::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
+            "::",
+            "::7f00:1",
+            "::10.0.0.1",
+            "2002:7f00:1::1",
+            "2001::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "fec0::1",
+            "100::1",
+            "64:ff9b::7f00:1",
+            "2001:db8::1",
+            "3fff::1",
         ] {
             assert!(!is_public(ip.parse().unwrap()), "{ip}");
         }
