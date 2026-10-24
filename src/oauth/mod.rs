@@ -289,38 +289,32 @@ struct Request {
     state: Option<String>,
 }
 
-/// Why an authorization request cannot go ahead. Until the client and its
-/// redirect URI are known to belong together, errors are shown to the user
-/// instead of being sent anywhere.
-enum Refusal {
-    Page(String),
-    Redirect {
-        redirect_uri: String,
-        state: Option<String>,
-        error: &'static str,
-        description: String,
-    },
-}
-
-async fn check(state: &AppState, params: &AuthorizeParams) -> Result<Request, Refusal> {
+/// Check an authorization request. Problems are shown to the user, never
+/// sent to the client: before the user has approved, a redirect would let
+/// anyone use this site to send browsers to any URI they registered (RFC
+/// 9700, section 4.11.2).
+async fn check(state: &AppState, params: &AuthorizeParams) -> Result<Request, String> {
     let client_id = params
         .client_id
         .as_deref()
         .filter(|id| !id.is_empty())
-        .ok_or_else(|| Refusal::Page("The request does not name a client.".into()))?;
+        .ok_or("The request does not name a client.")?;
     let client = if is_metadata_url(client_id) {
         state
             .oauth_clients
             .fetch(client_id)
             .await
-            .map_err(|err| Refusal::Page(format!("The client could not be verified: {err}.")))?
+            .map_err(|err| format!("The client could not be verified: {err}."))?
             .as_ref()
             .clone()
     } else {
         let client = store::get_client(&state.pool, client_id)
             .await
-            .map_err(|err| Refusal::Page(format!("Could not look up the client: {err}.")))?
-            .ok_or_else(|| Refusal::Page("This client is not registered.".into()))?;
+            .map_err(|err| {
+                tracing::error!(error = %err, "could not look up an OAuth client");
+                "Could not look up the client."
+            })?
+            .ok_or("This client is not registered.")?;
         ClientInfo {
             client_id: client.client_id,
             client_name: client.client_name,
@@ -331,35 +325,26 @@ async fn check(state: &AppState, params: &AuthorizeParams) -> Result<Request, Re
     let redirect_uri = match params.redirect_uri.as_deref() {
         Some(uri) if redirect_matches(&client.redirect_uris, uri) => uri.to_owned(),
         None if client.redirect_uris.len() == 1 => client.redirect_uris[0].clone(),
-        _ => {
-            return Err(Refusal::Page(
-                "The redirect URI does not belong to this client.".into(),
-            ));
-        }
+        _ => return Err("The redirect URI does not belong to this client.".into()),
     };
+    // Clients registered before the rules got stricter may still hold one.
+    if !valid_redirect_uri(&redirect_uri) {
+        return Err("The redirect URI of this client is not allowed.".into());
+    }
 
-    let refuse = |error, description: &str| Refusal::Redirect {
-        redirect_uri: redirect_uri.clone(),
-        state: params.state.clone(),
-        error,
-        description: description.to_owned(),
-    };
     if params.response_type.as_deref() != Some("code") {
-        return Err(refuse(
-            "unsupported_response_type",
-            "only response_type=code is supported",
-        ));
+        return Err("The client asked for an unsupported response type.".into());
     }
     let code_challenge = params
         .code_challenge
         .as_deref()
         .filter(|c| (43..=128).contains(&c.len()))
         .filter(|_| params.code_challenge_method.as_deref() == Some("S256"))
-        .ok_or_else(|| refuse("invalid_request", "PKCE with S256 is required"))?;
+        .ok_or("The client did not use PKCE with S256, which is required.")?;
     if let Some(requested) = &params.resource
         && !names_resource(&state.config, requested)
     {
-        return Err(refuse("invalid_target", "unknown resource"));
+        return Err("The client asked for access to an unknown resource.".into());
     }
     Ok(Request {
         client,
@@ -382,27 +367,23 @@ async fn authorize(
 ) -> Response {
     match check(&state, &params).await {
         Ok(request) => login_page(&state, &params, &request, None).await,
-        Err(refusal) => refuse(&state, refusal),
+        Err(message) => refuse(&message),
     }
 }
 
-async fn decide(State(state): State<AppState>, Form(form): Form<DecisionForm>) -> Response {
+async fn decide(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DecisionForm>,
+) -> Response {
     // Everything the page carried is checked again; it came back from the
     // browser and may have been changed.
     let request = match check(&state, &form.params).await {
         Ok(request) => request,
-        Err(refusal) => return refuse(&state, refusal),
+        Err(message) => return refuse(&message),
     };
     if form.decision.as_deref() != Some("approve") {
-        return refuse(
-            &state,
-            Refusal::Redirect {
-                redirect_uri: request.redirect_uri,
-                state: request.state,
-                error: "access_denied",
-                description: "the request was denied".into(),
-            },
-        );
+        return deny(&state, &request, &headers);
     }
     let presented = form.token.unwrap_or_default();
     if !bool::from(presented.trim().as_bytes().ct_eq(state.token.as_bytes())) {
@@ -438,43 +419,68 @@ async fn decide(State(state): State<AppState>, Form(form): Form<DecisionForm>) -
     )
 }
 
-fn refuse(state: &AppState, refusal: Refusal) -> Response {
-    match refusal {
-        Refusal::Page(message) => {
-            let mut body = String::from("<h1>Cannot sign in</h1>\n");
-            let _ = writeln!(body, "<p>{}</p>", escape(&message));
-            let mut response = page("Cannot sign in", &body);
-            *response.status_mut() = StatusCode::BAD_REQUEST;
-            response
-        }
-        Refusal::Redirect {
-            redirect_uri,
-            state: client_state,
-            error,
-            description,
-        } => redirect_to_client(
-            state,
-            &redirect_uri,
-            &[("error", error), ("error_description", &description)],
-            client_state.as_deref(),
-        ),
-    }
+fn refuse(message: &str) -> Response {
+    let mut body = String::from("<h1>Cannot sign in</h1>\n");
+    let _ = writeln!(body, "<p>{}</p>", escape(message));
+    let mut response = page("Cannot sign in", &body);
+    *response.status_mut() = StatusCode::BAD_REQUEST;
+    response
 }
 
-/// Send the browser back to the client with `params`, the client's `state`
-/// and our issuer (RFC 9207), so the client can tell who answered.
+/// Tell the client that the user said no. Only the form posted from our
+/// own page is answered with a redirect. Anyone can post the deny form
+/// from elsewhere without knowing the admin token, so other requests get
+/// a link instead of an automatic bounce to the client's URI.
+fn deny(state: &AppState, request: &Request, headers: &HeaderMap) -> Response {
+    let Some(url) = client_url(
+        state,
+        &request.redirect_uri,
+        &[
+            ("error", "access_denied"),
+            ("error_description", "the request was denied"),
+        ],
+        request.state.as_deref(),
+    ) else {
+        return refuse("The redirect URI is not valid.");
+    };
+    let same_origin = headers
+        .get("sec-fetch-site")
+        .is_some_and(|site| site == "same-origin");
+    if same_origin {
+        return Redirect::to(url.as_str()).into_response();
+    }
+    let mut body = String::from("<h1>Request denied</h1>\n");
+    let _ = writeln!(
+        body,
+        "<p>Nothing was shared.</p>\n<p><a href=\"{}\">Return to {}</a></p>",
+        escape(url.as_str()),
+        escape(&destination(&request.redirect_uri)),
+    );
+    page("Request denied", &body)
+}
+
+/// Send the browser back to the client with `params`.
 fn redirect_to_client(
     state: &AppState,
     redirect_uri: &str,
     params: &[(&str, &str)],
     client_state: Option<&str>,
 ) -> Response {
-    let Ok(mut url) = url::Url::parse(redirect_uri) else {
-        return refuse(
-            state,
-            Refusal::Page("The redirect URI is not valid.".into()),
-        );
-    };
+    match client_url(state, redirect_uri, params, client_state) {
+        Some(url) => Redirect::to(url.as_str()).into_response(),
+        None => refuse("The redirect URI is not valid."),
+    }
+}
+
+/// The client's redirect URI with `params`, the client's `state` and our
+/// issuer (RFC 9207), so the client can tell who answered.
+fn client_url(
+    state: &AppState,
+    redirect_uri: &str,
+    params: &[(&str, &str)],
+    client_state: Option<&str>,
+) -> Option<url::Url> {
+    let mut url = url::Url::parse(redirect_uri).ok()?;
     {
         let mut query = url.query_pairs_mut();
         for (key, value) in params {
@@ -485,7 +491,15 @@ fn redirect_to_client(
         }
         query.append_pair("iss", issuer(&state.config));
     }
-    Redirect::to(url.as_str()).into_response()
+    Some(url)
+}
+
+/// Where a redirect URI leads, as shown to the user.
+fn destination(redirect_uri: &str) -> String {
+    url::Url::parse(redirect_uri)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| redirect_uri.to_owned())
 }
 
 async fn login_page(
@@ -502,10 +516,7 @@ async fn login_page(
         .client_name
         .clone()
         .unwrap_or_else(|| "An MCP client".into());
-    let destination = url::Url::parse(&request.redirect_uri)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .unwrap_or_else(|| request.redirect_uri.clone());
+    let destination = destination(&request.redirect_uri);
     let identity = if request.client.verified {
         format!(
             "Identified by <code>{}</code>.",
@@ -938,14 +949,36 @@ mod tests {
     }
 
     async fn post_form(app: &Router, uri: &str, form: &[(&str, &str)]) -> Reply {
+        post_form_from(app, uri, form, None).await
+    }
+
+    /// Post a form as a browser would, from a page of `fetch_site`
+    /// (`Sec-Fetch-Site`).
+    async fn post_form_from(
+        app: &Router,
+        uri: &str,
+        form: &[(&str, &str)],
+        fetch_site: Option<&str>,
+    ) -> Reply {
         let body = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(form)
             .finish();
+        let mut request = axum::http::Request::post(uri)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(site) = fetch_site {
+            request = request.header("sec-fetch-site", site);
+        }
+        call(app, request.body(Body::from(body)).unwrap()).await
+    }
+
+    async fn register(app: &Router, redirect_uri: &str) -> Reply {
         call(
             app,
-            axum::http::Request::post(uri)
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from(body))
+            axum::http::Request::post("/oauth/register")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "redirect_uris": [redirect_uri] }).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -1165,10 +1198,19 @@ mod tests {
         let mut form = authorize_params(&client_id);
         form.push(("decision", "deny".into()));
         let pairs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let reply = post_form(&app, "/oauth/authorize", &pairs).await;
+        let reply = post_form_from(&app, "/oauth/authorize", &pairs, Some("same-origin")).await;
         let query: HashMap<_, _> = reply.location().query_pairs().into_owned().collect();
         assert_eq!(query["error"], "access_denied");
         assert_eq!(query["state"], "xyz");
+
+        // A denial posted from anywhere else is not bounced on to the
+        // client, since anyone could send it.
+        for site in [None, Some("cross-site")] {
+            let reply = post_form_from(&app, "/oauth/authorize", &pairs, site).await;
+            assert_eq!(reply.status, StatusCode::OK);
+            assert!(!reply.headers.contains_key(header::LOCATION));
+            assert!(reply.body.contains("error=access_denied"), "{}", reply.body);
+        }
     }
 
     #[tokio::test]
@@ -1186,7 +1228,8 @@ mod tests {
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
         assert!(!reply.headers.contains_key(header::LOCATION));
 
-        // PKCE is required.
+        // PKCE is required, and errors before the user approved are shown
+        // instead of being sent to the client.
         let params: Vec<_> = authorize_params(&client_id)
             .into_iter()
             .filter(|(k, _)| !k.starts_with("code_challenge"))
@@ -1195,8 +1238,16 @@ mod tests {
             .extend_pairs(params)
             .finish();
         let reply = get(&app, &format!("/oauth/authorize?{query}")).await;
-        let query: HashMap<_, _> = reply.location().query_pairs().into_owned().collect();
-        assert_eq!(query["error"], "invalid_request");
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert!(!reply.headers.contains_key(header::LOCATION));
+        assert!(reply.body.contains("PKCE"), "{}", reply.body);
+        let reply = get(
+            &app,
+            &format!("/oauth/authorize?client_id={client_id}&redirect_uri={REDIRECT}"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert!(!reply.headers.contains_key(header::LOCATION));
 
         // A wrong verifier gets no tokens.
         let code = sign_in(&app, &client_id).await;
@@ -1217,17 +1268,17 @@ mod tests {
         assert_eq!(reply.json()["error"], "invalid_grant");
 
         // Registration refuses redirect URIs that are not safe.
-        let reply = call(
-            &app,
-            axum::http::Request::post("/oauth/register")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({ "redirect_uris": ["http://evil.example/cb"] }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-        assert_eq!(reply.json()["error"], "invalid_redirect_uri");
+        for uri in [
+            "http://evil.example/cb",
+            "ms-msdt:/id",
+            "search-ms:query=x",
+            "intent://x#Intent;end",
+        ] {
+            let reply = register(&app, uri).await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(reply.json()["error"], "invalid_redirect_uri");
+        }
+        let reply = register(&app, "com.example.app:/oauth/callback").await;
+        assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
     }
 }

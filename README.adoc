@@ -191,6 +191,7 @@ The client then gets an access token (valid for an hour) and a refresh token (30
 
 * `WORDMAKER_BASE_URL` must be the public URL the client connects to, e.g. `https://example.com`; it is the OAuth issuer and part of every metadata URL.
 * Clients identify themselves with a client ID metadata document or through dynamic client registration.
+* Redirect URIs must use HTTPS, plain HTTP to `localhost` or a loopback address, or an app scheme named after a reverse domain name such as `com.example.app:` (`cursor:`, `vscode:` and `vscode-insiders:` are allowed too).
 * OAuth tokens are only accepted on `/mcp`, not on `/api`.
 * Changing `WORDMAKER_TOKEN` signs out every OAuth client.
 

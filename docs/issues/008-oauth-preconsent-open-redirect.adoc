@@ -1,13 +1,13 @@
 = 008: Anonymous open redirect through /oauth/authorize, including custom schemes
 :severity: Medium
 :area: OAuth
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Medium
 Area:: OAuth
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -40,3 +40,18 @@ schemes, so any other scheme is accepted.
   redirecting, unless the client is trusted (RFC 9700 §4.11.2).
 * Allow-list redirect schemes: `https`, loopback `http`, and reverse-domain
   private-use schemes (RFC 8252 §7.1).
+
+== Resolution
+
+* Every problem found while checking an authorization request is now
+  shown on the error page; nothing is redirected to the client before the
+  user has entered the admin token.
+* A denial is redirected only when the browser marks the form post as
+  `Sec-Fetch-Site: same-origin`, i.e. it came from our own sign-in page.
+  Since anyone can post the deny form, other denials get a page with a link
+  back to the client instead.
+* Redirect URIs are allow-listed: `https`, loopback `http`, schemes in
+  reverse domain form (RFC 8252 §7.1), plus `cursor`, `vscode` and
+  `vscode-insiders`, which well-known clients use. The authorization
+  endpoint also re-checks the stored redirect URI, so clients registered
+  under the old rules cannot use a scheme that is no longer allowed.

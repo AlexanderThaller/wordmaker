@@ -240,8 +240,14 @@ fn parse_document(client_id: &str, body: &[u8]) -> Result<ClientInfo, String> {
     })
 }
 
+/// Private-use schemes of well-known clients that do not follow the
+/// reverse domain name convention.
+const APP_SCHEMES: &[&str] = &["cursor", "vscode", "vscode-insiders"];
+
 /// Redirect URIs we hand codes to: HTTPS, HTTP on the loopback interface,
-/// or an app's own scheme. Never one that runs code in the browser.
+/// or an app's own scheme named after a reverse domain name, such as
+/// `com.example.app:` (RFC 8252, section 7.1). Other schemes could open
+/// any protocol handler of the operating system.
 pub fn valid_redirect_uri(uri: &str) -> bool {
     let Ok(url) = Url::parse(uri) else {
         return false;
@@ -252,10 +258,7 @@ pub fn valid_redirect_uri(uri: &str) -> bool {
     match url.scheme() {
         "https" => url.host().is_some(),
         "http" => is_loopback(&url),
-        "javascript" | "data" | "file" | "vbscript" | "about" | "blob" | "ftp" | "ws" | "wss" => {
-            false
-        }
-        _ => true,
+        scheme => scheme.contains('.') || APP_SCHEMES.contains(&scheme),
     }
 }
 
@@ -390,7 +393,11 @@ mod tests {
         ));
         assert!(!valid_redirect_uri("http://example.com/cb"));
         assert!(!valid_redirect_uri("https://example.com/cb#frag"));
+        assert!(valid_redirect_uri("com.example.app:/oauth/callback"));
         assert!(!valid_redirect_uri("javascript:alert(1)"));
+        assert!(!valid_redirect_uri("ms-msdt:/id"));
+        assert!(!valid_redirect_uri("search-ms:query=x"));
+        assert!(!valid_redirect_uri("intent://x"));
         assert!(!valid_redirect_uri("not a url"));
     }
 
