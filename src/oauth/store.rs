@@ -19,25 +19,68 @@ pub struct RegisteredClient {
     pub redirect_uris: Vec<String>,
 }
 
-pub async fn insert_client(pool: &SqlitePool, client: &RegisteredClient) -> AppResult<()> {
+/// Register `client`, keeping at most `max` clients. Unused clients (that
+/// never got tokens and have no sign-in under way) registered before
+/// `stale` are dropped; if there is still no room, the oldest unused ones
+/// make way. Returns false when every client is in use.
+pub async fn insert_client(
+    pool: &SqlitePool,
+    client: &RegisteredClient,
+    max: i64,
+    stale: DateTime<Utc>,
+) -> AppResult<bool> {
+    // Starting with a write takes the database's write lock, so the count
+    // below cannot change before the insert.
+    let mut tx = pool.begin().await?;
     sqlx::query(
+        "DELETE FROM oauth_clients
+         WHERE used_at IS NULL AND created_at < ? AND NOT EXISTS
+             (SELECT 1 FROM oauth_codes WHERE oauth_codes.client_id = oauth_clients.client_id)",
+    )
+    .bind(stale)
+    .execute(&mut *tx)
+    .await?;
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM oauth_clients")
+        .fetch_one(&mut *tx)
+        .await?;
+    if count >= max {
+        sqlx::query(
+            "DELETE FROM oauth_clients WHERE client_id IN
+                 (SELECT client_id FROM oauth_clients
+                  WHERE used_at IS NULL AND NOT EXISTS
+                      (SELECT 1 FROM oauth_codes
+                       WHERE oauth_codes.client_id = oauth_clients.client_id)
+                  ORDER BY created_at LIMIT ?)",
+        )
+        .bind(count - max + 1)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let inserted = sqlx::query(
         "INSERT INTO oauth_clients (client_id, client_name, redirect_uris, created_at)
-         VALUES (?, ?, ?, ?)",
+         SELECT ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM oauth_clients) < ?",
     )
     .bind(&client.client_id)
     .bind(&client.client_name)
     .bind(serde_json::to_string(&client.redirect_uris).unwrap_or_default())
     .bind(Utc::now())
-    .execute(pool)
-    .await?;
-    Ok(())
+    .bind(max)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    tx.commit().await?;
+    Ok(inserted)
 }
 
-pub async fn count_clients(pool: &SqlitePool) -> AppResult<i64> {
-    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM oauth_clients")
-        .fetch_one(pool)
+/// Note that a registered client got tokens, which keeps it registered.
+pub async fn mark_client_used(conn: &mut SqliteConnection, client_id: &str) -> AppResult<()> {
+    sqlx::query("UPDATE oauth_clients SET used_at = ? WHERE client_id = ? AND used_at IS NULL")
+        .bind(Utc::now())
+        .bind(client_id)
+        .execute(&mut *conn)
         .await?;
-    Ok(count)
+    Ok(())
 }
 
 pub async fn get_client(pool: &SqlitePool, client_id: &str) -> AppResult<Option<RegisteredClient>> {
@@ -279,4 +322,84 @@ pub async fn purge_expired(pool: &SqlitePool) -> AppResult<()> {
         .execute(pool)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeDelta;
+
+    use super::*;
+
+    fn client(id: &str) -> RegisteredClient {
+        RegisteredClient {
+            client_id: id.into(),
+            client_name: None,
+            redirect_uris: vec!["https://app.example/cb".into()],
+        }
+    }
+
+    async fn ids(pool: &SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT client_id FROM oauth_clients ORDER BY created_at")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn registration_makes_room_from_unused_clients() {
+        let pool = crate::db::connect_memory().await;
+        let long_ago = Utc::now() - TimeDelta::days(1);
+        for id in ["a", "b", "c"] {
+            assert!(
+                insert_client(&pool, &client(id), 3, long_ago)
+                    .await
+                    .unwrap()
+            );
+        }
+        // A full table drops the oldest client that was never used.
+        assert!(
+            insert_client(&pool, &client("d"), 3, long_ago)
+                .await
+                .unwrap()
+        );
+        assert_eq!(ids(&pool).await, ["b", "c", "d"]);
+
+        // Clients in use, or with a sign-in under way, stay.
+        mark_client_used(&mut pool.acquire().await.unwrap(), "b")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO oauth_codes
+                 (code_hash, client_id, redirect_uri, code_challenge, \
+             resource, expires_at)
+             VALUES ('h', 'c', 'https://app.example/cb', 'x', 'r', ?)",
+        )
+        .bind(Utc::now())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            insert_client(&pool, &client("e"), 3, long_ago)
+                .await
+                .unwrap()
+        );
+        assert_eq!(ids(&pool).await, ["b", "c", "e"]);
+        mark_client_used(&mut pool.acquire().await.unwrap(), "e")
+            .await
+            .unwrap();
+        assert!(
+            !insert_client(&pool, &client("f"), 3, long_ago)
+                .await
+                .unwrap()
+        );
+
+        // Unused clients expire.
+        sqlx::query("DELETE FROM oauth_codes")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let later = Utc::now() + TimeDelta::seconds(1);
+        assert!(insert_client(&pool, &client("g"), 3, later).await.unwrap());
+        assert_eq!(ids(&pool).await, ["b", "e", "g"]);
+    }
 }

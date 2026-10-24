@@ -41,3 +41,17 @@ evicting old ones.
 * Keep no server-side state before the OIDC callback: put the PKCE verifier
   and nonce in a signed or encrypted login cookie. Or evict the oldest entry
   and cap entries per client IP.
+
+== Resolution
+
+*Dynamic client registration (fixed):* registered clients record when they
+first got tokens (`oauth_clients.used_at`, migration `0005_oauth_reuse.sql`,
+backfilled from existing tokens). Registration runs in one transaction that
+starts with a write. It drops clients that never got tokens, have no
+pending code and are older than 24 hours. When the table is still full,
+the oldest such unused clients make way, and the insert itself is
+conditional on the count. Registration now fails only when all 500 clients
+are in use, which needs 500 approvals with the admin token. Per-IP rate
+limiting was not added; see 030 for why.
+
+*Admin sign-in:* handled separately.

@@ -75,7 +75,10 @@ const ACCESS_TOKEN_TTL: TimeDelta = TimeDelta::hours(1);
 const REFRESH_TOKEN_TTL: TimeDelta = TimeDelta::days(30);
 const CODE_TTL: TimeDelta = TimeDelta::minutes(5);
 /// Dynamic registration needs no credentials; this bounds what it can fill.
+/// Clients that never got tokens make way for new ones.
 const MAX_REGISTERED_CLIENTS: i64 = 500;
+/// How long a registered client may go without getting tokens.
+const UNUSED_CLIENT_TTL: TimeDelta = TimeDelta::days(1);
 
 pub fn router() -> Router<AppState> {
     // Metadata, registration and the token endpoint are called from
@@ -227,20 +230,22 @@ async fn register(State(state): State<AppState>, body: Bytes) -> Response {
         .map(|name| name.trim().chars().take(100).collect::<String>())
         .filter(|name| !name.is_empty());
 
-    match store::count_clients(&state.pool).await {
-        Ok(count) if count >= MAX_REGISTERED_CLIENTS => {
-            return invalid("too many registered clients");
-        }
-        Ok(_) => {}
-        Err(err) => return server_error(&err),
-    }
     let client = store::RegisteredClient {
         client_id: uuid::Uuid::new_v4().to_string(),
         client_name,
         redirect_uris: registration.redirect_uris,
     };
-    if let Err(err) = store::insert_client(&state.pool, &client).await {
-        return server_error(&err);
+    match store::insert_client(
+        &state.pool,
+        &client,
+        MAX_REGISTERED_CLIENTS,
+        Utc::now() - UNUSED_CLIENT_TTL,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => return invalid("too many registered clients"),
+        Err(err) => return server_error(&err),
     }
     (
         StatusCode::CREATED,
@@ -727,6 +732,7 @@ async fn redeem_code(state: &AppState, request: &TokenRequest) -> Result<Respons
         return Err(err);
     }
 
+    store::mark_client_used(&mut tx, &stored.client_id).await?;
     let grant = store::TokenGrant {
         grant_id,
         client_id: stored.client_id,
