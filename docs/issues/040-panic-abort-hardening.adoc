@@ -1,13 +1,13 @@
 = 040: panic = "abort" turns any request-path panic into an outage
 :severity: Low
 :area: Build
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Build
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -29,3 +29,11 @@ case. Fuzzing the renderer found no panics.
 * Consider `panic = "unwind"` for the server binary, or make sure the
   service manager restarts it and that no persisted input can panic on
   every request.
+
+== Resolution
+
+The `deploy` profile no longer sets `panic = "abort"`, so panics unwind as
+in every other profile. A panic in a `spawn_blocking` task (images,
+`lol_html`, rendering, theme CSS) now ends as a `JoinError`: a 500 for that
+request, or the built-in theme for the stylesheet, while the server keeps
+running.
