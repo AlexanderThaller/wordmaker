@@ -50,9 +50,10 @@ async fn report(
             "days must be between 1 and {MAX_DAYS}"
         )));
     }
-    let report = analytics
-        .report(query.days)
-        .await
-        .map_err(|err| AppError::Unavailable(format!("cannot read analytics: {err:#}")))?;
+    let report = analytics.report(query.days).await.map_err(|err| {
+        // ClickHouse's answer can name hosts, tables and queries.
+        tracing::warn!(error = format!("{err:#}"), "cannot read analytics");
+        AppError::Unavailable("cannot read analytics; the server log has the details".into())
+    })?;
     Ok(Json(report))
 }

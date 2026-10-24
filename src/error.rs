@@ -58,6 +58,15 @@ impl AppError {
             }
         }
     }
+
+    /// What clients are told. Database, IO and internal errors can name
+    /// files, SQL or internals; their details only go to the log.
+    pub fn public_message(&self) -> String {
+        match self {
+            Self::Database(_) | Self::Io(_) | Self::Internal(_) => "internal error".to_owned(),
+            other => other.to_string(),
+        }
+    }
 }
 
 impl IntoResponse for AppError {
@@ -66,6 +75,23 @@ impl IntoResponse for AppError {
         if status.is_server_error() {
             tracing::error!(error = %self, "request failed");
         }
-        (status, Json(json!({ "error": self.to_string() }))).into_response()
+        (status, Json(json!({ "error": self.public_message() }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_details_stay_in_the_log() {
+        let err = AppError::Io(std::io::Error::other("/srv/wordmaker/media: disk full"));
+        assert_eq!(err.public_message(), "internal error");
+        let err = AppError::Database(sqlx::Error::Protocol("near \"SELEC\": syntax".into()));
+        assert_eq!(err.public_message(), "internal error");
+        assert_eq!(
+            AppError::NotFound("page 'x'".into()).public_message(),
+            "page 'x' not found"
+        );
     }
 }

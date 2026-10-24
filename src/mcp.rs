@@ -596,7 +596,7 @@ fn respond<T: Serialize>(result: AppResult<T>) -> Result<CallToolResult, ErrorDa
             if err.status().is_server_error() {
                 tracing::error!(error = %err, "tool call failed");
             }
-            Ok(error_result(err.to_string()))
+            Ok(error_result(err.public_message()))
         }
     }
 }
