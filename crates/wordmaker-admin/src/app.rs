@@ -146,7 +146,10 @@ pub fn router(admin: Admin) -> Router {
             auth::require_session,
         ))
         .merge(auth::router())
-        .layer(middleware::map_response(security_headers))
+        .layer(middleware::map_response_with_state(
+            admin.clone(),
+            security_headers,
+        ))
         .layer(middleware::from_fn_with_state(admin.clone(), check_host))
         .layer(TraceLayer::new_for_http())
         .with_state(admin)
@@ -227,8 +230,15 @@ async fn check_host(State(admin): State<Admin>, request: Request, next: Next) ->
     }
 }
 
-async fn security_headers(mut response: Response) -> Response {
+async fn security_headers(State(admin): State<Admin>, mut response: Response) -> Response {
     let headers = response.headers_mut();
+    // Reached over https, it stays there; cookies are `Secure` then.
+    if admin.auth.as_ref().is_some_and(Auth::https) {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000"),
+        );
+    }
     if !headers.contains_key(header::CONTENT_SECURITY_POLICY) {
         headers.insert(
             header::CONTENT_SECURITY_POLICY,

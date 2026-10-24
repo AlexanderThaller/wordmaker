@@ -99,6 +99,8 @@ use crate::{
     token::read_secret_file,
 };
 
+/// Cookie names; over https they carry the `__Host-` prefix, so the browser
+/// only takes them from this host, never from a sibling subdomain.
 const SESSION_COOKIE: &str = "wordmaker_admin_session";
 /// Ties a callback to the browser that started the sign-in, so nobody can
 /// sign someone else in to their own account. One per sign-in, named
@@ -339,8 +341,24 @@ impl Auth {
         move |request| Box::pin(send(client.clone(), request))
     }
 
-    fn secure_cookies(&self) -> bool {
+    /// Whether the browser reaches the interface over https.
+    pub fn https(&self) -> bool {
         self.0.config.public_url.scheme() == "https"
+    }
+
+    /// `name` as the cookie is called here.
+    fn cookie_name(&self, name: &str) -> String {
+        if self.https() {
+            format!("__Host-{name}")
+        } else {
+            name.to_owned()
+        }
+    }
+
+    /// The login cookie's name for the sign-in `state`; `None` for a state
+    /// this interface would not have made.
+    fn login_cookie(&self, state: &str) -> Option<String> {
+        login_cookie(state).map(|name| self.cookie_name(&name))
     }
 
     fn allowed(&self, email: &str) -> bool {
@@ -358,7 +376,7 @@ impl Auth {
 
     /// The user a session cookie belongs to, if it is still good.
     fn user(&self, jar: &CookieJar) -> Option<User> {
-        let id = jar.get(SESSION_COOKIE)?.value();
+        let id = jar.get(&self.cookie_name(SESSION_COOKIE))?.value();
         let mut sessions = lock(&self.0.sessions);
         match sessions.get(id) {
             Some(session) if session.expires > Instant::now() => Some(session.user.clone()),
@@ -389,14 +407,18 @@ impl Auth {
         Cookie::build((name.into(), value))
             .path("/")
             .http_only(true)
-            .secure(self.secure_cookies())
+            .secure(self.https())
             .same_site(SameSite::Lax)
             .max_age(max_age.try_into().unwrap_or(cookie::time::Duration::ZERO))
             .build()
     }
 
-    fn removal(name: impl Into<String>) -> Cookie<'static> {
-        Cookie::build((name.into(), "")).path("/").build()
+    fn removal(&self, name: impl Into<String>) -> Cookie<'static> {
+        // A `__Host-` cookie is only replaced by one that is `Secure` too.
+        Cookie::build((name.into(), ""))
+            .path("/")
+            .secure(self.https())
+            .build()
     }
 
     fn login_mac(&self, state: &str, login: &PendingLogin) -> Hmac<Sha256> {
@@ -450,8 +472,8 @@ impl Auth {
     }
 }
 
-/// The login cookie's name for the sign-in `state`; `None` for a state
-/// this interface would not have made.
+/// The login cookie's name for the sign-in `state` without a prefix;
+/// `None` for a state this interface would not have made.
 fn login_cookie(state: &str) -> Option<String> {
     let made_here = !state.is_empty()
         && state.len() <= 64
@@ -569,7 +591,7 @@ async fn login(State(admin): State<Admin>, jar: CookieJar) -> Response {
         .set_pkce_challenge(pkce_challenge)
         .url();
 
-    let Some(name) = login_cookie(state.secret()) else {
+    let Some(name) = auth.login_cookie(state.secret()) else {
         return page(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Sign-in unavailable",
@@ -602,18 +624,21 @@ async fn callback(
     let Some(auth) = &admin.auth else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let name = params.state.as_deref().and_then(login_cookie);
+    let name = params
+        .state
+        .as_deref()
+        .and_then(|state| auth.login_cookie(state));
     let finished = finish_login(auth, &jar, name.as_deref(), params).await;
     // The sign-in is over either way.
     let jar = match name {
-        Some(name) if jar.get(&name).is_some() => jar.remove(Auth::removal(name)),
+        Some(name) if jar.get(&name).is_some() => jar.remove(auth.removal(name)),
         _ => jar,
     };
     match finished {
         Ok(user) => {
             tracing::info!(user = %user.0, "signed in");
             let session = auth.start_session(user);
-            let jar = jar.add(auth.cookie(SESSION_COOKIE, session, SESSION_TTL));
+            let jar = jar.add(auth.cookie(auth.cookie_name(SESSION_COOKIE), session, SESSION_TTL));
             (jar, Redirect::to("/")).into_response()
         }
         Err(Refusal(status, message)) => {
@@ -736,14 +761,14 @@ async fn logout(State(admin): State<Admin>, headers: HeaderMap, jar: CookieJar) 
             &format!("signing out needs the {API_GUARD_HEADER} header"),
         );
     }
-    if let (Some(auth), Some(session)) = (&admin.auth, jar.get(SESSION_COOKIE)) {
+    let Some(auth) = &admin.auth else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    let name = auth.cookie_name(SESSION_COOKIE);
+    if let Some(session) = jar.get(&name) {
         lock(&auth.0.sessions).remove(session.value());
     }
-    (
-        jar.remove(Auth::removal(SESSION_COOKIE)),
-        StatusCode::NO_CONTENT,
-    )
-        .into_response()
+    (jar.remove(auth.removal(name)), StatusCode::NO_CONTENT).into_response()
 }
 
 async fn signed_out() -> Response {
@@ -1189,6 +1214,36 @@ mod tests {
         );
         assert_eq!(login_cookie(""), None);
         assert_eq!(login_cookie("a=b"), None);
+    }
+
+    #[tokio::test]
+    async fn over_https_cookies_are_host_only() {
+        let issuer = fake_provider().await;
+        let config = OidcArgs {
+            public_url: Some("https://localhost:3001".into()),
+            ..args(&issuer)
+        };
+        let auth = Auth::new(config.resolve().unwrap().unwrap()).await.unwrap();
+        let app = app::router(Admin {
+            upstream: Upstream::new("http://127.0.0.1:9", "secret".into()).unwrap(),
+            allowed_hosts: vec!["localhost".to_owned()].into(),
+            auth: Some(auth),
+        });
+
+        let login = call(&app, Method::GET, "/auth/login", None).await;
+        assert_eq!(login.status, StatusCode::SEE_OTHER, "{}", login.body);
+        assert_eq!(
+            login.headers[header::STRICT_TRANSPORT_SECURITY],
+            "max-age=31536000"
+        );
+        let set_cookie = login.headers[header::SET_COOKIE].to_str().unwrap();
+        assert!(
+            set_cookie.starts_with(&format!("__Host-{LOGIN_COOKIE}_")),
+            "{set_cookie}"
+        );
+        assert!(set_cookie.contains("Secure"), "{set_cookie}");
+        assert!(set_cookie.contains("Path=/"), "{set_cookie}");
+        assert!(!set_cookie.contains("Domain"), "{set_cookie}");
     }
 
     #[tokio::test]
