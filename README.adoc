@@ -226,6 +226,8 @@ When the server is not reached through `localhost`, set `WORDMAKER_BASE_URL` (or
 `upload_media`, `list_media`, `delete_media`, `get_settings`, `set_settings`,
 `list_themes`, `get_theme`, `read_theme_file`, `write_theme_file`, `install_theme`, `activate_theme`, `delete_theme`.
 
+A tool call's arguments may be up to 2 MiB, like a REST API request; only `upload_media` takes up to `WORDMAKER_MAX_UPLOAD`, as base64 (standard or URL-safe, padding and line breaks optional).
+
 === Command line client
 
 Agents that can run shell commands but have no MCP support can use `wordmaker client`, which talks to the `/mcp` endpoint of a running server.
