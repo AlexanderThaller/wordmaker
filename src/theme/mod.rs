@@ -309,6 +309,9 @@ pub async fn read_file(themes_dir: &Path, slug: &str, path: &str) -> AppResult<T
     let file = theme_file_path(&dir, path)?;
     let path = path.to_owned();
     blocking(move || {
+        if file.is_dir() {
+            return Err(AppError::BadRequest(format!("'{path}' is a folder")));
+        }
         let bytes = match std::fs::read(&file) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1132,6 +1135,15 @@ mod tests {
             assert!(err.contains("http or https"), "{url}: {err}");
         }
         assert!(download("not a url").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn reading_a_folder_is_a_bad_request() {
+        let themes = temp_themes();
+        write_theme(&themes, "t", "{}");
+        let err = read_file(&themes, "t", "styles").await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)), "{err}");
+        std::fs::remove_dir_all(&themes).unwrap();
     }
 
     #[test]

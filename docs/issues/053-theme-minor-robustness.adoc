@@ -1,13 +1,13 @@
 = 053: Minor theme robustness issues
 :severity: Low
 :area: Themes
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Themes
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -30,3 +30,13 @@ Small correctness gaps in the theme code.
 
 * Return 400 for directories, compare schemes case-insensitively, and
   validate hex digits (see link:004-luminance-panic-crash-loop.adoc[issue 4]).
+
+== Resolution
+
+* `read_file` on a folder returns 400 ("is a folder"), as `write_file`
+  already did.
+* `install_from_url` parses the URL with `url::Url`, which lowercases the
+  scheme, so `HTTPS://` is accepted (done with
+  link:006-install-theme-ssrf.adoc[issue 6]).
+* `luminance` requires ASCII hex digits, so `#+f+f+f` is no longer a colour
+  (done with link:004-luminance-panic-crash-loop.adoc[issue 4]).
