@@ -1,13 +1,13 @@
 = 055: Token endpoint details
 :severity: Info
 :area: OAuth
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Info
 Area:: OAuth
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -34,3 +34,19 @@ Minor deviations, mostly mitigated by mandatory PKCE.
 * Require `redirect_uri` when it was sent at authorize, validate the
   verifier charset, match the scheme case-insensitively, return OAuth JSON
   errors, and purge on a timer.
+
+== Resolution
+
+All five points are addressed:
+
+* Codes record whether the authorization request named `redirect_uri`
+  (`oauth_codes.redirect_uri_sent`, in `0005_oauth_reuse.sql`). If it did,
+  the token request must repeat it.
+* `code_verifier` must be 43 to 128 unreserved characters
+  (`A-Z a-z 0-9 - . _ ~`).
+* The `Bearer` scheme is matched case-insensitively, and extra spaces
+  before the token are allowed.
+* `/oauth/token` and `/oauth/revoke` answer a missing or malformed form
+  body with an OAuth `invalid_request` JSON error.
+* Expired codes and tokens are purged every ten minutes by a task that
+  `serve` starts, instead of on every token request.

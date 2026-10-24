@@ -106,12 +106,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Client(args) => client::run(&cli.config, args).await,
         Command::Geoip(args) => analytics::download::run(&args).await,
         Command::Token => {
-            let token = format!(
-                "{}{}",
-                uuid::Uuid::new_v4().simple(),
-                uuid::Uuid::new_v4().simple()
-            );
-            println!("{token}");
+            println!("{}", token::generate());
             Ok(())
         }
     }
@@ -121,11 +116,13 @@ async fn serve(config: Config, args: ServeArgs) -> anyhow::Result<()> {
     let token = args
         .token
         .require("; generate one with `wordmaker token`")?;
+    token::check_strength(&token)?;
     let bind = args
         .bind
         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 3000)));
 
     let pool = db::connect(&config.database_url).await?;
+    oauth::spawn_purge(pool.clone());
     let mut allowed_hosts: Vec<String> = ["localhost", "127.0.0.1", "::1"]
         .into_iter()
         .map(str::to_owned)
@@ -142,6 +139,7 @@ async fn serve(config: Config, args: ServeArgs) -> anyhow::Result<()> {
         images: Arc::default(),
         renders: Arc::default(),
         oauth_clients: Arc::default(),
+        guesses: Arc::default(),
         analytics,
     };
     let router = app::router(state, allowed_hosts);
@@ -196,17 +194,37 @@ async fn mcp_stdio(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `https://example.com:8443/x` yields `example.com:8443` and `example.com`.
+/// `https://example.com:8443/x` yields `example.com:8443` and `example.com`;
+/// without an explicit port only the host is returned.
 fn base_url_hosts(base_url: &str) -> Vec<String> {
-    let rest = base_url
-        .split_once("://")
-        .map_or(base_url, |(_, rest)| rest);
-    let authority = rest.split('/').next().unwrap_or_default();
-    if authority.is_empty() {
+    let Ok(url) = url::Url::parse(base_url) else {
         return Vec::new();
+    };
+    let Some(host) = url.host_str() else {
+        return Vec::new();
+    };
+    match url.port() {
+        Some(port) => vec![format!("{host}:{port}"), host.to_owned()],
+        None => vec![host.to_owned()],
     }
-    let host = authority
-        .rsplit_once(':')
-        .map_or(authority, |(host, _)| host);
-    vec![authority.to_owned(), host.to_owned()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hosts_from_base_url() {
+        assert_eq!(
+            base_url_hosts("https://example.com:8443/x"),
+            ["example.com:8443", "example.com"]
+        );
+        assert_eq!(base_url_hosts("https://Example.com/"), ["example.com"]);
+        assert_eq!(base_url_hosts("http://[::1]:3000"), ["[::1]:3000", "[::1]"]);
+        assert_eq!(
+            base_url_hosts("https://user:pw@example.com"),
+            ["example.com"]
+        );
+        assert_eq!(base_url_hosts("not a url"), Vec::<String>::new());
+    }
 }

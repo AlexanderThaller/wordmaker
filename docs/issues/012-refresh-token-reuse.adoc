@@ -1,13 +1,13 @@
 = 012: Refresh token reuse is not detected and refresh is not atomic
 :severity: Medium
 :area: OAuth
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Medium
 Area:: OAuth
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -37,3 +37,15 @@ unknown one.
   inside the issuing transaction.
 * Keep used refresh hashes (e.g. a `used` flag) until the grant expires; on
   reuse, revoke the whole grant.
+
+== Resolution
+
+* A refresh token is used up with a single
+  `+UPDATE ... SET used = 1 WHERE ... AND used = 0 RETURNING ...+` in the
+  same transaction that issues its successors, so of two concurrent
+  refreshes only one succeeds.
+* Used refresh tokens stay in `oauth_tokens` (new `used` column, migration
+  `0005_oauth_reuse.sql`) until they expire. Presenting one again revokes
+  every token of its grant and logs a warning.
+* A refresh token presented with the wrong `client_id`, or for the wrong
+  resource, is left unused.

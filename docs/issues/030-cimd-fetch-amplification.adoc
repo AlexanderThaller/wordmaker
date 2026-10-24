@@ -1,13 +1,13 @@
 = 030: Anonymous client metadata fetches: no negative cache, full cache stops caching
 :severity: Low
 :area: OAuth
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: OAuth
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -29,3 +29,18 @@ valid entries fill the cache nothing new is cached.
 
 * Add a negative cache, per-IP limits and LRU eviction.
 * Use a generic error message.
+
+== Resolution
+
+* Failed fetches are cached for a minute, successful ones for ten.
+* When the cache (now 256 entries) is full, the oldest entry is dropped
+  instead of nothing new being cached.
+* At most four fetches run at once; further requests are refused without
+  a fetch.
+* Fetch failures (resolution, non-public address, connection, HTTP status,
+  size) are logged and shown only as a generic "could not be fetched".
+  Errors in the document itself are still reported in detail.
+
+No per-IP limit was added: the server does not reliably know the client
+address behind a proxy (see 018). The concurrency cap bounds the
+amplification instead.
