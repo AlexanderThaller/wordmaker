@@ -897,6 +897,7 @@ mod tests {
             token: "admin-secret".into(),
             themes: Arc::default(),
             images: Arc::default(),
+            renders: Arc::default(),
             oauth_clients: Arc::default(),
             analytics: None,
         };

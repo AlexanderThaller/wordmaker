@@ -4,7 +4,9 @@ use std::{
 };
 
 use sqlx::{
+    Sqlite,
     SqlitePool,
+    Transaction,
     sqlite::{
         SqliteConnectOptions,
         SqliteJournalMode,
@@ -26,6 +28,14 @@ pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
 
     sqlx::migrate!().run(&pool).await?;
     Ok(pool)
+}
+
+/// A transaction that holds the write lock from the start. A deferred
+/// `BEGIN` that reads first fails at once with "database is locked" when it
+/// later writes after another connection committed; the busy timeout does
+/// not apply then. Use this for every transaction that reads and then writes.
+pub async fn begin_write(pool: &SqlitePool) -> sqlx::Result<Transaction<'static, Sqlite>> {
+    pool.begin_with("BEGIN IMMEDIATE").await
 }
 
 /// A fresh in-memory database. Limited to one connection, since every

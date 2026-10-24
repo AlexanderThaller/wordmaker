@@ -270,10 +270,14 @@ curl -H "Authorization: Bearer $WORDMAKER_TOKEN" -H 'content-type: application/j
 
 * The page title is rendered as the heading, so start the body with `==` sections rather than a `= Title` line.
 * Reference uploaded images by their path: `image::/media/1a2b3c4d-logo.png[Logo]`.
+Images (SVG included), fonts, audio, video, CSS, plain text and PDFs open in the browser; other uploads, such as HTML, download instead.
+Media and theme files never run scripts on the site: opened on their own they are sandboxed, PDFs aside, which browsers show in their own viewer.
 * Link to other pages with `link:/about[About]`.
 * Changing a published page with `PATCH` changes the site at once.
 To prepare changes first, save them as a draft (`PUT /pages/{slug}/draft`): the site keeps showing the published version until the page is published again, which makes the draft live as a new revision.
-* Only published pages are visible on the site. `/` shows the page chosen as `home_slug`, or a list of all published pages.
+While a draft is pending, `PATCH` and restoring a revision refuse to change title or body (409), since publishing would replace them; change the draft instead, or discard it first.
+* Only published pages are visible on the site. `/` shows the page chosen as `home_slug`, or a list of all published pages while there is none or it is not published.
+`home_slug` must name an existing page; it follows the page when its slug changes and is cleared when the page is deleted.
 * Published pages appear in the header navigation, ordered by `nav_order` then title; set `in_nav` to false to leave one out.
 
 == Themes

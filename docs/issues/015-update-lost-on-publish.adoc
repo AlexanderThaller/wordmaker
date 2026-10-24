@@ -1,13 +1,13 @@
 = 015: Live edits made while a draft is pending are reverted by the next publish
 :severity: Low
 :area: Pages
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Pages
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -36,3 +36,19 @@ The admin UI avoids this; the API and MCP tools do not.
 * In `update()`, clear the draft or refuse with 409 when title or body
   change and a draft exists.
 * Or make `restore_revision` write into the draft when one is pending.
+
+== Resolution
+
+`update()` now answers 409 Conflict when it would change title or body
+while a draft is pending; slug and navigation changes still apply at once,
+and so does an update that leaves title and body as they are.
+`restore_revision` goes through `update()` and is refused the same way.
+
+Refusing rather than clearing the draft matches how the MCP instructions
+and the README separate the two: `update_page` changes the live page,
+`save_draft` prepares changes for the next publish. Clearing would
+silently throw away drafted work instead of the live edit. The admin UI
+is unaffected: once a page has a draft it saves title and body there.
+The error, the `update_page` and `restore_revision` tool descriptions,
+the MCP instructions and the README say to use the draft or discard it
+first.

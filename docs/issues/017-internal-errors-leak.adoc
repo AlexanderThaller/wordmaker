@@ -1,13 +1,13 @@
 = 017: 5xx responses expose raw database, IO and ClickHouse error text
 :severity: Low
 :area: API
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: API
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -29,3 +29,11 @@ internals in error responses.
 == Suggested fix
 
 * Log the details and return a generic message for 5xx responses.
+
+== Resolution
+
+`AppError::public_message` replaces the text of `Database`, `Io` and
+`Internal` errors with `internal error`; the API and the MCP tool results
+use it, and the full error still goes to the log. The analytics report
+logs the ClickHouse error chain and tells the client only that analytics
+cannot be read.

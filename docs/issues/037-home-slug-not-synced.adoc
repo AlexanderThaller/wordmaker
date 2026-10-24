@@ -1,13 +1,13 @@
 = 037: home_slug is not kept in step with page renames and deletes
 :severity: Low
 :area: Settings / site
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Settings / site
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -31,3 +31,12 @@ does not exist or is unpublished, leaves the setting dangling.
 * Update or clear `home_slug` on rename and delete.
 * Validate the page when the setting is saved.
 * Fall back to the page list when the home page is missing.
+
+== Resolution
+
+* Changing a page's slug moves `home_slug` along in the same transaction,
+  and deleting the page clears it (`settings::move_home`).
+* Saving `home_slug` checks that the page exists (400 otherwise). A draft
+  is still accepted, as the admin UI offers drafts for it.
+* `/` falls back to the list of published pages when the home page is not
+  published, and the sitemap then dates `/` like that list.

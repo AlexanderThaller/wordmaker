@@ -1,13 +1,13 @@
 = 038: Every public request re-renders AsciiDoc and the footer
 :severity: Low
 :area: Site rendering
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Low
 Area:: Site rendering
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -29,3 +29,22 @@ than a vulnerability.
 
 * Cache rendered HTML keyed by page id, `updated_at` and settings version.
 * Look the page up before building the frame, so 404s are cheap.
+
+== Resolution
+
+`site::RenderCache` (in `AppState::renders`) keeps rendered page bodies,
+with images already rewritten, and the rendered footer. It is keyed by a
+SHA-256 of what the HTML is made from, not by page id and `updated_at`:
+the body plus the theme's content and wide widths for pages, the footer
+text for the footer. An edit, a restored revision, a published draft, a
+new footer or a theme with other widths therefore misses by itself, with
+no invalidation to forget. Title, navigation, settings and the
+stylesheet are still read for every request; they are cheap, and the
+stylesheet has its own cache. Previews are never cached.
+
+The cache is bounded at 512 entries and 64 MiB, evicts the least
+recently used entry, and skips any single entry over 8 MiB.
+
+A page URL now looks the page up before building the frame, so a 404
+costs one query. `/` reads the settings once and reuses them for the
+frame.
