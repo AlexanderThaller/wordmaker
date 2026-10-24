@@ -394,6 +394,9 @@ $("#toggle-sidebar").addEventListener("click", toggleSidebar);
 
 const hasDraft = (page) => page.draft_body != null;
 
+/** Whether `page` is still the one open, after waiting on the server. */
+const stillOpen = (page) => state.current?.id === page.id;
+
 /** Whether saving keeps title and body as a draft rather than changing the page. */
 function savesDraft(page) {
   // Servers from before drafts send no draft fields; they change the page.
@@ -482,10 +485,13 @@ function updateDirty() {
     label.textContent = state.current ? `Saved ${ago(state.current.updated_at)}` : "";
     label.className = "save-state";
   }
-  // Nothing to publish on a published page without changes.
+  // Nothing to publish on a published page without changes, and nothing
+  // to send twice while a save is under way.
   const current = state.current;
+  $("#save").disabled = state.saving;
   $("#publish").disabled =
-    !!current && savesDraft(current) && current.status === "published" && !hasDraft(current) && !isDirty();
+    state.saving ||
+    (!!current && savesDraft(current) && current.status === "published" && !hasDraft(current) && !isDirty());
 }
 
 for (const input of Object.values(fields)) {
@@ -497,6 +503,9 @@ for (const input of Object.values(fields)) {
 
 /** Saves the draft; resolves to whether everything is saved now. */
 async function save() {
+  // A second Ctrl+S would send the same changes again, to a slug that may
+  // be gone by then.
+  if (state.saving) return false;
   const update = changes();
   if (!Object.keys(update).length) return true;
   if (update.title === "") {
@@ -505,18 +514,19 @@ async function save() {
   }
   state.saving = true;
   updateDirty();
-  const before = state.current.slug;
-  const drafting = savesDraft(state.current);
+  const target = state.current;
+  const before = target.slug;
+  const drafting = savesDraft(target);
   const content = Object.fromEntries(
     Object.entries(update).filter(([key]) => drafting && (key === "title" || key === "body")),
   );
   const direct = Object.fromEntries(Object.entries(update).filter(([key]) => !(key in content)));
 
-  let page = state.current;
+  let page = target;
   let ok = true;
   if (Object.keys(direct).length) {
     page = (await attempt(() => api("PATCH", pagePath(before), direct))) ?? page;
-    ok = page !== state.current;
+    ok = page !== target;
   }
   if (ok && Object.keys(content).length) {
     const drafted = await attempt(() => api("PUT", `${pagePath(page.slug)}/draft`, content));
@@ -524,11 +534,28 @@ async function save() {
     page = drafted ?? page;
   }
   state.saving = false;
-  // The editor and title keep what is in them: anything typed while saving,
+  if (!stillOpen(target)) {
+    // Another page was opened meanwhile; the form is that page's now.
+    updateDirty();
+    if (ok) {
+      loadPages();
+      toast(`Saved “${page.title}”`);
+    }
+    return false;
+  }
+  // The form and editor keep what is in them: anything typed while saving,
   // or not saved, stays a change.
-  const typed = fields.title.value;
+  const typed = {
+    title: fields.title.value,
+    slug: fields.slug.value,
+    inNav: fields.inNav.checked,
+    navOrder: fields.navOrder.value,
+  };
   if (page !== state.current) show(page);
-  fields.title.value = typed;
+  fields.title.value = typed.title;
+  fields.slug.value = typed.slug;
+  fields.inNav.checked = typed.inNav;
+  fields.navOrder.value = typed.navOrder;
   updateDirty();
   if (page.slug !== before) history.replaceState(null, "", `#/pages/${page.slug}`);
   if (!ok) return false;
@@ -549,9 +576,15 @@ $("#publish").addEventListener("click", async () => {
   const current = state.current;
   if (current.status === "published" && !("draft_body" in current)) return unpublish();
   if (!(await save())) return;
-  const wasPublished = state.current.status === "published";
-  const page = await attempt(() => api("POST", `${pagePath(state.current.slug)}/publish`));
+  const saved = state.current;
+  const wasPublished = saved.status === "published";
+  const page = await attempt(() => api("POST", `${pagePath(saved.slug)}/publish`));
   if (!page) return;
+  if (!stillOpen(saved)) {
+    loadPages();
+    toast(`Published “${page.title}”`);
+    return;
+  }
   show(page);
   if (!$("#history").hidden) loadRevisions();
   loadPages();
@@ -569,7 +602,7 @@ async function unpublish() {
   if (!sure) return;
   const updated = await attempt(() => api("POST", `${pagePath(page.slug)}/unpublish`));
   if (!updated) return;
-  show(updated);
+  if (stillOpen(page)) show(updated);
   loadPages();
   toast("Unpublished");
 }
@@ -587,8 +620,10 @@ $("#discard-draft").addEventListener("click", async () => {
   if (!sure) return;
   const updated = await attempt(() => api("DELETE", `${pagePath(page.slug)}/draft`));
   if (!updated) return;
-  show(updated, { body: true });
-  refreshPreview(0);
+  if (stillOpen(page)) {
+    show(updated, { body: true });
+    refreshPreview(0);
+  }
   loadPages();
   toast("Draft discarded");
 });
@@ -604,9 +639,11 @@ $("#delete-page").addEventListener("click", async () => {
   if (!sure) return;
   const done = await attempt(() => api("DELETE", pagePath(page.slug)));
   if (done === undefined) return;
-  state.current = null;
-  showPageEditor(false);
-  history.replaceState(null, "", "#/pages");
+  if (stillOpen(page)) {
+    state.current = null;
+    showPageEditor(false);
+    history.replaceState(null, "", "#/pages");
+  }
   await loadPages();
   toast(`Deleted “${page.title}”`);
 });
