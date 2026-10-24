@@ -26,6 +26,7 @@ use rmcp::transport::streamable_http_server::{
 };
 use sqlx::SqlitePool;
 use subtle::ConstantTimeEq;
+use tokio_util::sync::CancellationToken;
 use tower_http::{
     compression::CompressionLayer,
     trace::TraceLayer,
@@ -55,13 +56,20 @@ pub struct AppState {
     pub analytics: Option<Analytics>,
 }
 
-/// The whole application: public site, `/api/v1` and `/mcp`.
-pub fn router(state: AppState, mcp_allowed_hosts: Vec<String>) -> Router {
+/// The whole application: public site, `/api/v1` and `/mcp`. Cancelling
+/// `shutdown` ends the MCP sessions and their event streams, which would
+/// otherwise keep a graceful shutdown waiting forever.
+pub fn router(
+    state: AppState,
+    mcp_allowed_hosts: Vec<String>,
+    shutdown: CancellationToken,
+) -> Router {
     let mcp = {
         let pool = state.pool.clone();
         let config = state.config.clone();
         let mut mcp_config = StreamableHttpServerConfig::default();
         mcp_config.allowed_hosts = mcp_allowed_hosts;
+        mcp_config.cancellation_token = shutdown;
         mcp_config.max_request_body_bytes = state.config.max_upload_bytes * 2;
         StreamableHttpService::new(
             move || Ok(WordMakerMcp::new(pool.clone(), config.clone())),
@@ -166,6 +174,10 @@ mod tests {
     }
 
     async fn app_with(analytics: Option<Analytics>) -> Router {
+        app_until(analytics, CancellationToken::new()).await
+    }
+
+    async fn app_until(analytics: Option<Analytics>, shutdown: CancellationToken) -> Router {
         let config = Config {
             database_url: String::new(),
             media_dir: std::env::temp_dir().join("wordmaker-app-test"),
@@ -185,7 +197,7 @@ mod tests {
             oauth_clients: Arc::default(),
             analytics,
         };
-        router(state, vec!["localhost".into()])
+        router(state, vec!["localhost".into()], shutdown)
     }
 
     async fn send(
@@ -281,7 +293,7 @@ mod tests {
         ]);
         let (analytics, sink) = args
             .analytics
-            .start("http://localhost:3000")
+            .start("http://localhost:3000", CancellationToken::new())
             .unwrap()
             .unwrap();
         let app = app_with(Some(analytics)).await;
@@ -318,6 +330,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn mcp_request(method: Method, session: Option<&str>, body: Option<Value>) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(method)
+            .uri("/mcp")
+            .header("host", "localhost")
+            .header("authorization", "Bearer secret")
+            .header("accept", "application/json, text/event-stream");
+        if let Some(session) = session {
+            request = request.header("mcp-session-id", session);
+        }
+        match body {
+            Some(json) => request
+                .header("content-type", "application/json")
+                .body(Body::from(json.to_string())),
+            None => request.body(Body::empty()),
+        }
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn shutdown_ends_mcp_event_streams() {
+        let shutdown = CancellationToken::new();
+        let app = app_until(None, shutdown.clone()).await;
+        let initialize = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1" }
+            }
+        });
+        let response = app
+            .clone()
+            .oneshot(mcp_request(Method::POST, None, Some(initialize)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session = response.headers()["mcp-session-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        response.into_body().collect().await.unwrap();
+        let initialized = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+        app.clone()
+            .oneshot(mcp_request(Method::POST, Some(&session), Some(initialized)))
+            .await
+            .unwrap();
+
+        // The stream a client keeps open for server messages.
+        let response = app
+            .oneshot(mcp_request(Method::GET, Some(&session), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        // Past the priming event it stays open, waiting for server messages.
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(300), body.frame()).await {
+                Err(_) => break,
+                Ok(Some(Ok(_))) => {}
+                ended => panic!("the stream ended: {ended:?}"),
+            }
+        }
+
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), body.collect())
+            .await
+            .expect("the stream ends on shutdown")
+            .ok();
     }
 
     #[tokio::test]

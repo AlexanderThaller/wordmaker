@@ -897,7 +897,11 @@ mod tests {
             oauth_clients: Arc::default(),
             analytics: None,
         };
-        crate::app::router(state, vec!["site.example".into()])
+        crate::app::router(
+            state,
+            vec!["site.example".into()],
+            tokio_util::sync::CancellationToken::new(),
+        )
     }
 
     struct Reply {

@@ -28,6 +28,7 @@ use tokio::{
     sync::mpsc,
     time::Instant,
 };
+use tokio_util::sync::CancellationToken;
 
 use super::{
     Hit,
@@ -167,6 +168,9 @@ pub struct Sink {
     hits: mpsc::Receiver<Hit>,
     /// Hits the request side could not queue.
     dropped: Arc<AtomicU64>,
+    /// Stops taking hits even while handles remain, e.g. held by
+    /// connections a shutdown gave up waiting for.
+    stop: CancellationToken,
     salt: DailySalt,
     buffer: VecDeque<PageView>,
     /// [`PageView::size`] of everything in `buffer`.
@@ -184,6 +188,7 @@ impl Sink {
         geo: Geo,
         hits: mpsc::Receiver<Hit>,
         dropped: Arc<AtomicU64>,
+        stop: CancellationToken,
     ) -> Self {
         Self {
             client,
@@ -191,6 +196,7 @@ impl Sink {
             geo,
             hits,
             dropped,
+            stop,
             salt: DailySalt::default(),
             buffer: VecDeque::new(),
             buffer_bytes: 0,
@@ -200,8 +206,8 @@ impl Sink {
         }
     }
 
-    /// Runs until every [`super::Analytics`] handle is gone, then writes
-    /// what is left.
+    /// Runs until every [`super::Analytics`] handle is gone or `stop` is
+    /// cancelled, then writes what is left.
     pub async fn run(mut self) {
         // Fail early in the log if ClickHouse is misconfigured; page views
         // are buffered either way.
@@ -212,8 +218,14 @@ impl Sink {
         let mut next_flush = Instant::now() + FLUSH_INTERVAL;
         let mut geo_check = tokio::time::interval_at(Instant::now() + GEO_CHECK, GEO_CHECK);
         geo_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let stop = self.stop.clone();
         loop {
             tokio::select! {
+                // Takes what is queued already, then ends the loop below.
+                () = stop.cancelled(), if !self.hits.is_closed() => {
+                    self.hits.close();
+                    continue;
+                }
                 hit = self.hits.recv() => {
                     let Some(hit) = hit else { break };
                     let view = self.enrich(hit);
@@ -515,6 +527,7 @@ mod tests {
             Geo::default(),
             rx,
             Arc::default(),
+            CancellationToken::new(),
         );
         (sink, tx)
     }
@@ -808,6 +821,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(other.views, 0, "sites sharing the table stay apart");
+    }
+
+    #[tokio::test]
+    async fn stops_and_writes_when_told_although_handles_remain() {
+        let mock = Mock::new();
+        mock.add(handlers::record_ddl());
+        let recording = mock.add(handlers::record::<PageView>());
+        let (tx, rx) = mpsc::channel(16);
+        let stop = CancellationToken::new();
+        let sink = Sink::new(
+            clickhouse::Client::default().with_mock(&mock),
+            "https://site.example",
+            Geo::default(),
+            rx,
+            Arc::default(),
+            stop.clone(),
+        );
+        let task = tokio::spawn(sink.run());
+
+        tx.send(hit(Utc::now())).await.unwrap();
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("stopped")
+            .unwrap();
+        let rows: Vec<PageView> = recording.collect().await;
+        assert_eq!(rows.len(), 1, "wrote what was queued");
+        assert!(tx.send(hit(Utc::now())).await.is_err(), "takes no more");
     }
 
     #[tokio::test]

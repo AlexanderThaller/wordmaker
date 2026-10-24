@@ -36,6 +36,7 @@ use tokio::{
     sync::mpsc,
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::token::read_secret;
 
@@ -119,8 +120,14 @@ impl AnalyticsArgs {
     }
 
     /// Starts the sink if analytics is configured. `site` tags every page
-    /// view, so instances sharing a database can be told apart.
-    pub fn start(&self, site: &str) -> anyhow::Result<Option<(Analytics, JoinHandle<()>)>> {
+    /// view, so instances sharing a database can be told apart. The sink
+    /// stops once every [`Analytics`] handle is gone, or when `stop` is
+    /// cancelled, writing what it has either way.
+    pub fn start(
+        &self,
+        site: &str,
+        stop: CancellationToken,
+    ) -> anyhow::Result<Option<(Analytics, JoinHandle<()>)>> {
         let Some(url) = &self.clickhouse_url else {
             return Ok(None);
         };
@@ -140,7 +147,13 @@ impl AnalyticsArgs {
             redact(url),
             self.clickhouse_database
         );
-        Ok(Some(Analytics::start(client, site, geo, self.proxy_hops)))
+        Ok(Some(Analytics::start(
+            client,
+            site,
+            geo,
+            self.proxy_hops,
+            stop,
+        )))
     }
 }
 
@@ -179,12 +192,13 @@ impl Analytics {
         site: &str,
         geo: geo::Geo,
         proxy_hops: usize,
+        stop: CancellationToken,
     ) -> (Self, JoinHandle<()>) {
         let (queue, hits) = mpsc::channel(QUEUE);
         let dropped = Arc::default();
         let site = site.trim_end_matches('/');
         let geo_databases = geo.types();
-        let sink = sink::Sink::new(client.clone(), site, geo, hits, Arc::clone(&dropped));
+        let sink = sink::Sink::new(client.clone(), site, geo, hits, Arc::clone(&dropped), stop);
         let handle = tokio::spawn(sink.run());
         (
             Self {

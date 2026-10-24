@@ -78,7 +78,7 @@ Without a proxy, set `WORDMAKER_PROXY_HOPS=0`, so visitors on the local network 
 
 Analytics never slows the site down: requests only queue a page view, without waiting.
 When ClickHouse is unreachable, page views are buffered (up to 50,000, or 64 MiB) and written once it is back.
-On shutdown (Ctrl-C or SIGTERM) the buffer is written before the process exits.
+On shutdown (Ctrl-C or SIGTERM) open requests get 5 seconds to finish (MCP event streams are closed right away), then the buffer is written before the process exits.
 A failed insert is retried with the same deduplication token, so an insert that timed out but did reach ClickHouse is not written twice.
 That needs the `non_replicated_deduplication_window` setting, which tables created by older versions lack:
 

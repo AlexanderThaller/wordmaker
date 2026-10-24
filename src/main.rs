@@ -15,6 +15,7 @@ mod theme;
 mod token;
 
 use std::{
+    future::IntoFuture,
     net::SocketAddr,
     sync::Arc,
     time::Duration,
@@ -25,6 +26,7 @@ use clap::{
     Subcommand,
 };
 use rmcp::ServiceExt;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
@@ -133,7 +135,11 @@ async fn serve(config: Config, args: ServeArgs) -> anyhow::Result<()> {
     allowed_hosts.extend(base_url_hosts(&config.base_url));
     allowed_hosts.extend(args.allowed_hosts);
     args.analytics.check_bind(bind);
-    let (analytics, sink) = args.analytics.start(&config.base_url)?.unzip();
+    let stop_sink = CancellationToken::new();
+    let (analytics, sink) = args
+        .analytics
+        .start(&config.base_url, stop_sink.clone())?
+        .unzip();
 
     let state = AppState {
         pool,
@@ -144,19 +150,38 @@ async fn serve(config: Config, args: ServeArgs) -> anyhow::Result<()> {
         oauth_clients: Arc::default(),
         analytics,
     };
-    let router = app::router(state, allowed_hosts);
+    let shutdown = CancellationToken::new();
+    let router = app::router(state, allowed_hosts, shutdown.clone());
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("listening on http://{bind}");
-    axum::serve(
+    let server = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+    .into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result?,
+        () = shutdown_signal() => {
+            // Also ends MCP event streams, which never end by themselves.
+            shutdown.cancel();
+            if let Ok(result) = tokio::time::timeout(GRACE_PERIOD, &mut server).await {
+                result?;
+            } else {
+                tracing::warn!(
+                    "closing connections still open after {}s",
+                    GRACE_PERIOD.as_secs()
+                );
+            }
+        }
+    }
 
-    // The router held the last analytics handles; the sink now writes what
-    // it has buffered and stops.
+    // The router held the analytics handles; once they are gone, or when
+    // told to because connections outlived the grace period, the sink
+    // writes what it has buffered and stops.
+    stop_sink.cancel();
     if let Some(sink) = sink
         && tokio::time::timeout(Duration::from_secs(15), sink)
             .await
@@ -166,6 +191,11 @@ async fn serve(config: Config, args: ServeArgs) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// How long open requests may take to finish on shutdown. Together with
+/// writing buffered page views it stays within Docker's 10 s before SIGKILL
+/// in the usual case.
+const GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 /// Ctrl-C, or SIGTERM from systemd or Docker.
 async fn shutdown_signal() {
