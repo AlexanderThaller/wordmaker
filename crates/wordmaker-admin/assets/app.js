@@ -455,7 +455,8 @@ function draft() {
   return {
     title: fields.title.value.trim(),
     slug: fields.slug.value.trim(),
-    body: state.editor ? state.editor.value() : current.body,
+    // Before the editor loads it holds what was last saved: the draft, if any.
+    body: state.editor ? state.editor.value() : savedContent(current).body,
     in_nav: fields.inNav.checked,
     nav_order: Number.parseInt(fields.navOrder.value, 10) || 0,
   };
