@@ -153,11 +153,16 @@ async fn api(State(admin): State<Admin>, request: Request) -> Response {
             &format!("API requests need the {API_GUARD_HEADER} header"),
         );
     }
-    admin.upstream.forward(request, true).await
+    admin.upstream.forward(request, "/api/v1/", true).await
 }
 
 async fn public(State(admin): State<Admin>, request: Request) -> Response {
-    admin.upstream.forward(request, false).await
+    let prefix = if request.uri().path().starts_with("/_wm/") {
+        "/_wm/"
+    } else {
+        "/media/"
+    };
+    admin.upstream.forward(request, prefix, false).await
 }
 
 async fn check_host(State(admin): State<Admin>, request: Request, next: Next) -> Response {
@@ -383,6 +388,41 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn paths_cannot_step_out_of_their_prefix() {
+        let app = admin(&fake_server().await);
+        for uri in [
+            "/api/v1/../../x",
+            "/api/v1/./pages",
+            "/api/v1/%2e%2e/%2E%2E/x",
+            "/api/v1/pages%2f..%2fx",
+            "/api/v1/..%5cx",
+            "/api/v1/..\\x",
+            "/media/../about",
+            "/_wm/..",
+        ] {
+            let (status, _, body) = send(
+                &app,
+                request(Method::GET, uri)
+                    .header(API_GUARD_HEADER, "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+        }
+
+        // Dots inside a name are fine.
+        let (status, _, body) = send(
+            &app,
+            request(Method::GET, "/media/logo.v2..png")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     #[tokio::test]

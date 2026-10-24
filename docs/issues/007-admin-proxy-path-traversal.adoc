@@ -1,13 +1,13 @@
 = 007: Admin proxy forwards dot segments, sending the token to any upstream path
 :severity: Medium
 :area: wordmaker-admin
-:status: open
+:status: fixed
 :found: 2026-10-24
 
 [horizontal]
 Severity:: Medium
 Area:: wordmaker-admin
-Status:: Open
+Status:: Fixed
 
 == Summary
 
@@ -41,3 +41,11 @@ reqwest's WHATWG URL parser then resolves the dot segments.
 * Better: build the upstream URL from the matched `path` and check that the
   parsed result still starts with `base_url + "/api/v1/"` (or `/media/`,
   `/_wm/`) before sending.
+
+== Resolution
+
+`Upstream::forward` now takes the prefix a route serves (`/api/v1/`,
+`/media/`, `/_wm/`) and builds the server URL in `Upstream::url`, which
+refuses paths with `.` or `..` segments, backslashes or percent-encoded
+`.`, `/` or `\` with a 400, and checks that the parsed URL still lies under
+the server's base path plus that prefix before anything is sent.
