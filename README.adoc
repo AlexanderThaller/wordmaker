@@ -110,7 +110,8 @@ The _Site_ selector shows all instances or the ones you pick; clicking a site in
 
 It needs Grafana 11 or newer with the https://grafana.com/grafana/plugins/grafana-clickhouse-datasource/[ClickHouse data source] plugin.
 Add a ClickHouse data source for the server (HTTP, port 8123), then import the file under _Dashboards → New → Import_ and pick the data source.
-If the database is not called `wordmaker`, change the _Database_ field at the top.
+If the database is not called `wordmaker`, change the hidden `database` constant under _Dashboard settings → Variables_ (or in the file before importing); it is a constant so viewers cannot change it, since it goes into the SQL as is.
+
 To provision it instead, point a dashboard provider at the `grafana` directory:
 
 [source,yaml]
@@ -121,6 +122,15 @@ providers:
     type: file
     options:
       path: /path/to/wordmaker/grafana
+----
+
+Give the data source a ClickHouse user that can only read `page_views`, not the user `serve` writes with.
+Dashboard viewers can set variables such as _Site_ through the URL, and Grafana's quoting of them does not rule out SQL injection, so the data source's rights are what viewers can reach:
+
+[source,sql]
+----
+CREATE USER grafana IDENTIFIED BY 'change me' SETTINGS readonly = 2;
+GRANT SELECT ON wordmaker.page_views TO grafana;
 ----
 
 == Admin interface
