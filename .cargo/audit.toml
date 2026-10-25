@@ -1,0 +1,15 @@
+# Advisories reviewed and accepted. Remove an entry once openidconnect
+# releases a version with the fixed dependency.
+[advisories]
+ignore = [
+  # crypto-bigint 0.5 timing variability, via openidconnect 4.0.1 ->
+  # p256/p384 0.13. wordmaker-admin only verifies ID token signatures, which
+  # works on public keys and public signatures; no secret goes through
+  # crypto-bigint. Fix needs p256/p384 0.14 (ramosbugs/openidconnect-rs#244).
+  "RUSTSEC-2026-0387",
+  # rsa Marvin attack: timing leaks in private-key operations. Through
+  # openidconnect wordmaker-admin only verifies RSA signatures with the
+  # provider's public keys and never holds an RSA private key. No fixed
+  # rsa release exists.
+  "RUSTSEC-2023-0071",
+]
